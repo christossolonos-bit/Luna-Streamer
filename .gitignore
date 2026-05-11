@@ -1,0 +1,58 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Never commit real .env files. Use .env.example as the template.
+.env
+.env.*
+!.env.example
+viewer/.env
+viewer/.env.*
+!viewer/.env.example
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs (any name)
+.venv/
+.venv*/
+venv/
+env/
+
+# ── Node / Vite (viewer) ─────────────────────────────────────────────────────
+viewer/node_modules/
+viewer/dist/
+viewer/.vite/
+*.tsbuildinfo
+
+# ── Build / dist ─────────────────────────────────────────────────────────────
+dist/
+build/
+
+# ── Runtime state and caches (per-user, not source) ──────────────────────────
+.cache/
+data/
+checkpoints/
+logs/
+*.log
+
+# ── Per-user voice samples (speaker enrollment + Chatterbox refs) ────────────
+# Generated locally; do not publish your own voice to a public repo.
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.mp3
+
+# ── IDE / OS / editor metadata ───────────────────────────────────────────────
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

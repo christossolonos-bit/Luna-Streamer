@@ -1,0 +1,23 @@
+ollama>=0.4.0
+twitchio>=2.10,<3
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+
+# STT: local faster-whisper (optional GPU / CUDA build of ctranslate2).
+faster-whisper>=1.0.0
+# Viewer mic male-voice gate (LUNA_VOICE_GATE_MALE_ONLY=1): pitch estimate via pyin.
+librosa>=0.10.0
+
+# YouTube integration: !play (audio resolver/download) + !explain (transcript).
+yt-dlp>=2024.4.9
+youtube-transcript-api>=0.6.2
+
+# Optional: Discord music bot for voice-channel playback (DISCORD_TOKEN required).
+# The [voice] extra pulls PyNaCl. FFmpeg must be in PATH (already required for STT).
+discord.py[voice]>=2.3.0
+
+# Optional Luna voice (LUNA_TTS=1): Edge TTS backend (Python 3.13 friendly).
+edge-tts>=6.1.0
+pydub>=0.25.1
+# Optional alternative backend:
+# chatterbox-tts
