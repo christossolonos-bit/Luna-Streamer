@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -65,11 +66,41 @@ def _save_state(state: dict[str, Any]) -> None:
         pass
 
 
-def _fetch_latest_entries(cid: str, *, limit: int = 5) -> list[dict[str, str]]:
+def _fetch_latest_entries(
+    cid: str,
+    *,
+    limit: int = 5,
+    cache: dict[str, str] | None = None,
+) -> list[dict[str, str]] | None:
+    """Fetch the channel RSS feed. ``cache`` (if provided) is a dict updated
+    with ``etag`` / ``last_modified`` and used for conditional GETs — returns
+    ``None`` when YouTube responds 304 Not Modified so the caller can skip parsing.
+    """
     url = FEED_URL_TEMPLATE.format(channel_id=cid)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (LunaStreamer)"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        xml_text = resp.read().decode("utf-8", errors="replace")
+    headers = {"User-Agent": "Mozilla/5.0 (LunaStreamer)"}
+    if cache is not None:
+        etag = cache.get("etag")
+        last_mod = cache.get("last_modified")
+        if etag:
+            headers["If-None-Match"] = etag
+        if last_mod:
+            headers["If-Modified-Since"] = last_mod
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if cache is not None:
+                new_etag = resp.headers.get("ETag")
+                new_lm = resp.headers.get("Last-Modified")
+                if new_etag:
+                    cache["etag"] = new_etag
+                if new_lm:
+                    cache["last_modified"] = new_lm
+            xml_text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return None
+        raise
+
     root = ET.fromstring(xml_text)
     out: list[dict[str, str]] = []
     for entry in root.findall("atom:entry", _NS)[:limit]:
@@ -99,14 +130,17 @@ async def run_feed_poller(
     interval = poll_interval_sec()
     state = _load_state()
     seen: set[str] = set(state.get("seen_ids", []))
+    http_cache: dict[str, str] = {
+        k: v for k, v in (("etag", state.get("etag", "")), ("last_modified", state.get("last_modified", ""))) if v
+    }
 
     if not seen:
         # First run: seed with whatever exists so we don't spam old uploads.
         try:
-            entries = await asyncio.to_thread(_fetch_latest_entries, cid)
-            for e in entries:
+            entries = await asyncio.to_thread(_fetch_latest_entries, cid, cache=http_cache)
+            for e in (entries or []):
                 seen.add(e["id"])
-            _save_state({"seen_ids": list(seen)})
+            _save_state({"seen_ids": list(seen), **http_cache})
             await broadcast_status(
                 f"YouTube feed: watching channel {cid} every {int(interval)}s."
             )
@@ -115,9 +149,13 @@ async def run_feed_poller(
 
     while True:
         try:
-            entries = await asyncio.to_thread(_fetch_latest_entries, cid)
+            entries = await asyncio.to_thread(_fetch_latest_entries, cid, cache=http_cache)
         except Exception as exc:
             await broadcast_status(f"YouTube feed: fetch failed ({exc}).")
+            await asyncio.sleep(interval)
+            continue
+
+        if entries is None:  # 304 Not Modified — nothing to do.
             await asyncio.sleep(interval)
             continue
 
@@ -134,7 +172,10 @@ async def run_feed_poller(
                     pass
 
         if new_items:
-            _save_state({"seen_ids": list(seen)[-50:]})
+            _save_state({"seen_ids": list(seen)[-50:], **http_cache})
+        elif http_cache:
+            # Refresh cached ETag/Last-Modified even when nothing new.
+            _save_state({"seen_ids": list(seen)[-50:], **http_cache})
 
         await asyncio.sleep(interval)
 

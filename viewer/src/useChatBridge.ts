@@ -111,6 +111,7 @@ export type EnrollState = {
   enrolled: boolean;
   minSim: number;
   lastSim: number | null;
+  samples: number;
 };
 
 export function useChatBridge(enabled: boolean) {
@@ -125,7 +126,10 @@ export function useChatBridge(enabled: boolean) {
     enrolled: false,
     minSim: 0,
     lastSim: null,
+    samples: 0,
   });
+  /** True while Luna is synthesising / playing TTS locally (viewer path). */
+  const [avatarSpeaking, setAvatarSpeaking] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const timerRef = useRef<number>(0);
   const bridgeUrl = wsUrl();
@@ -223,6 +227,7 @@ export function useChatBridge(enabled: boolean) {
         return;
       }
       if (msg.name === "avatar_speaking") {
+        setAvatarSpeaking(msg.value);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-speaking", {
             detail: msg.value,
@@ -236,6 +241,7 @@ export function useChatBridge(enabled: boolean) {
           enrolled: msg.enrolled,
           minSim: msg.min_sim,
           lastSim: msg.last_sim,
+          samples: typeof msg.samples === "number" ? msg.samples : 0,
         });
         return;
       }
@@ -326,12 +332,27 @@ export function useChatBridge(enabled: boolean) {
     };
   }, [enabled, appendParsed, bridgeUrl]);
 
+  // Debounce localStorage writes — streaming token deltas can fire 100+
+  // setState calls per reply. Writing every one of those serialises the full
+  // chat history (~250 entries) and pegs the main thread.
+  const persistTimerRef = useRef<number>(0);
   useEffect(() => {
-    try {
-      window.localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(lines));
-    } catch {
-      // ignore storage quota/privacy failures
+    if (persistTimerRef.current) {
+      window.clearTimeout(persistTimerRef.current);
     }
+    persistTimerRef.current = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(lines));
+      } catch {
+        // ignore storage quota/privacy failures
+      }
+    }, 300);
+    return () => {
+      if (persistTimerRef.current) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = 0;
+      }
+    };
   }, [lines]);
 
   const clear = useCallback(() => {
@@ -512,6 +533,7 @@ export function useChatBridge(enabled: boolean) {
   return {
     lines,
     conn,
+    avatarSpeaking,
     wsUrl: wsUrl(),
     clear,
     speakEnabled,

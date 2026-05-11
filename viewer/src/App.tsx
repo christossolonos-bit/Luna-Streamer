@@ -7,13 +7,18 @@ import {
   type DragEvent,
 } from "react";
 import "./App.css";
-import { TwitchChatPanel } from "./TwitchChatPanel";
+import { ChatBridgeProvider, useBridge } from "./chatBridgeContext";
+import { ChatOverlay } from "./ChatOverlay";
+import { CaptionsOverlay } from "./CaptionsOverlay";
+import { FloatingDock, type DockOverlay } from "./FloatingDock";
+import { SettingsOverlay } from "./SettingsOverlay";
+import { CloseIcon } from "./icons";
+import { useMicSession } from "./useMicSession";
 import { VrmRuntime, type ChromaKeyMode } from "./vrmRuntime";
 import { wsUrl } from "./useChatBridge";
 
-type TabId = "upload" | "screen" | "chat" | "settings";
-
 const CHROMA_STORAGE_KEY = "luna.chromaKey.v1";
+const CAPTIONS_STORAGE_KEY = "luna.captions.v1";
 
 function readStoredChromaKey(): ChromaKeyMode {
   try {
@@ -25,23 +30,41 @@ function readStoredChromaKey(): ChromaKeyMode {
   return "off";
 }
 
-function randomHex(seed: number) {
-  const x = Math.floor(Math.abs(Math.sin(seed) * 1e9));
-  return `0x${x.toString(16).toUpperCase().slice(0, 6)}`;
+function readStoredCaptionsEnabled(): boolean {
+  try {
+    const v = window.localStorage.getItem(CAPTIONS_STORAGE_KEY);
+    if (v === "1") return true;
+    if (v === "0") return false;
+  } catch {
+    /* ignore */
+  }
+  return true;
 }
 
 export default function App() {
+  return (
+    <ChatBridgeProvider>
+      <AppInner />
+    </ChatBridgeProvider>
+  );
+}
+
+function AppInner() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const runtimeRef = useRef<VrmRuntime | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const motionInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
-  const [tab, setTab] = useState<TabId>("upload");
+  const { conn } = useBridge();
+  const mic = useMicSession();
+
+  const [activeOverlay, setActiveOverlay] = useState<DockOverlay>(null);
+  const [chatOpen, setChatOpen] = useState(true);
+  const [captionsEnabled, setCaptionsEnabled] = useState(() =>
+    readStoredCaptionsEnabled(),
+  );
+
   const [fps, setFps] = useState(0);
-  const [bootPct, setBootPct] = useState(0);
-  const [bufferLine, setBufferLine] = useState(">> Loading Avatar BUFFER: 0% / 100%");
-  const [streamHex, setStreamHex] = useState(() => randomHex(1));
   const [sceneLine, setSceneLine] = useState("Initializing scene…");
   const [loadPct, setLoadPct] = useState(0);
   const [drag, setDrag] = useState(false);
@@ -49,23 +72,35 @@ export default function App() {
   const [motionUrl, setMotionUrl] = useState(
     "/@fs/D:/Luna streamer/expressions/motion_1777320820578.vrma",
   );
-  const [motionBusy, setMotionBusy] = useState(false);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [screenBusy, setScreenBusy] = useState(false);
-  const [chromaKey, setChromaKey] = useState<ChromaKeyMode>(() => readStoredChromaKey());
+  const [chromaKey, setChromaKeyState] = useState<ChromaKeyMode>(() =>
+    readStoredChromaKey(),
+  );
 
-  useEffect(() => {
-    let t = 0;
-    const id = window.setInterval(() => {
-      t += 1;
-      const pct = Math.min(100, Math.round((t / 45) * 100));
-      setBootPct(pct);
-      setBufferLine(`>> Loading Avatar BUFFER: ${pct}% / 100%`);
-      if (pct >= 100) window.clearInterval(id);
-    }, 40);
-    return () => window.clearInterval(id);
+  const setChromaKey = useCallback((mode: ChromaKeyMode) => {
+    setChromaKeyState(mode);
+    try {
+      window.localStorage.setItem(CHROMA_STORAGE_KEY, mode);
+    } catch {
+      /* ignore */
+    }
+    runtimeRef.current?.setChromaKeyMode(mode);
   }, []);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CAPTIONS_STORAGE_KEY, captionsEnabled ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [captionsEnabled]);
+
+  useEffect(() => {
+    runtimeRef.current?.setChromaKeyMode(chromaKey);
+  }, [chromaKey]);
+
+  // Screen-share preview hookup.
   useEffect(() => {
     const v = screenVideoRef.current;
     if (!v) return;
@@ -84,6 +119,7 @@ export default function App() {
     };
   }, [screenStream]);
 
+  // Periodic JPEG frame upload while screen-sharing.
   useEffect(() => {
     if (!screenStream) return;
 
@@ -181,15 +217,7 @@ export default function App() {
     };
   }, [screenStream]);
 
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(CHROMA_STORAGE_KEY, chromaKey);
-    } catch {
-      /* ignore */
-    }
-    runtimeRef.current?.setChromaKeyMode(chromaKey);
-  }, [chromaKey]);
-
+  // Bridge → avatar event listeners.
   useEffect(() => {
     const onEmotion = (ev: Event) => {
       const ce = ev as CustomEvent<string>;
@@ -213,13 +241,7 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setStreamHex(randomHex(Date.now()));
-    }, 4200);
-    return () => window.clearInterval(id);
-  }, []);
-
+  // VRM runtime boot.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -234,15 +256,16 @@ export default function App() {
     });
     runtimeRef.current = runtime;
     runtime.setChromaKeyMode(readStoredChromaKey());
+
     const params = new URLSearchParams(window.location.search);
-    const vrmUrl = params.get("vrm");
+    const vrmParam = params.get("vrm");
     const idleUrls = params.getAll("idle").filter((v) => v.trim().length > 0);
-    if (vrmUrl) {
+    if (vrmParam) {
       setLoadPct(0);
       setLastError(null);
       setSceneLine("> Trying startup avatar…");
       void runtime
-        .loadVrmFromUrl(vrmUrl, vrmUrl.split("/").pop() || "startup.vrm")
+        .loadVrmFromUrl(vrmParam, vrmParam.split("/").pop() || "startup.vrm")
         .then(async () => {
           setLoadPct(100);
           if (idleUrls.length > 0) {
@@ -303,41 +326,6 @@ export default function App() {
     if (f) void loadFile(f);
   };
 
-  const onPickMotion = (e: ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    e.target.value = "";
-    if (!f) return;
-    const rt = runtimeRef.current;
-    if (!rt) return;
-    setMotionBusy(true);
-    setLastError(null);
-    void rt
-      .loadVrmaFile(f)
-      .catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        setLastError(msg);
-        setSceneLine(`Motion error: ${msg}`);
-      })
-      .finally(() => setMotionBusy(false));
-  };
-
-  const loadMotionFromUrl = () => {
-    const rt = runtimeRef.current;
-    if (!rt) return;
-    const url = motionUrl.trim();
-    if (!url) return;
-    setMotionBusy(true);
-    setLastError(null);
-    void rt
-      .loadVrmaFromUrl(url, url.split("/").pop() || "motion")
-      .catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        setLastError(msg);
-        setSceneLine(`Motion error: ${msg}`);
-      })
-      .finally(() => setMotionBusy(false));
-  };
-
   const stopScreenShare = useCallback(() => {
     setScreenStream((prev) => {
       if (prev) {
@@ -386,10 +374,12 @@ export default function App() {
     }
   }, [screenBusy]);
 
-  const standby =
-    bootPct >= 100
-      ? "System Standby — drop a .vrm or open Upload"
-      : "System boot…";
+  const toggleOverlay = useCallback((id: Exclude<DockOverlay, null>) => {
+    setActiveOverlay((current) => (current === id ? null : id));
+  }, []);
+
+  const connLabel =
+    conn === "open" ? "● live" : conn === "connecting" ? "◌ connecting…" : "○ offline";
 
   return (
     <div className={`app ${chromaKey !== "off" ? "app--chroma" : ""}`}>
@@ -399,218 +389,161 @@ export default function App() {
       <div className="scanlines" aria-hidden />
       <div className="vignette" aria-hidden />
 
-      <div className="hud">
-        <div className="hud-top">
-          <div className="brand-block">
-            <h1>Luna | VRM</h1>
-            <p className="sub">NEURAL SYNC</p>
-            <div className="terminal" aria-live="polite">
-              <p className="line">
-                <span className="prompt">&gt;&gt;</span> {bufferLine}
-              </p>
-              <p className="line">
-                <span className="prompt">&gt;</span> {sceneLine}
-              </p>
-              <p className="line">
-                <span className="prompt">&gt;</span> D.STREAM: {streamHex} // SECURE
-              </p>
-              <p className="line">{standby}</p>
-              <p className="line" style={{ opacity: 0.75 }}>
-                Connect Luna backend for voice + vision tools (Twitch / Ollama).
-              </p>
-            </div>
-          </div>
-          <div className="stats">
-            <div>
-              <div className="label">RENDER FPS</div>
-              <div className={`value ${fps < 30 && fps > 0 ? "warn" : ""}`}>{fps.toFixed(0)}</div>
-            </div>
-            <div style={{ marginTop: "0.55rem" }}>
-              <div className="label">MODEL BUFFER</div>
-              <div className="value">{loadPct}%</div>
-            </div>
-          </div>
+      <div className="status-badge" role="status">
+        <div className="status-badge-title">
+          LUNA <span className="status-badge-dot">●</span>
         </div>
-
-        <div className="hud-bottom">
-          <div className="tabs" role="tablist" aria-label="Control panels">
-            {(
-              [
-                ["upload", "Upload"],
-                ["screen", "Screen"],
-                ["chat", "Chat"],
-                ["settings", "Settings"],
-              ] as const
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                className={`tab ${tab === id ? "active" : ""}`}
-                onClick={() => setTab(id)}
-                role="tab"
-                aria-selected={tab === id}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          <div className="panel">
-            {tab === "upload" && (
-              <>
-                <p>
-                  Local VRM preview. Style inspired by{" "}
-                  <a
-                    href="https://vmrchat.vercel.app/"
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ color: "#00f0ff" }}
-                  >
-                    vmrchat.vercel.app
-                  </a>
-                  .
-                </p>
-                <div
-                  className={`drop ${drag ? "drag" : ""}`}
-                  onClick={() => fileInputRef.current?.click()}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    setDrag(true);
-                  }}
-                  onDragLeave={() => setDrag(false)}
-                  onDrop={onDrop}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
-                  }}
-                >
-                  <strong>Drop .vrm</strong> or click to browse
-                </div>
-                <input
-                  ref={fileInputRef}
-                  className="hidden-input"
-                  type="file"
-                  accept=".vrm,model/vrm,.glb"
-                  onChange={onPick}
-                />
-                <div className="progress-wrap" aria-hidden>
-                  <div className="progress-bar" style={{ width: `${loadPct}%` }} />
-                </div>
-                {lastError && (
-                  <p style={{ color: "#ff6b8a", marginTop: "0.5rem" }}>{lastError}</p>
-                )}
-                <p className="mono-note">Orbit: drag · zoom: scroll · pan: right-drag</p>
-              </>
-            )}
-            {tab === "screen" && (
-              <>
-                <p>Share your desktop/window for live reactions in this viewer session.</p>
-                <div className="motion-row">
-                  <button
-                    type="button"
-                    className="chat-clear"
-                    onClick={() => void startScreenShare()}
-                    disabled={screenBusy || !!screenStream}
-                  >
-                    {screenBusy ? "Starting…" : screenStream ? "Sharing" : "Start Share"}
-                  </button>
-                  <button
-                    type="button"
-                    className="chat-clear"
-                    onClick={stopScreenShare}
-                    disabled={!screenStream}
-                  >
-                    Stop Share
-                  </button>
-                </div>
-                <div className="screen-preview-wrap">
-                  {screenStream ? (
-                    <video ref={screenVideoRef} className="screen-preview" muted playsInline autoPlay />
-                  ) : (
-                    <p className="mono-note">No active screen share.</p>
-                  )}
-                </div>
-              </>
-            )}
-            <TwitchChatPanel visible={tab === "chat"} />
-            {tab === "settings" && (
-              <>
-                <p>Ollama host, model name, and Twitch token stay in your Python <code className="inline-code">.env</code>.</p>
-                <p>Chroma key background (OBS / browser source):</p>
-                <div className="chroma-key-row" role="group" aria-label="Chroma key background">
-                  {(
-                    [
-                      ["off", "Off"],
-                      ["green", "Green"],
-                      ["blue", "Blue"],
-                    ] as const
-                  ).map(([id, label]) => (
-                    <button
-                      key={id}
-                      type="button"
-                      className={`chat-clear chroma-key-btn ${chromaKey === id ? "chroma-key-btn--active" : ""}`}
-                      onClick={() => setChromaKey(id)}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <p className="mono-note">
-                  Uses a flat screen (#00ff00 / #0047bb), hides fog and floor grid, and removes scanlines for a cleaner key.
-                </p>
-                <p>Load VRMA motion for your avatar:</p>
-                <div className="motion-row">
-                  <input
-                    className="motion-input"
-                    value={motionUrl}
-                    onChange={(e) => setMotionUrl(e.target.value)}
-                    placeholder="/@fs/D:/Luna streamer/expressions/your_motion.vrma"
-                  />
-                  <button
-                    type="button"
-                    className="chat-clear"
-                    onClick={loadMotionFromUrl}
-                    disabled={motionBusy}
-                  >
-                    {motionBusy ? "Loading…" : "Load URL"}
-                  </button>
-                </div>
-                <div className="motion-row">
-                  <button
-                    type="button"
-                    className="chat-clear"
-                    onClick={() => motionInputRef.current?.click()}
-                    disabled={motionBusy}
-                  >
-                    {motionBusy ? "Loading…" : "Pick .vrma file"}
-                  </button>
-                  <input
-                    ref={motionInputRef}
-                    className="hidden-input"
-                    type="file"
-                    accept=".vrma,model/vrma"
-                    onChange={onPickMotion}
-                  />
-                </div>
-                <p className="mono-note">
-                  Viewer WebSocket URL: set{" "}
-                  <code className="inline-code">VITE_CHAT_WS_URL</code> in{" "}
-                  <code className="inline-code">viewer/.env</code> if the bridge is not on{" "}
-                  <code className="inline-code">ws://127.0.0.1:8765/ws</code>. Bot:{" "}
-                  <code className="inline-code">LUNA_CHAT_WS_HOST</code> /{" "}
-                  <code className="inline-code">LUNA_CHAT_WS_PORT</code> (use{" "}
-                  <code className="inline-code">0</code> to disable).
-                </p>
-                <p className="mono-note">
-                  For local files in Vite dev, absolute paths use{" "}
-                  <code className="inline-code">/@fs/...</code> URLs.
-                </p>
-              </>
-            )}
-          </div>
+        <div className={`status-badge-sub status-badge-sub--${conn}`}>{connLabel}</div>
+        <div className="status-badge-scene" title={sceneLine}>
+          {sceneLine}
         </div>
       </div>
+
+      <div className="stats-hud" aria-hidden>
+        <div className="stats-hud-row">
+          <span className="stats-hud-label">FPS</span>
+          <span className={`stats-hud-value ${fps < 30 && fps > 0 ? "warn" : ""}`}>
+            {fps.toFixed(0)}
+          </span>
+        </div>
+        <div className="stats-hud-row">
+          <span className="stats-hud-label">Model</span>
+          <span className="stats-hud-value">{loadPct}%</span>
+        </div>
+      </div>
+
+      <CaptionsOverlay enabled={captionsEnabled} />
+
+      {activeOverlay === "upload" && (
+        <div className="overlay-card overlay-card--center" role="dialog" aria-label="Upload avatar">
+          <div className="overlay-card-header">
+            <span className="overlay-card-title">Upload avatar</span>
+            <button
+              type="button"
+              className="chat-card-icon-btn"
+              onClick={() => setActiveOverlay(null)}
+              aria-label="Close upload"
+              title="Close"
+            >
+              <CloseIcon />
+            </button>
+          </div>
+          <div className="overlay-card-body">
+            <p className="settings-hint">
+              Local VRM preview — drop a <code className="chat-code">.vrm</code> or
+              click to browse.
+            </p>
+            <div
+              className={`drop ${drag ? "drag" : ""}`}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDrag(true);
+              }}
+              onDragLeave={() => setDrag(false)}
+              onDrop={onDrop}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
+              }}
+            >
+              <strong>Drop .vrm</strong> or click to browse
+            </div>
+            <input
+              ref={fileInputRef}
+              className="hidden-input"
+              type="file"
+              accept=".vrm,model/vrm,.glb"
+              onChange={onPick}
+            />
+            <div className="progress-wrap" aria-hidden>
+              <div className="progress-bar" style={{ width: `${loadPct}%` }} />
+            </div>
+            {lastError && <p className="settings-hint settings-hint--err">{lastError}</p>}
+            <p className="settings-hint">Orbit: drag · zoom: scroll · pan: right-drag</p>
+          </div>
+        </div>
+      )}
+
+      {activeOverlay === "screen" && (
+        <div className="overlay-card overlay-card--center" role="dialog" aria-label="Share screen">
+          <div className="overlay-card-header">
+            <span className="overlay-card-title">Share screen</span>
+            <button
+              type="button"
+              className="chat-card-icon-btn"
+              onClick={() => setActiveOverlay(null)}
+              aria-label="Close screen"
+              title="Close"
+            >
+              <CloseIcon />
+            </button>
+          </div>
+          <div className="overlay-card-body">
+            <p className="settings-hint">
+              Share your desktop or window — Luna can react to what's on screen.
+            </p>
+            <div className="settings-row">
+              <button
+                type="button"
+                className={`settings-btn ${screenStream ? "settings-btn--on" : ""}`}
+                onClick={() => void startScreenShare()}
+                disabled={screenBusy || !!screenStream}
+              >
+                {screenBusy ? "Starting…" : screenStream ? "Sharing" : "Start Share"}
+              </button>
+              <button
+                type="button"
+                className="settings-btn"
+                onClick={stopScreenShare}
+                disabled={!screenStream}
+              >
+                Stop Share
+              </button>
+            </div>
+            <div className="screen-preview-wrap">
+              {screenStream ? (
+                <video
+                  ref={screenVideoRef}
+                  className="screen-preview"
+                  muted
+                  playsInline
+                  autoPlay
+                />
+              ) : (
+                <p className="settings-hint">No active screen share.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeOverlay === "settings" && (
+        <SettingsOverlay
+          onClose={() => setActiveOverlay(null)}
+          runtimeRef={runtimeRef}
+          chromaKey={chromaKey}
+          setChromaKey={setChromaKey}
+          motionUrl={motionUrl}
+          setMotionUrl={setMotionUrl}
+          captionsEnabled={captionsEnabled}
+          setCaptionsEnabled={setCaptionsEnabled}
+        />
+      )}
+
+      {chatOpen && <ChatOverlay onClose={() => setChatOpen(false)} />}
+
+      <FloatingDock
+        activeOverlay={activeOverlay}
+        onToggleOverlay={toggleOverlay}
+        micListening={mic.listening}
+        micDisabled={mic.disabled}
+        micHoldForTts={mic.holdForTts}
+        onToggleMic={() => void mic.toggle()}
+        chatOpen={chatOpen}
+        onToggleChat={() => setChatOpen((v) => !v)}
+      />
     </div>
   );
 }

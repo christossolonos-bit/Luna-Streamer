@@ -70,17 +70,26 @@ import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from chat_ws import ChatHub, start_chat_ws_server, stop_chat_ws_server
-from luna_tts import maybe_speak, set_selected_speaker, tts_enabled, tts_playback_enabled, tts_voices_control_message
+from luna_tts import (
+    maybe_speak,
+    prewarm_edge_tts,
+    set_selected_speaker,
+    synthesize_reply_to_file,
+    tts_enabled,
+    tts_playback_enabled,
+    tts_voices_control_message,
+)
 from luna_discord_bot import LunaDiscordBot, discord_enabled
 from luna_speaker_id import (
     clear_enrollment as speaker_clear,
     enroll_from_bytes as speaker_enroll,
     speaker_state,
 )
-from luna_stt import stt_status_line, transcribe_audio
+from luna_stt import prewarm as stt_prewarm, stt_status_line, transcribe_audio
 from youtube_audio import (
     download_enabled as yt_download_enabled,
     download_to_dir as yt_download_to_dir,
@@ -90,10 +99,12 @@ from youtube_audio import (
 )
 from youtube_feed import channel_id as yt_channel_id, run_feed_poller as yt_run_feed_poller
 from ollama_client import (
+    ThinkStripper,
     build_client,
     chat_once,
     chat_request_kwargs,
     configure_stdio_utf8,
+    strip_think_blocks,
     summarize_viewer_screen,
 )
 
@@ -130,6 +141,7 @@ def _speaker_state_control_message() -> dict:
         "enrolled": bool(state.get("enrolled")),
         "min_sim": float(state.get("min_sim") or 0.0),
         "last_sim": state.get("last_sim"),
+        "samples": int(state.get("samples") or 0),
     }
 
 
@@ -346,7 +358,12 @@ class LunaTwitchBot(commands.Bot):
         return "luna" in lowered or "@luna" in lowered
 
     async def _ollama_stream_to_hub(self, channel_name: str, messages: list[dict]) -> str:
-        """Stream Ollama tokens to the chat hub while collecting the full reply."""
+        """Stream Ollama tokens to the chat hub while collecting the full reply.
+
+        Filters out reasoning-model ``<think>...</think>`` blocks so the viewer
+        only sees the visible answer (the raw chunks still accumulate so we can
+        return / strip the full text once the stream ends).
+        """
         loop = asyncio.get_running_loop()
         chunk_q: asyncio.Queue[str | None] = asyncio.Queue()
         err: list[BaseException] = []
@@ -364,23 +381,70 @@ class LunaTwitchBot(commands.Bot):
             finally:
                 loop.call_soon_threadsafe(chunk_q.put_nowait, None)
 
+        # Coalesce tokens into ~50 ms windows (or every 48+ chars) so the
+        # viewer renders ~10 deltas per reply instead of ~200 — cuts WS frames
+        # and React re-renders by an order of magnitude with no visible lag.
+        try:
+            flush_ms = max(10, int(os.environ.get("LUNA_STREAM_FLUSH_MS", "50") or "50"))
+        except ValueError:
+            flush_ms = 50
+        try:
+            flush_chars = max(8, int(os.environ.get("LUNA_STREAM_FLUSH_CHARS", "48") or "48"))
+        except ValueError:
+            flush_chars = 48
+        flush_interval = flush_ms / 1000.0
+
         async def consume() -> None:
             hub = self._chat_hub
             u = self.nick or "luna"
-            while True:
-                piece = await chunk_q.get()
-                if piece is None:
-                    break
-                acc.append(piece)
-                if hub is not None:
+            stripper = ThinkStripper()
+            pending = ""
+            last_flush = loop.time()
+
+            async def flush() -> None:
+                nonlocal pending, last_flush
+                if pending and hub is not None:
                     await hub.broadcast(
                         {
                             "type": "assistant_delta",
                             "user": u,
                             "channel": channel_name,
-                            "text": piece,
+                            "text": pending,
                         }
                     )
+                pending = ""
+                last_flush = loop.time()
+
+            while True:
+                # Block for the next chunk unless we already have pending text
+                # to flush — in that case timeout so the user sees tokens.
+                timeout = None
+                if pending:
+                    elapsed = loop.time() - last_flush
+                    timeout = max(0.0, flush_interval - elapsed)
+                try:
+                    if timeout is None:
+                        piece = await chunk_q.get()
+                    else:
+                        piece = await asyncio.wait_for(chunk_q.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    await flush()
+                    continue
+
+                if piece is None:
+                    visible = stripper.finalize()
+                else:
+                    acc.append(piece)
+                    visible = stripper.feed(piece)
+                if visible:
+                    pending += visible
+                    if piece is None or len(pending) >= flush_chars:
+                        await flush()
+                    elif (loop.time() - last_flush) >= flush_interval:
+                        await flush()
+                if piece is None:
+                    await flush()
+                    break
 
         th = threading.Thread(target=pump, daemon=True)
         th.start()
@@ -390,7 +454,7 @@ class LunaTwitchBot(commands.Bot):
             th.join(timeout=180.0)
         if err:
             raise err[0]
-        return "".join(acc)
+        return strip_think_blocks("".join(acc))
 
     async def _generate_and_dispatch_reply(
         self,
@@ -399,8 +463,23 @@ class LunaTwitchBot(commands.Bot):
         author: str,
         question: str,
         send_to_twitch: bool = True,
-    ) -> None:
-        user_line = f"[{author} in Twitch chat]: {question.strip()}"
+        source: str = "Twitch chat",
+        local_speak: bool = True,
+    ) -> str:
+        """Generate a reply, append to shared memory, broadcast to hub + TTS.
+
+        Returns the assistant reply text so non-Twitch callers (Discord, viewer
+        panel) can forward it to their own destination. ``source`` is the human
+        label injected into the user turn so Luna's memory knows where the
+        message came from (e.g. ``"Twitch chat"``, ``"Discord #general"``,
+        ``"Discord DM"``, ``"viewer panel"``).
+
+        Set ``local_speak=False`` for replies whose audio should NOT play on
+        the streamer's speakers (e.g. Discord chat, which uploads its own
+        audio attachment instead). The viewer still receives the assistant
+        message + emotion broadcasts so the panel stays in sync.
+        """
+        user_line = f"[{author} in {source}]: {question.strip()}"
 
         messages: list[dict] = []
         system_content = self._system
@@ -452,7 +531,7 @@ class LunaTwitchBot(commands.Bot):
                     messages,
                     stream=True,
                 )
-        reply_stripped = reply.strip()
+        reply_stripped = strip_think_blocks(reply).strip()
         if self._memory_turns > 0:
             self._memory.append({"role": "user", "content": user_line})
             self._memory.append({"role": "assistant", "content": reply_stripped})
@@ -486,7 +565,7 @@ class LunaTwitchBot(commands.Bot):
                 ),
             )
 
-        if tts_enabled():
+        if local_speak and tts_enabled():
             if self._chat_hub:
                 await self._chat_hub.broadcast(
                     {
@@ -506,6 +585,54 @@ class LunaTwitchBot(commands.Bot):
                             "value": False,
                         }
                     )
+        return reply_stripped
+
+    async def handle_discord_chat(
+        self,
+        *,
+        author: str,
+        question: str,
+        discord_channel_label: str,
+        is_dm: bool,
+    ) -> tuple[str, "Path | None"]:
+        """Entry point for Discord text messages.
+
+        Mirrors the incoming message to the viewer panel, then runs the same
+        reply pipeline as Twitch / viewer so memory + chat hub stay in sync.
+        Skips LOCAL TTS playback (the streamer doesn't want Discord chatter
+        spoken through their headphones) and instead synthesises a separate
+        audio file that the Discord layer attaches to its text reply. Set
+        ``LUNA_DISCORD_TTS=0`` to disable the audio attachment entirely.
+        """
+        source = "Discord DM" if is_dm else f"Discord {discord_channel_label}"
+        ts = int(time.time() * 1000)
+        if self._chat_hub:
+            await self._chat_hub.broadcast(
+                {
+                    "type": "chat",
+                    "user": author,
+                    "text": question,
+                    "channel": source,
+                    "ts": ts,
+                }
+            )
+        reply = await self._generate_and_dispatch_reply(
+            channel_name=source,
+            author=author,
+            question=question,
+            send_to_twitch=False,
+            source=source,
+            local_speak=False,
+        )
+
+        audio_path: Path | None = None
+        if reply and _env_truthy("LUNA_DISCORD_TTS", default=True) and tts_enabled():
+            try:
+                audio_path = await asyncio.to_thread(synthesize_reply_to_file, reply)
+            except Exception as exc:
+                print(f"(discord tts) synth failed: {exc}", flush=True)
+                audio_path = None
+        return reply, audio_path
 
     @commands.command(name="ai", aliases=["luna"])
     async def cmd_ai(self, ctx: commands.Context, *, question: str | None = None) -> None:
@@ -725,6 +852,27 @@ async def _run_async(
         chat_hub=hub,
         discord_bot=discord_bot_obj,
     )
+    # Wire Discord free-text chat into LunaTwitchBot's shared memory pipeline.
+    if discord_bot_obj is not None:
+        discord_bot_obj.set_chat_handler(bot.handle_discord_chat)
+
+    # Kick off STT + TTS warmups in the background. These cost a few seconds
+    # of model load / DNS handshake the FIRST time they're called, so doing
+    # them up front means the first user utterance / first reply is fast.
+    async def _warm_stt() -> None:
+        try:
+            await asyncio.to_thread(stt_prewarm)
+        except Exception as exc:
+            print(f"(stt prewarm) failed: {exc}", flush=True)
+
+    async def _warm_tts() -> None:
+        try:
+            await asyncio.to_thread(prewarm_edge_tts)
+        except Exception as exc:
+            print(f"(tts prewarm) failed: {exc}", flush=True)
+
+    asyncio.create_task(_warm_stt(), name="luna-stt-prewarm")
+    asyncio.create_task(_warm_tts(), name="luna-tts-prewarm")
     if hub:
         async def _on_client_message(payload: dict) -> None:
             msg_type = payload.get("type")
@@ -819,6 +967,7 @@ async def _run_async(
                     author="viewer",
                     question=text,
                     send_to_twitch=False,
+                    source="viewer panel",
                 )
                 return
 
@@ -870,6 +1019,7 @@ async def _run_async(
                         author="viewer",
                         question=text,
                         send_to_twitch=False,
+                        source="viewer voice",
                     )
                 except Exception as exc:
                     print(f"(viewer_voice) error: {exc}", flush=True)

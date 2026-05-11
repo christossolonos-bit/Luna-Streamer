@@ -68,6 +68,7 @@ export type BridgeControlEnrollStateMessage = {
   enrolled: boolean;
   min_sim: number;
   last_sim: number | null;
+  samples?: number;
 };
 
 export type BridgeControlMessage =
@@ -138,6 +139,7 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
         : o.last_sim === null
         ? null
         : null;
+    const samples = typeof o.samples === "number" ? o.samples : undefined;
     return {
       type: "control",
       name: "enroll_state",
@@ -145,6 +147,7 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       enrolled,
       min_sim: minSim,
       last_sim: lastSim,
+      samples,
     };
   }
   if (t === "chat" && typeof o.user === "string" && typeof o.text === "string") {

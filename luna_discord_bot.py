@@ -1,7 +1,9 @@
-"""Discord music bot for Luna streamer (joins a voice channel, plays YouTube audio).
+"""Discord music + chat bot for Luna streamer.
 
 Runs in the same asyncio loop as the Twitch bot (started from twitch_bot._run_async).
 Resolves tracks via youtube_audio.resolve_track and streams them with FFmpeg.
+Free-text messages (anything that is not a ``!command``) are forwarded to the
+LunaTwitchBot reply pipeline so memory is shared across viewer / Twitch / Discord.
 
 Discord commands (in any text channel the bot can read):
   !join                   Join the caller's current voice channel
@@ -13,20 +15,37 @@ Discord commands (in any text channel the bot can read):
   !queue / !nowplaying    Show queue / current track
 
 Env:
-  DISCORD_TOKEN              Bot token (required to enable Discord).
-  DISCORD_COMMAND_PREFIX     Command prefix (default "!").
-  DISCORD_VOICE_GUILD_ID     Optional. With DISCORD_VOICE_CHANNEL_ID, auto-join on ready.
-  DISCORD_VOICE_CHANNEL_ID   Optional voice channel id to auto-join.
-  DISCORD_TEXT_CHANNEL_ID    Optional text channel id for now-playing messages.
+  DISCORD_TOKEN                    Bot token (required to enable Discord).
+  DISCORD_COMMAND_PREFIX           Command prefix (default "!").
+  DISCORD_VOICE_GUILD_ID           Optional. With DISCORD_VOICE_CHANNEL_ID, auto-join on ready.
+  DISCORD_VOICE_CHANNEL_ID         Optional voice channel id to auto-join.
+  DISCORD_TEXT_CHANNEL_ID          Optional text channel id for now-playing messages.
+  LUNA_DISCORD_SELF_DEAF           If 0/false/no/off, join VC without self-deafen (cosmetic;
+                                   bot still does not use VC audio for STT). Default: 1.
+  LUNA_DISCORD_CHAT                Master switch for free-text chat replies. Default 1.
+  LUNA_DISCORD_CHAT_TRIGGER        "all" (any non-command msg in allowed channels) or
+                                   "mention" (only when bot is @-mentioned or "luna" appears).
+                                   Default "mention".
+  LUNA_DISCORD_CHAT_CHANNEL_IDS    Optional comma-separated allowlist of text channel ids.
+                                   Empty = all text channels Luna can see.
+  LUNA_DISCORD_CHAT_DM             1 to also reply to DMs (default 1).
+  LUNA_DISCORD_CHAT_COOLDOWN_SEC   Min seconds between Luna replies per channel. Default 4.
+  LUNA_DISCORD_TTS                 1 to attach a TTS voice clip of Luna's reply under the
+                                   text in Discord chat (default 1). The clip is generated
+                                   per-reply and uploaded as a file; it does NOT play on
+                                   the streamer's local speakers (the VRM viewer's TTS is
+                                   skipped for Discord-originated messages).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 try:
     import discord
@@ -41,6 +60,48 @@ from youtube_audio import resolve_track, short_status_line
 
 _FFMPEG_BEFORE_OPTS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 _FFMPEG_OPTS = "-vn"
+
+# Discord hard cap is 2000 chars per message; leave a little headroom.
+_DISCORD_MSG_CHUNK = 1900
+
+# Handler may return either ``reply`` (str) or ``(reply, audio_path | None)``.
+ChatHandler = Callable[..., Awaitable[Any]]
+
+
+def _env_truthy(key: str, default: bool = False) -> bool:
+    raw = (os.environ.get(key, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def _channel_allowed_for_chat(channel_id: int) -> bool:
+    raw = (os.environ.get("LUNA_DISCORD_CHAT_CHANNEL_IDS") or "").strip()
+    if not raw:
+        return True
+    allowed = {s.strip() for s in raw.split(",") if s.strip()}
+    return str(channel_id) in allowed
+
+
+def _chunk_discord(text: str, limit: int = _DISCORD_MSG_CHUNK) -> list[str]:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks: list[str] = []
+    buf = ""
+    for line in text.splitlines(keepends=True):
+        if len(buf) + len(line) > limit and buf:
+            chunks.append(buf)
+            buf = ""
+        if len(line) > limit:
+            for i in range(0, len(line), limit):
+                chunks.append(line[i : i + limit])
+            buf = ""
+            continue
+        buf += line
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 def discord_enabled() -> bool:
@@ -92,7 +153,17 @@ class _GuildPlayer:
                     return None
             return self.voice
         try:
-            self.voice = await channel.connect(self_deaf=True, reconnect=True)
+            # self_deaf=True (default for many music bots): we only transmit playback,
+            # so we don't subscribe to incoming voice — Discord shows the "deafened" icon.
+            # Set LUNA_DISCORD_SELF_DEAF=0 if you prefer the bot to appear not deafened
+            # (cosmetic only; this bot still does not process VC audio for STT).
+            _deaf = (os.environ.get("LUNA_DISCORD_SELF_DEAF", "1") or "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            self.voice = await channel.connect(self_deaf=_deaf, reconnect=True)
         except Exception:
             self.voice = None
         return self.voice
@@ -172,7 +243,75 @@ class LunaDiscordBot:
         intents.voice_states = True
         self.bot = dcommands.Bot(command_prefix=prefix, intents=intents)
         self.players: dict[int, _GuildPlayer] = {}
+        self._prefix = prefix
+        self._chat_handler: ChatHandler | None = None
+        # Per-channel cooldown so Luna doesn't spam in a busy room.
+        self._chat_last_reply_ts: dict[int, float] = {}
+        # Per-channel single-flight lock so two near-simultaneous messages don't
+        # both go to Ollama for the same channel.
+        self._chat_locks: dict[int, asyncio.Lock] = {}
         self._register_events_and_commands()
+
+    def set_chat_handler(self, handler: ChatHandler | None) -> None:
+        """Wire a coroutine that turns an incoming Discord message into a reply.
+
+        The handler is called as ``handler(author=..., question=...,
+        discord_channel_label=..., is_dm=...)`` and must return the assistant
+        reply text (or None to skip sending). Typically this is
+        ``LunaTwitchBot.handle_discord_chat`` so memory + viewer + TTS stay in
+        sync with Twitch.
+        """
+        self._chat_handler = handler
+
+    def _chat_lock(self, channel_id: int) -> asyncio.Lock:
+        lock = self._chat_locks.get(channel_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._chat_locks[channel_id] = lock
+        return lock
+
+    async def _send_reply_with_audio(
+        self,
+        channel: Any,
+        reply_text: str,
+        audio_path: Path | None,
+    ) -> None:
+        """Post a Discord reply with optional TTS audio attached to the last chunk.
+
+        Sends text first so it appears in the timeline immediately; the voice
+        clip is attached to the FINAL text chunk so it renders right under
+        the text. If the reply is empty but audio exists, just sends the
+        audio. Falls back to text-only if the file upload fails.
+        """
+        import discord  # local import: optional dependency
+
+        chunks = _chunk_discord(reply_text) if reply_text else []
+        # No text? Just send the audio if we have it.
+        if not chunks:
+            if audio_path is not None and audio_path.exists():
+                try:
+                    await channel.send(file=discord.File(str(audio_path), filename=audio_path.name))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"(discord chat) audio-only send failed: {exc}", flush=True)
+            return
+
+        for idx, part in enumerate(chunks):
+            is_last = idx == len(chunks) - 1
+            try:
+                if is_last and audio_path is not None and audio_path.exists():
+                    try:
+                        await channel.send(
+                            content=part,
+                            file=discord.File(str(audio_path), filename=audio_path.name),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"(discord chat) audio attach failed, sending text only: {exc}", flush=True)
+                        await channel.send(part)
+                else:
+                    await channel.send(part)
+            except Exception as exc:  # noqa: BLE001
+                print(f"(discord chat) send failed: {exc}", flush=True)
+                break
 
     def _player(self, guild_id: int) -> _GuildPlayer:
         if guild_id not in self.players:
@@ -299,6 +438,96 @@ class LunaDiscordBot:
     def _register_events_and_commands(self) -> None:
         bot = self.bot
         outer = self
+
+        @bot.event
+        async def on_message(message: "discord.Message") -> None:
+            # Ignore our own messages and other bots so we never loop on
+            # bot-to-bot chatter.
+            if message.author.bot:
+                return
+            # Always let the command framework see the message first so
+            # !play / !join / !skip etc. keep working.
+            await bot.process_commands(message)
+
+            content = (message.content or "").strip()
+            if not content:
+                return
+            if content.startswith(outer._prefix):
+                return
+            if outer._chat_handler is None:
+                return
+            if not _env_truthy("LUNA_DISCORD_CHAT", default=True):
+                return
+
+            is_dm = message.guild is None
+            if is_dm:
+                if not _env_truthy("LUNA_DISCORD_CHAT_DM", default=True):
+                    return
+                channel_label = "DM"
+            else:
+                if not _channel_allowed_for_chat(message.channel.id):
+                    return
+                channel_label = f"#{getattr(message.channel, 'name', message.channel.id)}"
+
+            # Trigger gate: "all" answers everything, "mention" needs an explicit
+            # ping or the word "luna" in the message.
+            trigger = (os.environ.get("LUNA_DISCORD_CHAT_TRIGGER") or "mention").strip().lower()
+            if not is_dm and trigger != "all":
+                me = bot.user
+                mentioned = bool(me) and me in (message.mentions or [])
+                lowered = content.lower()
+                name_hit = "luna" in lowered
+                if not (mentioned or name_hit):
+                    return
+
+            # Per-channel cooldown.
+            try:
+                cooldown = float(os.environ.get("LUNA_DISCORD_CHAT_COOLDOWN_SEC", "4") or "4")
+            except ValueError:
+                cooldown = 4.0
+            now = time.time()
+            last = outer._chat_last_reply_ts.get(message.channel.id, 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                return
+
+            lock = outer._chat_lock(message.channel.id)
+            if lock.locked():
+                return
+            async with lock:
+                outer._chat_last_reply_ts[message.channel.id] = time.time()
+                author_name = getattr(message.author, "display_name", None) or str(message.author)
+                try:
+                    async with message.channel.typing():
+                        result = await outer._chat_handler(
+                            author=author_name,
+                            question=content,
+                            discord_channel_label=channel_label,
+                            is_dm=is_dm,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"(discord chat) handler error: {exc}", flush=True)
+                    return
+
+                # Handler may return either a plain str or (str, audio_path|None).
+                audio_path: Path | None = None
+                if isinstance(result, tuple):
+                    reply = result[0] if result else ""
+                    if len(result) >= 2 and result[1] is not None:
+                        try:
+                            audio_path = Path(result[1])  # type: ignore[arg-type]
+                        except TypeError:
+                            audio_path = None
+                else:
+                    reply = result or ""
+
+                try:
+                    await outer._send_reply_with_audio(message.channel, reply, audio_path)
+                finally:
+                    if audio_path is not None:
+                        try:
+                            audio_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
 
         @bot.event
         async def on_ready() -> None:

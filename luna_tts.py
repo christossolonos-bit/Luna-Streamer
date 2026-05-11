@@ -20,12 +20,13 @@ Env:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
-import asyncio
 import threading
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from typing import Any
 _selected_speaker: str | None = None
 _cb_model: Any = None
 _tts_play_lock = threading.Lock()
+_edge_prewarmed = False
 
 
 def _env_bool(key: str, default: str = "") -> bool:
@@ -263,9 +265,13 @@ def _split_tts_chunks(text: str, target_chars: int) -> list[str]:
     return final
 
 
-def maybe_speak(reply_text: str) -> None:
-    if not tts_enabled():
-        return
+def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
+    """Clean a reply for synthesis.
+
+    Returns ``(cleaned_text, emotion)``. ``cleaned_text`` may be empty if the
+    reply was entirely emojis / decoration, in which case callers should skip
+    synthesis. ``emotion`` is the detected emotion label used for prosody.
+    """
     text = (reply_text or "").strip()
     # Remove common ASCII emoticons/smiley faces before TTS.
     text = re.sub(r"(?::|;|=|8)(?:-)?(?:\)|\(|D|P|p|/|\\|\||\*)", " ", text)
@@ -283,11 +289,9 @@ def maybe_speak(reply_text: str) -> None:
         if not inner:
             return " "
         if song_mode and _is_action_phrase(inner):
-            # In songs, skip action tags and keep lyrical parts.
             return " "
         return f" {inner} "
 
-    # Speak content inside *...* without asterisks.
     text = re.sub(r"\*([^*]+)\*", _star_replace, text)
     text = re.sub(r"\(([^()]+)\)", lambda m: _action_sound(m.group(1)), text)
     text = re.sub(r"[*_`]+", "", text)
@@ -296,11 +300,19 @@ def maybe_speak(reply_text: str) -> None:
     if len(text) > max_chars:
         text = text[: max_chars - 3].rstrip() + "..."
     if not text:
-        return
-
+        return "", ""
     text = _enhance_interjections_for_tts(text)
-
     emotion = _classify_emotion(text)
+    return text, emotion
+
+
+def maybe_speak(reply_text: str) -> None:
+    """Synthesize and PLAY a reply locally (used by Twitch / viewer pipelines)."""
+    if not tts_enabled():
+        return
+    text, emotion = _clean_text_for_tts(reply_text)
+    if not text:
+        return
     rate, pitch = _prosody_for_emotion(emotion)
 
     backend = _backend()
@@ -345,6 +357,99 @@ def maybe_speak(reply_text: str) -> None:
             print(f"(LUNA_TTS {backend} synthesis failed: {exc})", flush=True)
 
 
+def synthesize_reply_to_file(reply_text: str) -> Path | None:
+    """Synthesize a reply to a standalone audio file without playing it.
+
+    Returns the path to an MP3 (Edge backend) or WAV (Chatterbox). The caller
+    owns the file and should delete it when finished (e.g. after uploading to
+    Discord). Returns None if TTS is disabled or the reply is empty.
+    """
+    if not tts_enabled():
+        return None
+    text, emotion = _clean_text_for_tts(reply_text)
+    if not text:
+        return None
+    rate, pitch = _prosody_for_emotion(emotion)
+
+    backend = _backend()
+    try:
+        if backend == "chatterbox":
+            chunk_chars = int(os.environ.get("LUNA_CHATTERBOX_CHUNK_CHARS", "120").strip() or "120")
+            chunks = _split_tts_chunks(text, chunk_chars) or [text]
+            # Chatterbox needs to render each chunk; concatenate to a single WAV.
+            fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_chatter_out_")
+            os.close(fd)
+            combined = Path(tmp)
+            if len(chunks) == 1:
+                _synthesize_chatterbox_to_wav(chunks[0], combined, emotion=emotion)
+                return combined
+            # Multi-chunk: synth each to temp, then concat with ffmpeg.
+            tmp_parts: list[Path] = []
+            try:
+                for i, part in enumerate(chunks):
+                    fd_p, p_tmp = tempfile.mkstemp(suffix=".wav", prefix=f"luna_chatter_part_{i}_")
+                    os.close(fd_p)
+                    p = Path(p_tmp)
+                    _synthesize_chatterbox_to_wav(part, p, emotion=emotion)
+                    tmp_parts.append(p)
+                _concat_audio_with_ffmpeg(tmp_parts, combined)
+            finally:
+                for p in tmp_parts:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            return combined
+
+        # Edge: single MP3 output.
+        fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_discord_")
+        os.close(fd)
+        mp3_out = Path(tmp)
+        _synthesize_edge_to_mp3(text, mp3_out, voice=get_effective_speaker(), rate=rate, pitch=pitch)
+        return mp3_out
+    except Exception as exc:
+        print(f"(LUNA_TTS {backend} file synth failed: {exc})", flush=True)
+        return None
+
+
+def _concat_audio_with_ffmpeg(parts: list[Path], out_path: Path) -> None:
+    """Concatenate multiple WAV files into one via ffmpeg's concat demuxer."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        # Fallback: just copy the first one so we still have a usable file.
+        if parts:
+            out_path.write_bytes(parts[0].read_bytes())
+        return
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, prefix="luna_concat_"
+    ) as listfile:
+        for p in parts:
+            listfile.write(f"file '{str(p).replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'\n")
+        list_path = listfile.name
+    try:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_path,
+            "-c",
+            "copy",
+            str(out_path),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, check=False)
+    finally:
+        try:
+            os.unlink(list_path)
+        except OSError:
+            pass
+
+
 def _synthesize_edge_to_mp3(text: str, out_path: Path, voice: str, rate: str, pitch: str) -> None:
     import edge_tts
 
@@ -355,10 +460,73 @@ def _synthesize_edge_to_mp3(text: str, out_path: Path, voice: str, rate: str, pi
     asyncio.run(_run())
 
 
-def _mp3_to_wav(src: Path, dst: Path) -> None:
-    from pydub import AudioSegment
+def prewarm_edge_tts() -> None:
+    """Warm Edge TTS so the first user reply doesn't pay DNS + TLS handshake.
 
-    AudioSegment.from_file(src, format="mp3").export(dst, format="wav")
+    Synthesises a single short sample and discards it. No-op after first
+    success. Safe to call multiple times.
+    """
+    global _edge_prewarmed
+    if _edge_prewarmed:
+        return
+    if not tts_enabled() or _backend() != "edge":
+        _edge_prewarmed = True
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_edge_warm_")
+        os.close(fd)
+        warm_out = Path(tmp)
+        try:
+            _synthesize_edge_to_mp3(
+                "hi",
+                warm_out,
+                voice=get_effective_speaker(),
+                rate=os.environ.get("LUNA_EDGE_RATE", "+0%").strip() or "+0%",
+                pitch=os.environ.get("LUNA_EDGE_PITCH", "+0Hz").strip() or "+0Hz",
+            )
+        finally:
+            try:
+                warm_out.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _edge_prewarmed = True
+    except Exception as exc:
+        # Non-fatal — first real reply will just be ~200 ms slower.
+        print(f"(tts prewarm) skipped: {exc}", flush=True)
+
+
+def _mp3_to_wav(src: Path, dst: Path) -> None:
+    """Convert MP3 → 24 kHz mono WAV via a single ffmpeg subprocess.
+
+    Avoids pulling pydub / AudioSegment (which itself shells out to ffmpeg
+    plus loads pydub's audioop). Cuts per-reply TTS overhead by ~200 ms.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        # Last-ditch: pydub still works if ffmpeg isn't on PATH.
+        from pydub import AudioSegment
+
+        AudioSegment.from_file(src, format="mp3").export(dst, format="wav")
+        return
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(src),
+        "-ac",
+        "1",
+        "-ar",
+        "24000",
+        "-f",
+        "wav",
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0 or not dst.exists() or dst.stat().st_size < 256:
+        err = (proc.stderr or "").strip() or "ffmpeg mp3->wav failed"
+        raise RuntimeError(err)
 
 
 def _ensure_chatterbox_loaded() -> Any:

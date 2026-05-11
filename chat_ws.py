@@ -39,12 +39,19 @@ class ChatHub:
         text = json.dumps(payload, ensure_ascii=False)
         async with self._lock:
             clients = list(self._clients)
-        dead: list[web.WebSocketResponse] = []
-        for ws in clients:
+        if not clients:
+            return
+        if len(clients) == 1:
+            ws = clients[0]
             try:
                 await ws.send_str(text)
             except Exception:
-                dead.append(ws)
+                await self.remove(ws)
+            return
+        results = await asyncio.gather(
+            *(ws.send_str(text) for ws in clients), return_exceptions=True
+        )
+        dead = [ws for ws, res in zip(clients, results) if isinstance(res, BaseException)]
         for ws in dead:
             await self.remove(ws)
 
