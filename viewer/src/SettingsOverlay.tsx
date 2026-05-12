@@ -2,9 +2,24 @@ import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "reac
 import { useBridge } from "./chatBridgeContext";
 import { CloseIcon, VoiceIcon } from "./icons";
 import type { VrmRuntime, ChromaKeyMode } from "./vrmRuntime";
+import { AVATAR_FACE_EXPRESSIONS, type AvatarFaceExpressionId } from "./avatarExpressions";
 
 /** Length of an enrollment clip (steady speech for accuracy). */
 const ENROLL_RECORD_MS = 4000;
+
+const EXPRESSION_PREVIEW_STORAGE_KEY = "luna.avatar.expression.preview.v1";
+
+function readStoredExpressionPreview(): AvatarFaceExpressionId {
+  try {
+    const v = window.localStorage.getItem(EXPRESSION_PREVIEW_STORAGE_KEY);
+    if (v && AVATAR_FACE_EXPRESSIONS.some((x) => x.id === v)) {
+      return v as AvatarFaceExpressionId;
+    }
+  } catch {
+    /* ignore */
+  }
+  return "relaxed";
+}
 
 function pickRecorderMime(): string {
   if (typeof MediaRecorder === "undefined") return "";
@@ -63,6 +78,9 @@ export function SettingsOverlay({
   const [motionBusy, setMotionBusy] = useState(false);
   const [enrollRecording, setEnrollRecording] = useState(false);
   const [motionError, setMotionError] = useState<string | null>(null);
+  const [previewExpression, setPreviewExpression] = useState<AvatarFaceExpressionId>(() =>
+    readStoredExpressionPreview(),
+  );
 
   const motionInputRef = useRef<HTMLInputElement>(null);
   const enrollMrRef = useRef<MediaRecorder | null>(null);
@@ -216,6 +234,19 @@ export function SettingsOverlay({
       .finally(() => setMotionBusy(false));
   };
 
+  const setExpressionPreview = useCallback((id: AvatarFaceExpressionId) => {
+    setPreviewExpression(id);
+    try {
+      window.localStorage.setItem(EXPRESSION_PREVIEW_STORAGE_KEY, id);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const applyExpressionPreview = useCallback(() => {
+    runtimeRef.current?.triggerEmotion(previewExpression);
+  }, [previewExpression, runtimeRef]);
+
   return (
     <div className="overlay-card overlay-card--settings" role="dialog" aria-label="Settings">
       <div className="overlay-card-header">
@@ -273,6 +304,38 @@ export function SettingsOverlay({
               Connect the chat bridge to choose a TTS voice.
             </p>
           )}
+        </section>
+
+        <section className="settings-section">
+          <h3 className="settings-section-title">Face expression</h3>
+          <p className="settings-hint">
+            Luna picks an expression from this set from each reply (tone keywords). Preview on
+            the avatar anytime.
+          </p>
+          <div className="settings-row settings-row--yt">
+            <select
+              className="settings-select"
+              value={previewExpression}
+              onChange={(e) =>
+                setExpressionPreview(e.target.value as AvatarFaceExpressionId)
+              }
+              aria-label="Face expression preview"
+            >
+              {AVATAR_FACE_EXPRESSIONS.map((ex) => (
+                <option key={ex.id} value={ex.id} title={ex.hint}>
+                  {ex.label}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="settings-btn"
+              onClick={applyExpressionPreview}
+              title="Fire this expression on the VRM now"
+            >
+              Preview on avatar
+            </button>
+          </div>
         </section>
 
         <section className="settings-section">

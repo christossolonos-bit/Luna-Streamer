@@ -221,7 +221,10 @@ export function useChatBridge(enabled: boolean) {
       if (msg.name === "avatar_emotion") {
         window.dispatchEvent(
           new CustomEvent("luna-avatar-emotion", {
-            detail: msg.value,
+            detail: {
+              emotion: msg.value,
+              durationMs: msg.duration_ms,
+            },
           }),
         );
         return;
@@ -243,6 +246,21 @@ export function useChatBridge(enabled: boolean) {
               intensity: msg.intensity ?? 1,
               holdMs: msg.hold_ms ?? 120,
             },
+          }),
+        );
+        return;
+      }
+      if (msg.name === "mic_ready") {
+        const hint =
+          typeof msg.hint === "string" && msg.hint.trim().length > 0
+            ? msg.hint.trim()
+            : "You can speak into the mic now.";
+        setLines((p) =>
+          append(p, {
+            id: nextId(),
+            kind: "status",
+            text: `Mic ready — ${hint}`,
+            ts: Date.now(),
           }),
         );
         return;

@@ -435,7 +435,7 @@ export class VrmRuntime {
     this._lipJawSmoothed = 0;
   }
 
-  triggerEmotion(raw: string) {
+  triggerEmotion(raw: string, durationMs?: number) {
     if (!this.vrm?.expressionManager) return;
     const mgr = this.vrm.expressionManager;
 
@@ -461,13 +461,17 @@ export class VrmRuntime {
     for (const n of ["happy", "sad", "angry", "surprised", "relaxed"]) {
       this._trySetExpression(mgr, emotionAliases[n], n === preset ? 1 : 0);
     }
+    const hold = Math.max(
+      700,
+      Math.min(12_000, durationMs ?? 2600),
+    );
     if (this.emotionTimer) window.clearTimeout(this.emotionTimer);
     this.emotionTimer = window.setTimeout(() => {
       for (const n of ["happy", "sad", "angry", "surprised", "relaxed"]) {
         this._trySetExpression(mgr, emotionAliases[n], 0);
       }
       this.emotionTimer = 0;
-    }, 900);
+    }, hold);
   }
 
   triggerTalk(text: string, holdUntilStop = false) {
@@ -498,7 +502,16 @@ export class VrmRuntime {
         this.talkRaf = requestAnimationFrame(step);
         return;
       }
-      if ((!this._forceSpeaking && now >= this.talkUntil) || this.disposed) {
+      // TTS / "speaking" hold: do not cycle fake vowels between server visemes.
+      if (this._forceSpeaking) {
+        if (mgr) {
+          for (const aliases of vowelAliases) this._trySetExpression(mgr, aliases, 0);
+        }
+        this._lipJawTarget = 0;
+        this.talkRaf = requestAnimationFrame(step);
+        return;
+      }
+      if ((now >= this.talkUntil) || this.disposed) {
         if (mgr) {
           for (const aliases of vowelAliases) this._trySetExpression(mgr, aliases, 0);
         }

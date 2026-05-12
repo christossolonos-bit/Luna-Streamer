@@ -53,6 +53,8 @@ export type BridgeControlAvatarEmotionMessage = {
   type: "control";
   name: "avatar_emotion";
   value: string;
+  /** How long to hold the expression preset (ms); should cover most of TTS. */
+  duration_ms?: number;
 };
 
 export type BridgeControlAvatarSpeakingMessage = {
@@ -67,6 +69,13 @@ export type BridgeControlAvatarVisemeMessage = {
   value: string;
   intensity?: number;
   hold_ms?: number;
+};
+
+export type BridgeControlMicReadyMessage = {
+  type: "control";
+  name: "mic_ready";
+  value: true;
+  hint?: string;
 };
 
 export type BridgeControlEnrollStateMessage = {
@@ -86,6 +95,7 @@ export type BridgeControlMessage =
   | BridgeControlAvatarEmotionMessage
   | BridgeControlAvatarSpeakingMessage
   | BridgeControlAvatarVisemeMessage
+  | BridgeControlMicReadyMessage
   | BridgeControlEnrollStateMessage;
 
 export type BridgeMessage =
@@ -133,7 +143,16 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
     return { type: "control", name: "tts_speaker", value: o.value };
   }
   if (t === "control" && o.name === "avatar_emotion" && typeof o.value === "string") {
-    return { type: "control", name: "avatar_emotion", value: o.value };
+    const duration_ms =
+      typeof o.duration_ms === "number" && Number.isFinite(o.duration_ms)
+        ? o.duration_ms
+        : undefined;
+    return {
+      type: "control",
+      name: "avatar_emotion",
+      value: o.value,
+      ...(duration_ms !== undefined ? { duration_ms } : {}),
+    };
   }
   if (t === "control" && o.name === "avatar_speaking" && typeof o.value === "boolean") {
     return { type: "control", name: "avatar_speaking", value: o.value };
@@ -145,6 +164,14 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       value: o.value,
       intensity: typeof o.intensity === "number" ? o.intensity : undefined,
       hold_ms: typeof o.hold_ms === "number" ? o.hold_ms : undefined,
+    };
+  }
+  if (t === "control" && o.name === "mic_ready" && o.value === true) {
+    return {
+      type: "control",
+      name: "mic_ready",
+      value: true,
+      hint: typeof o.hint === "string" ? o.hint : undefined,
     };
   }
   if (t === "control" && o.name === "enroll_state") {

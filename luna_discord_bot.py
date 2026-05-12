@@ -35,6 +35,12 @@ Env:
                                    per-reply and uploaded as a file; it does NOT play on
                                    the streamer's local speakers (the VRM viewer's TTS is
                                    skipped for Discord-originated messages).
+  LUNA_DISCORD_VOICE_TTS           If 1 (default), after a chat reply Luna also plays the
+                                   same TTS audio in the voice channel she is connected to,
+                                   when VC is idle (no !play music). Users in VC hear her.
+  Voice context                    When the author is in a voice channel, Luna's model
+                                   prompt includes which VC they are in (so she can refer
+                                   to it). !join replies also name that channel explicitly.
 """
 
 from __future__ import annotations
@@ -231,6 +237,46 @@ class _GuildPlayer:
 
             await self.bot.announce_now_playing(self.guild_id, track)
 
+    async def play_tts_file(self, path: Path) -> bool:
+        """Play a local WAV/MP3 in the connected voice channel when not playing music."""
+        if not _DISCORD_AVAILABLE:
+            return False
+        import discord  # noqa: PLC0415
+
+        if not self.is_connected or self.voice is None:
+            return False
+        vc = self.voice
+        if vc.is_playing() or vc.is_paused():
+            print("(discord voice tts) skipped — music or audio already playing", flush=True)
+            return False
+        if not path.is_file() or path.stat().st_size < 32:
+            return False
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+
+        def _after(_error: BaseException | None) -> None:
+            loop.call_soon_threadsafe(done.set)
+
+        try:
+            source = discord.FFmpegPCMAudio(
+                str(path),
+                before_options=_FFMPEG_BEFORE_OPTS,
+                options=_FFMPEG_OPTS,
+            )
+            vc.play(source, after=_after)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(discord voice tts) play() failed: {exc}", flush=True)
+            return False
+        try:
+            await asyncio.wait_for(done.wait(), timeout=600.0)
+        except asyncio.TimeoutError:
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            return False
+        return True
+
 
 class LunaDiscordBot:
     """Wrapper that owns a discord.ext commands.Bot and per-guild players."""
@@ -256,7 +302,7 @@ class LunaDiscordBot:
         """Wire a coroutine that turns an incoming Discord message into a reply.
 
         The handler is called as ``handler(author=..., question=...,
-        discord_channel_label=..., is_dm=...)`` and must return the assistant
+        discord_channel_label=..., is_dm=..., voice_channel_label=...)`` and must return the assistant
         reply text (or None to skip sending). Typically this is
         ``LunaTwitchBot.handle_discord_chat`` so memory + viewer + TTS stay in
         sync with Twitch.
@@ -317,6 +363,13 @@ class LunaDiscordBot:
         if guild_id not in self.players:
             self.players[guild_id] = _GuildPlayer(self, guild_id)
         return self.players[guild_id]
+
+    async def play_reply_tts_in_voice(self, guild_id: int, audio_path: Path) -> None:
+        """Speak a synthesized reply in VC (same file as Discord attachment)."""
+        if not _env_truthy("LUNA_DISCORD_VOICE_TTS", default=True):
+            return
+        player = self._player(guild_id)
+        await player.play_tts_file(audio_path)
 
     async def announce_now_playing(self, guild_id: int, track: Track) -> None:
         guild = self.bot.get_guild(guild_id)
@@ -496,6 +549,11 @@ class LunaDiscordBot:
             async with lock:
                 outer._chat_last_reply_ts[message.channel.id] = time.time()
                 author_name = getattr(message.author, "display_name", None) or str(message.author)
+                voice_channel_label: str | None = None
+                if not is_dm and message.author:
+                    av = getattr(message.author, "voice", None)
+                    if av and av.channel is not None:
+                        voice_channel_label = f"#{av.channel.name}"
                 try:
                     async with message.channel.typing():
                         result = await outer._chat_handler(
@@ -503,6 +561,7 @@ class LunaDiscordBot:
                             question=content,
                             discord_channel_label=channel_label,
                             is_dm=is_dm,
+                            voice_channel_label=voice_channel_label,
                         )
                 except Exception as exc:  # noqa: BLE001
                     print(f"(discord chat) handler error: {exc}", flush=True)
@@ -522,6 +581,16 @@ class LunaDiscordBot:
 
                 try:
                     await outer._send_reply_with_audio(message.channel, reply, audio_path)
+                    if (
+                        not is_dm
+                        and message.guild is not None
+                        and audio_path is not None
+                        and audio_path.exists()
+                    ):
+                        try:
+                            await outer.play_reply_tts_in_voice(message.guild.id, audio_path)
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"(discord voice tts) {exc}", flush=True)
                 finally:
                     if audio_path is not None:
                         try:
@@ -585,12 +654,16 @@ class LunaDiscordBot:
                 await ctx.reply("Use this in a server.")
                 return
             if not (ctx.author and ctx.author.voice and ctx.author.voice.channel):
-                await ctx.reply("Join a voice channel first.")
+                await ctx.reply("Join a voice channel first, then run `!join` — I need to see which channel you're in.")
                 return
+            ch = ctx.author.voice.channel
             player = outer._player(ctx.guild.id)
-            vc = await player.ensure_voice(ctx.author.voice.channel)
+            vc = await player.ensure_voice(ch)
             if vc:
-                await ctx.reply(f"Joined #{ctx.author.voice.channel.name}.")
+                await ctx.reply(
+                    f"I see you in voice **{ch.name}**. Joining that channel now — "
+                    "I'll include it in context when you chat here."
+                )
             else:
                 await ctx.reply("Could not join voice.")
 

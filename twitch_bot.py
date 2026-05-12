@@ -23,6 +23,8 @@ Environment (or use CLI flags where noted):
   LUNA_EDGE_PITCH    Edge pitch adjustment like +0Hz / -2Hz
   LUNA_TTS_SPEAKER   Initial voice id
   LUNA_TTS_VOICES    CSV voice list (voice or voice:Label) for viewer menu
+  LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC  Seconds after TTS playback ends before viewer mic
+    clips are accepted (echo / ring-out guard; default 3). Set 0 to disable the tail guard.
   LUNA_STT_LOCAL_MODEL  faster-whisper size (default tiny); LUNA_STT_LOCAL_DEVICE cpu|cuda (unset = auto GPU if available)
   LUNA_SPEAKER_ONLY  If 1, viewer mic clips must match the enrolled voice (see chat panel "Enroll my voice")
   LUNA_SPEAKER_MIN_SIM  Cosine similarity threshold for the speaker check (default 0.75)
@@ -57,6 +59,7 @@ Environment (or use CLI flags where noted):
   DISCORD_VOICE_GUILD_ID    Guild id; with DISCORD_VOICE_CHANNEL_ID enables auto-join on ready and remote enqueue from Twitch / panel.
   DISCORD_VOICE_CHANNEL_ID  Voice channel id to auto-join.
   DISCORD_TEXT_CHANNEL_ID   Optional. Text channel for now-playing announcements (else first channel the bot can write in).
+  LUNA_DISCORD_VOICE_TTS    If 1 (default), play Luna's Discord reply TTS in the connected VC when idle (see luna_discord_bot.py).
 """
 
 from __future__ import annotations
@@ -149,22 +152,138 @@ def _speaker_state_control_message() -> dict:
 
 
 def detect_avatar_emotion(text: str) -> str:
+    """Map assistant reply text to a VRM preset face id (viewer: happy|sad|angry|surprised|relaxed).
+
+    Uses weighted keyword / phrase cues so the face roughly matches the reply tone.
+    """
     t = (text or "").lower()
+    scores: dict[str, float] = {"happy": 0.0, "sad": 0.0, "angry": 0.0, "surprised": 0.0, "relaxed": 0.0}
+
+    def add(emotion: str, weight: float) -> None:
+        scores[emotion] = scores.get(emotion, 0.0) + weight
+
+    # Strong action / roleplay markers (same spirit as before, higher weight).
     if any(k in t for k in ("*scream*", "*shout*", " screaming", " shouted", "shouting")):
-        return "shout"
-    if any(k in t for k in ("*scared*", "*afraid*", " terrified", " scared", "frightened")):
-        return "surprised"
-    if any(k in t for k in ("*surprised*", "*gasp*", " surprised", " gasp")):
-        return "surprised"
-    if any(k in t for k in ("*cry*", "*crying*", "*sad*", " i cried", " sob", "tears", "sad ")):
-        return "sad"
-    if any(k in t for k in ("*angry*", "*mad*", " furious", " angry", "annoyed")):
-        return "angry"
-    if any(k in t for k in ("*excited*", " let's go", " woo", " so hyped", " excited")):
-        return "happy"
-    if any(k in t for k in ("*laugh*", "*giggle*", "*chuckle*", " haha", " lol")):
-        return "happy"
-    return "neutral"
+        add("surprised", 5.0)
+    if any(k in t for k in ("*scared*", "*afraid*", " terrified", " frightened")):
+        add("surprised", 4.0)
+    if any(k in t for k in ("*surprised*", "*gasp*", " gasp", " jaw dropped")):
+        add("surprised", 4.0)
+    if any(k in t for k in ("*cry*", "*crying*", "*sob*", " i cried", " tears", "heartbroken")):
+        add("sad", 5.0)
+    if any(k in t for k in ("*angry*", "*mad*", " furious", " livid", " outraged")):
+        add("angry", 5.0)
+    if any(k in t for k in ("*laugh*", "*giggle*", "*chuckle*", " haha", " hehe", " lol", " lmao")):
+        add("happy", 4.0)
+    if any(k in t for k in ("*excited*", " woo", " let's go", " hyped", " can't wait")):
+        add("happy", 3.5)
+
+    # Phrase buckets (contextual reactions).
+    happy_hits = (
+        "thank you",
+        " thanks ",
+        "appreciate",
+        "love that",
+        " so happy",
+        "glad to",
+        "great news",
+        "awesome",
+        "amazing",
+        "wonderful",
+        "congrats",
+        "proud of you",
+        "you got this",
+        " rooting for",
+        "cute",
+        "adorable",
+        "sweet",
+        "hugs",
+        " mwah",
+    )
+    for phrase in happy_hits:
+        if phrase in t:
+            add("happy", 2.0)
+
+    sad_hits = (
+        "i'm sorry",
+        " im sorry",
+        "that's rough",
+        " that sucks",
+        "unfortunate",
+        "disappointing",
+        "feel bad",
+        "sympath",
+        "condolences",
+        "rest in peace",
+        " rip ",
+        "miss them",
+        "lonely",
+        "depressing",
+    )
+    for phrase in sad_hits:
+        if phrase in t:
+            add("sad", 2.0)
+
+    angry_hits = (
+        "not fair",
+        "unacceptable",
+        "ridiculous",
+        "frustrating",
+        "annoying",
+        "angry",
+        "furious",
+        "fed up",
+        "cut it out",
+        "stop that",
+        "enough already",
+    )
+    for phrase in angry_hits:
+        if phrase in t:
+            add("angry", 2.0)
+
+    surprise_hits = (
+        "no way",
+        "wait what",
+        " seriously?",
+        " holy ",
+        "omg",
+        " oh my",
+        "wow",
+        " incredible",
+        " i can't believe",
+        "plot twist",
+        "shocked",
+        "astonished",
+    )
+    for phrase in surprise_hits:
+        if phrase in t:
+            add("surprised", 2.0)
+
+    calm_hits = (
+        "take your time",
+        "no rush",
+        " step by step",
+        " calmly",
+        " for now",
+        "by the way",
+        " anyway",
+        " in short",
+        " basically",
+    )
+    for phrase in calm_hits:
+        if phrase in t:
+            add("relaxed", 1.2)
+
+    # Question / uncertainty → slight surprise or neutral, not anger.
+    if "?" in t and scores["surprised"] < 1 and scores["happy"] < 2:
+        add("surprised", 0.8)
+
+    # Pick winner; tie-break prefers more specific expressive faces over neutral.
+    tie = {"surprised": 5, "angry": 4, "sad": 3, "happy": 2, "relaxed": 1}
+    best = max(scores, key=lambda k: (scores[k], tie.get(k, 0)))
+    if scores[best] <= 0:
+        return "relaxed"
+    return best
 
 
 async def safe_send(ctx: commands.Context, content: str) -> None:
@@ -252,8 +371,9 @@ class LunaTwitchBot(commands.Bot):
         self._avatar_speaking = False
         self._last_avatar_speaking_end_ts = 0.0
         self._viewer_voice_block_after_tts_sec = max(
-            0.0, float(os.environ.get("LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC", "4.0").strip() or "4.0")
+            0.0, float(os.environ.get("LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC", "3.0").strip() or "3.0")
         )
+        self._mic_ready_task: asyncio.Task[None] | None = None
         self._last_assistant_reply = ""
         self._load_memory_from_disk()
         self._load_user_memory_from_disk()
@@ -270,6 +390,46 @@ class LunaTwitchBot(commands.Bot):
         # Small tail guard for buffered recorder chunks / playback ring-out.
         return (time.monotonic() - self._last_avatar_speaking_end_ts) >= self._viewer_voice_block_after_tts_sec
 
+    def viewer_voice_cooldown_remaining_sec(self) -> float:
+        """Seconds until the post-TTS mic tail guard clears (0 if ready)."""
+        if self._avatar_speaking:
+            return 0.0
+        elapsed = time.monotonic() - self._last_avatar_speaking_end_ts
+        return max(0.0, self._viewer_voice_block_after_tts_sec - elapsed)
+
+    def _cancel_mic_ready_task(self) -> None:
+        t = self._mic_ready_task
+        self._mic_ready_task = None
+        if t is not None and not t.done():
+            t.cancel()
+
+    async def _mic_ready_broadcast_after_delay(self, hub: ChatHub, delay_sec: float) -> None:
+        try:
+            if delay_sec > 0:
+                await asyncio.sleep(delay_sec)
+            await hub.broadcast(
+                {
+                    "type": "control",
+                    "name": "mic_ready",
+                    "value": True,
+                    "hint": "You can speak into the mic now.",
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _schedule_mic_ready_after_tts(self, hub: ChatHub) -> None:
+        """Tell the viewer when the post-TTS echo guard has cleared (new TTS cancels this)."""
+        self._cancel_mic_ready_task()
+        delay = self._viewer_voice_block_after_tts_sec
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._mic_ready_task = loop.create_task(self._mic_ready_broadcast_after_delay(hub, delay))
+
     @staticmethod
     def _normalize_text_for_echo(text: str) -> str:
         cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
@@ -281,14 +441,22 @@ class LunaTwitchBot(commands.Bot):
         if len(current) < 20 or len(prev) < 20:
             return False
         sim = SequenceMatcher(None, current[:400], prev[:400]).ratio()
+        # Near-verbatim replay (typical headphone bleed of Luna's TTS).
         if sim >= 0.78:
             return True
         c_tokens = set(current.split())
         p_tokens = set(prev.split())
         if not c_tokens or not p_tokens:
             return False
+        # Short answers often reuse Luna's vocabulary without being a replay;
+        # only use token overlap when the transcript is long enough to plausibly
+        # be a full line picked up from speakers.
+        if len(c_tokens) < 16:
+            return False
+        if len(current) < max(100, int(len(prev) * 0.36)):
+            return False
         overlap = len(c_tokens & p_tokens) / max(1, len(c_tokens))
-        return overlap >= 0.75
+        return overlap >= 0.82
 
     def _persist_memory_to_disk(self) -> None:
         if not self._memory_persist or self._memory_turns <= 0:
@@ -722,6 +890,7 @@ class LunaTwitchBot(commands.Bot):
         send_to_twitch: bool = True,
         source: str = "Twitch chat",
         local_speak: bool = True,
+        discord_voice_channel: str | None = None,
     ) -> str:
         """Generate a reply, append to shared memory, broadcast to hub + TTS.
 
@@ -736,7 +905,12 @@ class LunaTwitchBot(commands.Bot):
         audio attachment instead). The viewer still receives the assistant
         message + emotion broadcasts so the panel stays in sync.
         """
-        user_line = f"[{author} in {source}]: {question.strip()}"
+        vc_note = ""
+        if discord_voice_channel:
+            vc_note = (
+                f" — speaker is currently in Discord voice channel {discord_voice_channel}"
+            )
+        user_line = f"[{author} in {source}{vc_note}]: {question.strip()}"
 
         messages: list[dict] = []
         system_content = self._system
@@ -808,6 +982,18 @@ class LunaTwitchBot(commands.Bot):
 
         if self._chat_hub:
             ts = int(time.time() * 1000)
+            # Tell the viewer TTS is about to start *before* the assistant line so
+            # the UI does not fire text-timed lip animation (luna-assistant-reply).
+            if local_speak and tts_enabled():
+                self._cancel_mic_ready_task()
+                await self._chat_hub.broadcast(
+                    {
+                        "type": "control",
+                        "name": "avatar_speaking",
+                        "value": True,
+                    }
+                )
+                self._avatar_speaking = True
             await asyncio.gather(
                 self._chat_hub.broadcast(
                     {
@@ -823,20 +1009,15 @@ class LunaTwitchBot(commands.Bot):
                         "type": "control",
                         "name": "avatar_emotion",
                         "value": detect_avatar_emotion(reply_stripped),
+                        "duration_ms": min(
+                            12_000,
+                            max(1_800, int(len(reply_stripped) * 42)),
+                        ),
                     }
                 ),
             )
 
         if local_speak and tts_enabled():
-            if self._chat_hub:
-                await self._chat_hub.broadcast(
-                    {
-                        "type": "control",
-                        "name": "avatar_speaking",
-                        "value": True,
-                    }
-                )
-            self._avatar_speaking = True
             loop = asyncio.get_running_loop()
 
             def _emit_viseme(vowel: str, intensity: float, hold_ms: int) -> None:
@@ -869,6 +1050,7 @@ class LunaTwitchBot(commands.Bot):
                             "value": False,
                         }
                     )
+                    self._schedule_mic_ready_after_tts(self._chat_hub)
         return reply_stripped
 
     async def handle_discord_chat(
@@ -878,6 +1060,7 @@ class LunaTwitchBot(commands.Bot):
         question: str,
         discord_channel_label: str,
         is_dm: bool,
+        voice_channel_label: str | None = None,
     ) -> tuple[str, "Path | None"]:
         """Entry point for Discord text messages.
 
@@ -907,6 +1090,7 @@ class LunaTwitchBot(commands.Bot):
             send_to_twitch=False,
             source=source,
             local_speak=False,
+            discord_voice_channel=voice_channel_label,
         )
 
         audio_path: Path | None = None
@@ -1258,12 +1442,16 @@ async def _run_async(
             if msg_type == "viewer_voice":
                 try:
                     if not bot.viewer_voice_allowed():
-                        await hub.broadcast(
-                            {
-                                "type": "status",
-                                "text": "Mic clip ignored while Luna is speaking.",
-                            }
-                        )
+                        if bot._avatar_speaking:
+                            gate_msg = "Mic clip ignored: Luna is still speaking."
+                        else:
+                            rem = bot.viewer_voice_cooldown_remaining_sec()
+                            w = max(1, int(rem + 0.99))
+                            gate_msg = (
+                                f"Mic clip ignored: wait ~{w}s after Luna's voice (echo guard). "
+                                "Watch for a 'Mic ready' line, then speak."
+                            )
+                        await hub.broadcast({"type": "status", "text": gate_msg})
                         return
                     raw_b64 = payload.get("data")
                     if not isinstance(raw_b64, str) or not raw_b64.strip():
@@ -1295,6 +1483,14 @@ async def _run_async(
                             {
                                 "type": "status",
                                 "text": "Mic clip ignored: detected Luna voice echo.",
+                            }
+                        )
+                        await hub.broadcast(
+                            {
+                                "type": "control",
+                                "name": "mic_ready",
+                                "value": True,
+                                "hint": "You can speak now — try again (rephrase if it still matches Luna's last line).",
                             }
                         )
                         print("(viewer_voice) dropped likely assistant echo", flush=True)

@@ -220,8 +220,24 @@ function AppInner() {
   // Bridge → avatar event listeners.
   useEffect(() => {
     const onEmotion = (ev: Event) => {
-      const ce = ev as CustomEvent<string>;
-      runtimeRef.current?.triggerEmotion(String(ce.detail || ""));
+      const ce = ev as CustomEvent<
+        string | { emotion?: string; durationMs?: number }
+      >;
+      const d = ce.detail;
+      const id =
+        typeof d === "string"
+          ? d
+          : typeof d === "object" && d && typeof d.emotion === "string"
+            ? d.emotion
+            : "";
+      const ms =
+        typeof d === "object" &&
+        d &&
+        typeof d.durationMs === "number" &&
+        Number.isFinite(d.durationMs)
+          ? d.durationMs
+          : undefined;
+      runtimeRef.current?.triggerEmotion(String(id || "relaxed"), ms);
     };
     const onReply = (ev: Event) => {
       const ce = ev as CustomEvent<string>;

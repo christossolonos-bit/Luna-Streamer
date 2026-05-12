@@ -16,6 +16,13 @@ Env:
   LUNA_CHATTERBOX_CFG_WEIGHT    default 0.5
   LUNA_CHATTERBOX_TEMPERATURE   default 0.8
   LUNA_CHATTERBOX_VOICE_REF     Optional path to reference wav/mp3 for custom voice cloning.
+  LUNA_TTS_VISEME_OFFSET_SEC    Extra delay (seconds) added to every viseme timestamp so lips
+                                track local speakers / WebSocket latency (default 0.05).
+  LUNA_TTS_VISEME_SOURCE        Lip cues: ``audio`` (analyze WAV — follows sound shape),
+                                ``edge`` (Edge word/sentence boundaries only), or ``auto``
+                                (prefer audio when librosa yields a timeline; default auto).
+  LUNA_TTS_VISEME_N_FFT         STFT size for audio visemes (default 960).
+  LUNA_TTS_VISEME_HOP           STFT hop for audio visemes (default n_fft/4).
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -333,7 +341,12 @@ def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> 
                     try:
                         _synthesize_chatterbox_to_wav(part, wav_out, emotion=emotion)
                         if tts_playback_enabled():
-                            _play_wav(wav_out)
+                            cues = _resolve_viseme_timeline(wav_out, [])
+                            _play_wav(
+                                wav_out,
+                                viseme_events=cues or None,
+                                viseme_cb=viseme_cb,
+                            )
                     finally:
                         try:
                             wav_out.unlink(missing_ok=True)
@@ -346,7 +359,7 @@ def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> 
             mp3_out = Path(tmp)
             wav_out = mp3_out.with_suffix(".wav")
             try:
-                cues = _synthesize_edge_to_mp3(
+                cues_edge = _synthesize_edge_to_mp3(
                     text,
                     mp3_out,
                     voice=get_effective_speaker(),
@@ -355,7 +368,12 @@ def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> 
                 )
                 _mp3_to_wav(mp3_out, wav_out)
                 if tts_playback_enabled():
-                    _play_wav(wav_out, viseme_events=cues, viseme_cb=viseme_cb)
+                    cues = _resolve_viseme_timeline(wav_out, cues_edge)
+                    _play_wav(
+                        wav_out,
+                        viseme_events=cues or None,
+                        viseme_cb=viseme_cb,
+                    )
             finally:
                 try:
                     mp3_out.unlink(missing_ok=True)
@@ -486,21 +504,44 @@ def _synthesize_edge_to_mp3(
                     if isinstance(data, (bytes, bytearray)):
                         f.write(data)
                     continue
-                if kind != "WordBoundary":
+                # Edge may emit per-word or per-sentence boundaries depending on version.
+                if kind == "WordBoundary":
+                    raw_text = str(chunk.get("text", "")).strip()
+                    vis = _word_to_vowel_viseme(raw_text)
+                    if not vis:
+                        continue
+                    start_sec = max(0.0, float(chunk.get("offset", 0)) / 10_000_000.0)
+                    dur_sec = max(0.04, float(chunk.get("duration", 0)) / 10_000_000.0)
+                    hold_ms = int(max(70.0, min(260.0, dur_sec * 1000.0 * 0.85)))
+                    cues.append((start_sec, vis, 0.95, hold_ms))
+                    rest_at = start_sec + min(max(0.05, dur_sec * 0.9), 0.32)
+                    cues.append((rest_at, "", 0.0, 85))
                     continue
-                raw_text = str(chunk.get("text", "")).strip()
-                vis = _word_to_vowel_viseme(raw_text)
-                if not vis:
+
+                if kind == "SentenceBoundary":
+                    raw_text = str(chunk.get("text", "")).strip()
+                    start_sec = max(0.0, float(chunk.get("offset", 0)) / 10_000_000.0)
+                    dur_sec = max(0.06, float(chunk.get("duration", 0)) / 10_000_000.0)
+                    words = re.findall(r"[A-Za-z']+", raw_text)
+                    if not words:
+                        continue
+                    weights = [max(1, len(w)) for w in words]
+                    total_w = float(sum(weights)) or 1.0
+                    span = dur_sec * 0.92
+                    acc = 0.0
+                    for i, w in enumerate(words):
+                        frac = weights[i] / total_w
+                        slice_dur = span * frac
+                        vis = _word_to_vowel_viseme(w)
+                        if vis:
+                            t0w = start_sec + acc
+                            wdur = max(0.05, slice_dur)
+                            hold_ms = int(max(70.0, min(260.0, wdur * 1000.0 * 0.85)))
+                            cues.append((t0w, vis, 0.95, hold_ms))
+                            rest_at = t0w + min(max(0.05, wdur * 0.88), 0.28)
+                            cues.append((rest_at, "", 0.0, 85))
+                        acc += slice_dur
                     continue
-                # Edge offsets are 100ns units.
-                start_sec = max(0.0, float(chunk.get("offset", 0)) / 10_000_000.0)
-                dur_sec = max(0.04, float(chunk.get("duration", 0)) / 10_000_000.0)
-                hold_ms = int(max(70.0, min(260.0, dur_sec * 1000.0 * 0.85)))
-                cues.append((start_sec, vis, 0.95, hold_ms))
-                # Add an explicit mouth-close near the end of each word so
-                # short pauses/spaces are visible instead of constant talking.
-                rest_at = start_sec + min(max(0.05, dur_sec * 0.9), 0.32)
-                cues.append((rest_at, "", 0.0, 85))
 
     asyncio.run(_run())
     cues.sort(key=lambda x: x[0])
@@ -629,50 +670,328 @@ def _synthesize_chatterbox_to_wav(text: str, out_path: Path, emotion: str) -> No
     torchaudio.save(str(out_path), wav.cpu(), getattr(model, "sr", 24000))
 
 
+def _viseme_source() -> str:
+    v = (os.environ.get("LUNA_TTS_VISEME_SOURCE", "auto").strip() or "auto").lower()
+    return v if v in ("auto", "audio", "edge") else "auto"
+
+
+def _pick_vowel_from_spectrum(
+    cent: float,
+    r0: float,
+    r1: float,
+    r2: float,
+    r3: float,
+    rms_norm: float,
+) -> str:
+    """Map band energy ratios + centroid to a single mouth vowel (VRM preset ids)."""
+    if rms_norm < 0.06:
+        return ""
+    # Front / high brightness → i / e
+    if r3 > 0.16 or (cent > 2600.0 and (r2 + r3) > (r0 + r1) * 0.95):
+        return "i"
+    if cent > 2100.0 and r2 > r0 * 1.1:
+        return "e"
+    # Very low, sub-heavy → rounded back (u vs o)
+    if r0 > 0.36 and cent < 1150.0:
+        return "u" if r0 > r1 * 1.15 else "o"
+    if cent < 1450.0 and (r0 + r1) > (r2 + r3) * 1.05:
+        return "o" if r0 > 0.22 else "a"
+    if r1 > r2 * 1.05 and cent < 2000.0:
+        return "a"
+    return "e"
+
+
+def _wav_viseme_timeline_from_audio(path: Path) -> list[tuple[float, str, float, int]]:
+    """Build viseme events from the actual TTS waveform (spectral shape + loudness)."""
+    try:
+        import numpy as np
+        import librosa
+        import soundfile as sf
+    except ImportError:
+        return []
+
+    try:
+        y, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    except OSError:
+        return []
+
+    y = np.asarray(y, dtype=np.float32)
+    if y.ndim > 1:
+        y = np.mean(y, axis=1)
+    n_fft = int(os.environ.get("LUNA_TTS_VISEME_N_FFT", "960").strip() or "960")
+    n_fft = max(256, min(2048, n_fft))
+    hop_default = max(64, n_fft // 4)
+    hop = int(os.environ.get("LUNA_TTS_VISEME_HOP", str(hop_default)).strip() or str(hop_default))
+    hop = max(32, min(hop, n_fft // 2))
+
+    if y.size < n_fft + hop:
+        return []
+
+    center = False
+    S = np.abs(
+        librosa.stft(y, n_fft=n_fft, hop_length=hop, win_length=n_fft, center=center)
+    )
+    rms = librosa.feature.rms(
+        y=y, frame_length=n_fft, hop_length=hop, center=center
+    )[0]
+    cent = librosa.feature.spectral_centroid(S=S, sr=sr, n_fft=n_fft, hop_length=hop)[0]
+
+    n = int(min(S.shape[1], len(rms), len(cent)))
+    if n < 2:
+        return []
+
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    ny = float(sr) / 2.0
+
+    def band(lo: float, hi: float) -> np.ndarray:
+        m = (freqs >= lo) & (freqs < min(hi, ny))
+        return S[m, :n].sum(axis=0) + 1e-10
+
+    e0 = band(0.0, 400.0)
+    e1 = band(400.0, 1200.0)
+    e2 = band(1200.0, 3500.0)
+    e3 = band(3500.0, ny + 1.0)
+    et = e0 + e1 + e2 + e3
+    r0 = (e0 / et).astype(np.float64)
+    r1 = (e1 / et).astype(np.float64)
+    r2 = (e2 / et).astype(np.float64)
+    r3 = (e3 / et).astype(np.float64)
+
+    rms_n = rms[:n].astype(np.float64)
+    mx = float(np.max(rms_n)) + 1e-12
+    gate = max(mx * 0.07, 1e-5)
+    raw: list[str] = []
+    amps: list[float] = []
+    for i in range(n):
+        rn = float(np.clip(rms_n[i] / mx, 0.0, 1.0))
+        if rms_n[i] < gate:
+            raw.append("")
+            amps.append(0.0)
+            continue
+        v = _pick_vowel_from_spectrum(
+            float(cent[i]),
+            float(r0[i]),
+            float(r1[i]),
+            float(r2[i]),
+            float(r3[i]),
+            rn,
+        )
+        raw.append(v)
+        amps.append(float(np.clip(rn**0.52 * 1.05, 0.14, 1.0)))
+
+    # Short median smooth to reduce single-frame flicker.
+    vow_to_id = {"": 0, "a": 1, "e": 2, "i": 3, "o": 4, "u": 5}
+    id_to_vow = {v: k for k, v in vow_to_id.items()}
+    ids = np.array([vow_to_id[v] for v in raw], dtype=np.int32)
+    win = 3
+    pad = win // 2
+    ids_p = np.pad(ids, (pad, pad), mode="edge")
+    smooth = np.array(
+        [int(np.median(ids_p[i : i + win])) for i in range(n)], dtype=np.int32
+    )
+
+    hop_sec = hop / float(sr)
+    out: list[tuple[float, str, float, int]] = []
+    i = 0
+    while i < n:
+        vid = int(smooth[i])
+        v = id_to_vow.get(vid, "")
+        if not v:
+            i += 1
+            continue
+        j = i
+        peak = amps[i]
+        while j + 1 < n and id_to_vow.get(int(smooth[j + 1]), "") == v:
+            j += 1
+            peak = max(peak, amps[j])
+        t0 = float(librosa.frames_to_time(i, sr=sr, hop_length=hop, n_fft=n_fft))
+        span_sec = (j - i + 1) * hop_sec
+        hold_ms = int(max(48, min(300, span_sec * 1000.0 * 1.08)))
+        out.append((t0, v, peak, hold_ms))
+        i = j + 1
+
+    return out
+
+
+def _resolve_viseme_timeline(
+    wav_path: Path,
+    edge_cues: list[tuple[float, str, float, int]],
+) -> list[tuple[float, str, float, int]]:
+    src = _viseme_source()
+    audio_cues: list[tuple[float, str, float, int]] = []
+    try:
+        audio_cues = _wav_viseme_timeline_from_audio(wav_path)
+    except Exception as exc:
+        print(f"(LUNA_TTS audio viseme analysis failed: {exc})", flush=True)
+
+    if src == "edge":
+        return sorted(edge_cues, key=lambda x: x[0])
+    if src == "audio":
+        return audio_cues if audio_cues else sorted(edge_cues, key=lambda x: x[0])
+    # auto: prefer sound-shaped timeline when it has body
+    if len(audio_cues) >= 3:
+        return audio_cues
+    return sorted(edge_cues, key=lambda x: x[0]) if edge_cues else audio_cues
+
+
+def _wav_duration_sec(path: Path) -> float:
+    """Best-effort WAV length for scheduling visemes against playback."""
+    try:
+        with wave.open(str(path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 24000
+            if frames <= 0 or rate <= 0:
+                return 3.0
+            return max(0.05, frames / float(rate))
+    except Exception:
+        return 3.0
+
+
+def _blocking_play_wav(path_str: str) -> None:
+    if sys.platform == "win32":
+        import winsound
+
+        winsound.PlaySound(path_str, winsound.SND_FILENAME)
+    elif sys.platform == "darwin":
+        subprocess.run(["afplay", path_str], check=False)
+    else:
+        subprocess.run(["aplay", "-q", path_str], check=False)
+
+
 def _play_wav(
     path: Path,
     *,
     viseme_events: list[tuple[float, str, float, int]] | None = None,
     viseme_cb: VisemeCallback | None = None,
 ) -> None:
-    scheduler_thread: threading.Thread | None = None
     stop_scheduler = threading.Event()
-    if viseme_cb and viseme_events:
-        timeline = sorted(viseme_events, key=lambda x: x[0])
-
-        def _run_visemes() -> None:
-            start = time.monotonic()
-            for at_sec, vis, amp, hold_ms in timeline:
-                if stop_scheduler.is_set():
-                    break
-                delay = (start + at_sec) - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                if stop_scheduler.is_set():
-                    break
-                try:
-                    viseme_cb(vis, float(amp), int(hold_ms))
-                except Exception:
-                    # Non-fatal: lip-sync failures should never kill TTS.
-                    pass
-
-        scheduler_thread = threading.Thread(target=_run_visemes, daemon=True)
-        scheduler_thread.start()
-
     p = str(path)
+    timeline = (
+        sorted(viseme_events, key=lambda x: x[0])
+        if viseme_cb and viseme_events
+        else []
+    )
+    dur = _wav_duration_sec(path)
+    offset = float(os.environ.get("LUNA_TTS_VISEME_OFFSET_SEC", "0.05").strip() or "0.05")
+    viseme_thread: threading.Thread | None = None
+    cb = viseme_cb if timeline else None
+
+    def _emit_timeline(t0: float, boot_slip: float) -> None:
+        if not cb:
+            return
+        for at_sec, vis, amp, hold_ms in timeline:
+            if stop_scheduler.is_set():
+                break
+            target = t0 + boot_slip + offset + at_sec
+            delay = target - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            if stop_scheduler.is_set():
+                break
+            try:
+                cb(vis, float(amp), int(hold_ms))
+            except Exception:
+                pass
+
     try:
+        if not timeline:
+            _blocking_play_wav(p)
+            return
+
         if sys.platform == "win32":
             import winsound
 
-            winsound.PlaySound(p, winsound.SND_FILENAME)
-        elif sys.platform == "darwin":
-            subprocess.run(["afplay", p], check=False)
-        else:
-            subprocess.run(["aplay", "-q", p], check=False)
+            SND_ASYNC = getattr(winsound, "SND_ASYNC", 0x0001)
+            async_ok = False
+            try:
+                winsound.PlaySound(p, winsound.SND_FILENAME | SND_ASYNC)
+                async_ok = True
+            except Exception:
+                pass
+            if async_ok:
+                t0 = time.monotonic()
+                _emit_timeline(t0, boot_slip=0.03)
+                remain = (t0 + dur) - time.monotonic()
+                if remain > 0:
+                    time.sleep(remain)
+                return
+
+            cv = threading.Condition()
+            st: dict[str, float | bool] = {"go": False, "t0": 0.0}
+
+            def _vis_win_sync() -> None:
+                with cv:
+                    while not st["go"]:
+                        cv.wait(timeout=8.0)
+                    t0w = float(st["t0"])
+                _emit_timeline(t0w, boot_slip=0.12)
+
+            def _audio_win_sync() -> None:
+                with cv:
+                    st["t0"] = time.monotonic()
+                    st["go"] = True
+                    cv.notify_all()
+                winsound.PlaySound(p, winsound.SND_FILENAME)
+
+            viseme_thread = threading.Thread(target=_vis_win_sync, daemon=True)
+            viseme_thread.start()
+            _audio_win_sync()
+            stop_scheduler.set()
+            viseme_thread.join(timeout=max(3.0, dur + 4.0))
+            return
+
+        if sys.platform == "darwin":
+            proc = subprocess.Popen(
+                ["afplay", p],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            t0 = time.monotonic()
+            _emit_timeline(t0, boot_slip=0.05)
+            try:
+                proc.wait(timeout=max(5.0, dur + 8.0))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return
+
+        ffplay = shutil.which("ffplay")
+        if ffplay:
+            proc = subprocess.Popen(
+                [
+                    ffplay,
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel",
+                    "quiet",
+                    "-vn",
+                    p,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            t0 = time.monotonic()
+            _emit_timeline(t0, boot_slip=0.05)
+            try:
+                proc.wait(timeout=max(5.0, dur + 8.0))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return
+
+        proc = subprocess.Popen(
+            ["aplay", "-q", p],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        t0 = time.monotonic()
+        _emit_timeline(t0, boot_slip=0.05)
+        try:
+            proc.wait(timeout=max(5.0, dur + 8.0))
+        except subprocess.TimeoutExpired:
+            proc.kill()
     finally:
         stop_scheduler.set()
-        if scheduler_thread is not None:
-            scheduler_thread.join(timeout=0.2)
+        if viseme_thread is not None:
+            viseme_thread.join(timeout=0.5)
         if viseme_cb:
             try:
                 viseme_cb("", 0.0, 80)
