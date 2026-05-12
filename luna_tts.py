@@ -28,13 +28,16 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 _selected_speaker: str | None = None
 _cb_model: Any = None
 _tts_play_lock = threading.Lock()
 _edge_prewarmed = False
+VisemeCallback = Callable[[str, float, int], None]
 
 
 def _env_bool(key: str, default: str = "") -> bool:
@@ -306,7 +309,7 @@ def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
     return text, emotion
 
 
-def maybe_speak(reply_text: str) -> None:
+def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> None:
     """Synthesize and PLAY a reply locally (used by Twitch / viewer pipelines)."""
     if not tts_enabled():
         return
@@ -343,10 +346,16 @@ def maybe_speak(reply_text: str) -> None:
             mp3_out = Path(tmp)
             wav_out = mp3_out.with_suffix(".wav")
             try:
-                _synthesize_edge_to_mp3(text, mp3_out, voice=get_effective_speaker(), rate=rate, pitch=pitch)
+                cues = _synthesize_edge_to_mp3(
+                    text,
+                    mp3_out,
+                    voice=get_effective_speaker(),
+                    rate=rate,
+                    pitch=pitch,
+                )
                 _mp3_to_wav(mp3_out, wav_out)
                 if tts_playback_enabled():
-                    _play_wav(wav_out)
+                    _play_wav(wav_out, viseme_events=cues, viseme_cb=viseme_cb)
             finally:
                 try:
                     mp3_out.unlink(missing_ok=True)
@@ -450,14 +459,52 @@ def _concat_audio_with_ffmpeg(parts: list[Path], out_path: Path) -> None:
             pass
 
 
-def _synthesize_edge_to_mp3(text: str, out_path: Path, voice: str, rate: str, pitch: str) -> None:
+def _word_to_vowel_viseme(word: str) -> str:
+    w = re.sub(r"[^a-z]", "", (word or "").lower())
+    if not w:
+        return ""
+    counts = {v: w.count(v) for v in "aeiou"}
+    if not any(counts.values()):
+        return ""
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _synthesize_edge_to_mp3(
+    text: str, out_path: Path, voice: str, rate: str, pitch: str
+) -> list[tuple[float, str, float, int]]:
     import edge_tts
+
+    cues: list[tuple[float, str, float, int]] = []
 
     async def _run() -> None:
         comm = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
-        await comm.save(str(out_path))
+        with open(out_path, "wb") as f:
+            async for chunk in comm.stream():
+                kind = str(chunk.get("type", ""))
+                if kind == "audio":
+                    data = chunk.get("data")
+                    if isinstance(data, (bytes, bytearray)):
+                        f.write(data)
+                    continue
+                if kind != "WordBoundary":
+                    continue
+                raw_text = str(chunk.get("text", "")).strip()
+                vis = _word_to_vowel_viseme(raw_text)
+                if not vis:
+                    continue
+                # Edge offsets are 100ns units.
+                start_sec = max(0.0, float(chunk.get("offset", 0)) / 10_000_000.0)
+                dur_sec = max(0.04, float(chunk.get("duration", 0)) / 10_000_000.0)
+                hold_ms = int(max(70.0, min(260.0, dur_sec * 1000.0 * 0.85)))
+                cues.append((start_sec, vis, 0.95, hold_ms))
+                # Add an explicit mouth-close near the end of each word so
+                # short pauses/spaces are visible instead of constant talking.
+                rest_at = start_sec + min(max(0.05, dur_sec * 0.9), 0.32)
+                cues.append((rest_at, "", 0.0, 85))
 
     asyncio.run(_run())
+    cues.sort(key=lambda x: x[0])
+    return cues
 
 
 def prewarm_edge_tts() -> None:
@@ -582,13 +629,52 @@ def _synthesize_chatterbox_to_wav(text: str, out_path: Path, emotion: str) -> No
     torchaudio.save(str(out_path), wav.cpu(), getattr(model, "sr", 24000))
 
 
-def _play_wav(path: Path) -> None:
-    p = str(path)
-    if sys.platform == "win32":
-        import winsound
+def _play_wav(
+    path: Path,
+    *,
+    viseme_events: list[tuple[float, str, float, int]] | None = None,
+    viseme_cb: VisemeCallback | None = None,
+) -> None:
+    scheduler_thread: threading.Thread | None = None
+    stop_scheduler = threading.Event()
+    if viseme_cb and viseme_events:
+        timeline = sorted(viseme_events, key=lambda x: x[0])
 
-        winsound.PlaySound(p, winsound.SND_FILENAME)
-    elif sys.platform == "darwin":
-        subprocess.run(["afplay", p], check=False)
-    else:
-        subprocess.run(["aplay", "-q", p], check=False)
+        def _run_visemes() -> None:
+            start = time.monotonic()
+            for at_sec, vis, amp, hold_ms in timeline:
+                if stop_scheduler.is_set():
+                    break
+                delay = (start + at_sec) - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                if stop_scheduler.is_set():
+                    break
+                try:
+                    viseme_cb(vis, float(amp), int(hold_ms))
+                except Exception:
+                    # Non-fatal: lip-sync failures should never kill TTS.
+                    pass
+
+        scheduler_thread = threading.Thread(target=_run_visemes, daemon=True)
+        scheduler_thread.start()
+
+    p = str(path)
+    try:
+        if sys.platform == "win32":
+            import winsound
+
+            winsound.PlaySound(p, winsound.SND_FILENAME)
+        elif sys.platform == "darwin":
+            subprocess.run(["afplay", p], check=False)
+        else:
+            subprocess.run(["aplay", "-q", p], check=False)
+    finally:
+        stop_scheduler.set()
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=0.2)
+        if viseme_cb:
+            try:
+                viseme_cb("", 0.0, 80)
+            except Exception:
+                pass

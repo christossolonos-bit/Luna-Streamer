@@ -235,6 +235,18 @@ export function useChatBridge(enabled: boolean) {
         );
         return;
       }
+      if (msg.name === "avatar_viseme") {
+        window.dispatchEvent(
+          new CustomEvent("luna-avatar-viseme", {
+            detail: {
+              vowel: msg.value,
+              intensity: msg.intensity ?? 1,
+              holdMs: msg.hold_ms ?? 120,
+            },
+          }),
+        );
+        return;
+      }
       if (msg.name === "enroll_state") {
         setEnrollState({
           enabled: msg.enabled,

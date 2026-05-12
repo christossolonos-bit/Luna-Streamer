@@ -61,6 +61,14 @@ export type BridgeControlAvatarSpeakingMessage = {
   value: boolean;
 };
 
+export type BridgeControlAvatarVisemeMessage = {
+  type: "control";
+  name: "avatar_viseme";
+  value: string;
+  intensity?: number;
+  hold_ms?: number;
+};
+
 export type BridgeControlEnrollStateMessage = {
   type: "control";
   name: "enroll_state";
@@ -77,6 +85,7 @@ export type BridgeControlMessage =
   | BridgeControlTtsSpeakerMessage
   | BridgeControlAvatarEmotionMessage
   | BridgeControlAvatarSpeakingMessage
+  | BridgeControlAvatarVisemeMessage
   | BridgeControlEnrollStateMessage;
 
 export type BridgeMessage =
@@ -128,6 +137,15 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
   }
   if (t === "control" && o.name === "avatar_speaking" && typeof o.value === "boolean") {
     return { type: "control", name: "avatar_speaking", value: o.value };
+  }
+  if (t === "control" && o.name === "avatar_viseme" && typeof o.value === "string") {
+    return {
+      type: "control",
+      name: "avatar_viseme",
+      value: o.value,
+      intensity: typeof o.intensity === "number" ? o.intensity : undefined,
+      hold_ms: typeof o.hold_ms === "number" ? o.hold_ms : undefined,
+    };
   }
   if (t === "control" && o.name === "enroll_state") {
     const enabled = o.enabled === true;

@@ -65,10 +65,13 @@ import argparse
 import asyncio
 import base64
 import binascii
+import json
 import os
+import re
 import sys
 import threading
 import time
+from difflib import SequenceMatcher
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -223,15 +226,269 @@ class LunaTwitchBot(commands.Bot):
             int(os.environ.get("LUNA_CHAT_MEMORY_MAX_CHARS", "5000").strip() or "5000"),
         )
         self._memory: deque[dict[str, str]] = deque(maxlen=max(2, self._memory_turns * 2))
+        self._memory_file = (os.environ.get("LUNA_CHAT_MEMORY_FILE") or "").strip() or str(
+            Path(__file__).resolve().parent / "data" / "chat_memory.json"
+        )
+        self._memory_persist = _env_truthy("LUNA_CHAT_MEMORY_PERSIST", default=True)
+        self._user_memory_file = (os.environ.get("LUNA_USER_MEMORY_FILE") or "").strip() or str(
+            Path(__file__).resolve().parent / "data" / "user_memory.json"
+        )
+        self._user_memory_persist = _env_truthy("LUNA_USER_MEMORY_PERSIST", default=True)
+        self._user_facts_max_per_user = max(
+            2, int(os.environ.get("LUNA_USER_MEMORY_MAX_FACTS", "24").strip() or "24")
+        )
+        self._user_fact_max_chars = max(
+            30, int(os.environ.get("LUNA_USER_MEMORY_MAX_FACT_CHARS", "220").strip() or "220")
+        )
+        self._user_memory_inject_max_chars = max(
+            180, int(os.environ.get("LUNA_USER_MEMORY_INJECT_MAX_CHARS", "900").strip() or "900")
+        )
+        self._user_facts: dict[str, list[str]] = {}
         self._screen_context_summary = ""
         self._screen_context_lock = asyncio.Lock()
         self._last_screen_summarize_ts = 0.0
+        # Server-side mic gate: while local TTS is playing (and briefly after),
+        # reject viewer_voice packets so Luna cannot transcribe her own output.
+        self._avatar_speaking = False
+        self._last_avatar_speaking_end_ts = 0.0
+        self._viewer_voice_block_after_tts_sec = max(
+            0.0, float(os.environ.get("LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC", "4.0").strip() or "4.0")
+        )
+        self._last_assistant_reply = ""
+        self._load_memory_from_disk()
+        self._load_user_memory_from_disk()
         if self._chat_model != self._model:
             print(
                 f"(ollama) LUNA_CHAT_MODEL={self._chat_model!r} (text chat) | "
                 f"OLLAMA_MODEL / vision={self._model!r}",
                 flush=True,
             )
+
+    def viewer_voice_allowed(self) -> bool:
+        if self._avatar_speaking:
+            return False
+        # Small tail guard for buffered recorder chunks / playback ring-out.
+        return (time.monotonic() - self._last_avatar_speaking_end_ts) >= self._viewer_voice_block_after_tts_sec
+
+    @staticmethod
+    def _normalize_text_for_echo(text: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+        return " ".join(cleaned.split())
+
+    def looks_like_assistant_echo(self, text: str) -> bool:
+        current = self._normalize_text_for_echo(text)
+        prev = self._normalize_text_for_echo(self._last_assistant_reply)
+        if len(current) < 20 or len(prev) < 20:
+            return False
+        sim = SequenceMatcher(None, current[:400], prev[:400]).ratio()
+        if sim >= 0.78:
+            return True
+        c_tokens = set(current.split())
+        p_tokens = set(prev.split())
+        if not c_tokens or not p_tokens:
+            return False
+        overlap = len(c_tokens & p_tokens) / max(1, len(c_tokens))
+        return overlap >= 0.75
+
+    def _persist_memory_to_disk(self) -> None:
+        if not self._memory_persist or self._memory_turns <= 0:
+            return
+        try:
+            path = Path(self._memory_file).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in self._memory]
+            path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"(memory) persist failed: {exc}", flush=True)
+
+    def _load_memory_from_disk(self) -> None:
+        if not self._memory_persist or self._memory_turns <= 0:
+            return
+        try:
+            path = Path(self._memory_file).expanduser()
+            if not path.is_file():
+                return
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                return
+            loaded: list[dict[str, str]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role", "")).strip()
+                content = str(item.get("content", "")).strip()
+                if role not in {"user", "assistant"} or not content:
+                    continue
+                loaded.append({"role": role, "content": content})
+            self._memory.clear()
+            for msg in loaded[-self._memory.maxlen :]:
+                self._memory.append(msg)
+            if self._memory:
+                print(f"(memory) restored {len(self._memory)} messages from {path}", flush=True)
+        except Exception as exc:
+            print(f"(memory) restore failed: {exc}", flush=True)
+
+    def _append_memory(self, role: str, content: str) -> None:
+        if self._memory_turns <= 0:
+            return
+        c = content.strip()
+        if not c:
+            return
+        self._memory.append({"role": role, "content": c})
+        self._persist_memory_to_disk()
+
+    def _platform_from_source(self, source: str) -> str | None:
+        s = (source or "").strip().lower()
+        if s.startswith("discord"):
+            return "discord"
+        if s.startswith("twitch"):
+            return "twitch"
+        return None
+
+    def _user_memory_key(self, author: str, source: str) -> str | None:
+        platform = self._platform_from_source(source)
+        handle = (author or "").strip().lower()
+        if not platform or not handle:
+            return None
+        return f"{platform}:{handle}"
+
+    def _persist_user_memory_to_disk(self) -> None:
+        if not self._user_memory_persist:
+            return
+        try:
+            path = Path(self._user_memory_file).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._user_facts, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"(user_memory) persist failed: {exc}", flush=True)
+
+    def _load_user_memory_from_disk(self) -> None:
+        if not self._user_memory_persist:
+            return
+        try:
+            path = Path(self._user_memory_file).expanduser()
+            if not path.is_file():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            out: dict[str, list[str]] = {}
+            for raw_key, raw_facts in data.items():
+                key = str(raw_key or "").strip().lower()
+                if ":" not in key or not isinstance(raw_facts, list):
+                    continue
+                facts: list[str] = []
+                for f in raw_facts:
+                    txt = str(f or "").strip()
+                    if not txt:
+                        continue
+                    if len(txt) > self._user_fact_max_chars:
+                        txt = txt[: self._user_fact_max_chars - 1] + "…"
+                    if txt not in facts:
+                        facts.append(txt)
+                    if len(facts) >= self._user_facts_max_per_user:
+                        break
+                if facts:
+                    out[key] = facts
+            self._user_facts = out
+            if out:
+                print(f"(user_memory) restored {len(out)} users from {path}", flush=True)
+        except Exception as exc:
+            print(f"(user_memory) restore failed: {exc}", flush=True)
+
+    def _extract_user_facts(self, text: str) -> list[str]:
+        t = " ".join((text or "").strip().split())
+        if not t:
+            return []
+        facts: list[str] = []
+        patterns = (
+            r"\bmy name is\s+([a-zA-Z][a-zA-Z0-9_\- ]{1,40})",
+            r"\bcall me\s+([a-zA-Z][a-zA-Z0-9_\- ]{1,40})",
+            r"\bi(?:\s*'m|\s+am)\s+([a-zA-Z][a-zA-Z0-9_\- ]{1,40})\b",
+            r"\bi(?:\s*'m|\s+am)\s+from\s+([a-zA-Z0-9 ,.'\-]{2,60})",
+            r"\bi live in\s+([a-zA-Z0-9 ,.'\-]{2,60})",
+            r"\bmy pronouns are\s+([a-zA-Z0-9/ \-]{2,40})",
+            r"\bmy birthday is\s+([a-zA-Z0-9 ,./\-]{2,40})",
+            r"\bi (?:like|love|enjoy)\s+([a-zA-Z0-9 ,.'\-]{2,80})",
+            r"\bmy favorite (?:game|games|food|music|color|anime|movie) is\s+([a-zA-Z0-9 ,.'\-]{2,80})",
+        )
+        for p in patterns:
+            m = re.search(p, t, flags=re.IGNORECASE)
+            if not m:
+                continue
+            value = " ".join((m.group(1) or "").strip().strip(".,!?;:").split())
+            if not value:
+                continue
+            label = p
+            if "my name is" in p or "call me" in p:
+                fact = f"name: {value}"
+            elif "pronouns" in p:
+                fact = f"pronouns: {value}"
+            elif "birthday" in p:
+                fact = f"birthday: {value}"
+            elif "from" in p:
+                fact = f"from: {value}"
+            elif "live in" in p:
+                fact = f"lives in: {value}"
+            elif "favorite" in p:
+                fact = f"favorite: {value}"
+            elif "like|love|enjoy" in label:
+                fact = f"likes: {value}"
+            else:
+                fact = value
+            if len(fact) > self._user_fact_max_chars:
+                fact = fact[: self._user_fact_max_chars - 1] + "…"
+            if fact not in facts:
+                facts.append(fact)
+        return facts
+
+    def _remember_user_facts(self, author: str, source: str, text: str) -> None:
+        key = self._user_memory_key(author, source)
+        if not key:
+            return
+        extracted = self._extract_user_facts(text)
+        if not extracted:
+            return
+        bucket = self._user_facts.get(key, [])
+        changed = False
+        for fact in extracted:
+            if fact in bucket:
+                continue
+            bucket.append(fact)
+            changed = True
+        if not changed:
+            return
+        # Keep the most recent facts if we exceed cap.
+        if len(bucket) > self._user_facts_max_per_user:
+            bucket = bucket[-self._user_facts_max_per_user :]
+        self._user_facts[key] = bucket
+        self._persist_user_memory_to_disk()
+
+    def _user_memory_block(self, author: str, source: str) -> str:
+        key = self._user_memory_key(author, source)
+        if not key:
+            return ""
+        facts = self._user_facts.get(key, [])
+        if not facts:
+            return ""
+        speaker = f"{source}:{author}"
+        lines: list[str] = []
+        total = 0
+        for fact in facts:
+            row = f"- {fact}"
+            if total + len(row) > self._user_memory_inject_max_chars:
+                break
+            lines.append(row)
+            total += len(row)
+        if not lines:
+            return ""
+        return (
+            "\n\n## Known facts about this speaker\n"
+            f"Source user: {speaker}\n"
+            "Use only when relevant, and do not invent missing details.\n"
+            + "\n".join(lines)
+        )
 
     async def ingest_viewer_screen_frame(self, image_b64: str) -> None:
         raw = (os.environ.get("LUNA_SCREEN_CONTEXT", "1") or "1").strip().lower()
@@ -483,6 +740,10 @@ class LunaTwitchBot(commands.Bot):
 
         messages: list[dict] = []
         system_content = self._system
+        self._remember_user_facts(author, source, question)
+        user_memory = self._user_memory_block(author, source)
+        if user_memory:
+            system_content = f"{system_content}{user_memory}" if system_content else user_memory.lstrip()
         if self._screen_context_summary:
             block = os.environ.get(
                 "LUNA_SCREEN_CONTEXT_INJECTION",
@@ -532,9 +793,10 @@ class LunaTwitchBot(commands.Bot):
                     stream=True,
                 )
         reply_stripped = strip_think_blocks(reply).strip()
+        self._last_assistant_reply = reply_stripped
         if self._memory_turns > 0:
-            self._memory.append({"role": "user", "content": user_line})
-            self._memory.append({"role": "assistant", "content": reply_stripped})
+            self._append_memory("user", user_line)
+            self._append_memory("assistant", reply_stripped)
         self._last_auto_reply_ts = time.time()
 
         if send_to_twitch and self._send_replies:
@@ -574,9 +836,31 @@ class LunaTwitchBot(commands.Bot):
                         "value": True,
                     }
                 )
+            self._avatar_speaking = True
+            loop = asyncio.get_running_loop()
+
+            def _emit_viseme(vowel: str, intensity: float, hold_ms: int) -> None:
+                hub = self._chat_hub
+                if hub is None:
+                    return
+                payload = {
+                    "type": "control",
+                    "name": "avatar_viseme",
+                    "value": str(vowel or "").lower(),
+                    "intensity": max(0.0, min(1.0, float(intensity))),
+                    "hold_ms": max(40, min(400, int(hold_ms))),
+                }
+                try:
+                    asyncio.run_coroutine_threadsafe(hub.broadcast(payload), loop)
+                except RuntimeError:
+                    # Event loop stopped during shutdown.
+                    pass
+
             try:
-                await asyncio.to_thread(maybe_speak, reply_stripped)
+                await asyncio.to_thread(maybe_speak, reply_stripped, viseme_cb=_emit_viseme)
             finally:
+                self._avatar_speaking = False
+                self._last_avatar_speaking_end_ts = time.monotonic()
                 if self._chat_hub:
                     await self._chat_hub.broadcast(
                         {
@@ -973,6 +1257,14 @@ async def _run_async(
 
             if msg_type == "viewer_voice":
                 try:
+                    if not bot.viewer_voice_allowed():
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "Mic clip ignored while Luna is speaking.",
+                            }
+                        )
+                        return
                     raw_b64 = payload.get("data")
                     if not isinstance(raw_b64, str) or not raw_b64.strip():
                         return
@@ -997,6 +1289,15 @@ async def _run_async(
                             }
                         )
                         print(f"(viewer_voice) STT failed: {note}", flush=True)
+                        return
+                    if bot.looks_like_assistant_echo(text):
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "Mic clip ignored: detected Luna voice echo.",
+                            }
+                        )
+                        print("(viewer_voice) dropped likely assistant echo", flush=True)
                         return
                     print(f"(viewer_voice) transcript ({note}): {text[:120]!r}…", flush=True)
                     await hub.broadcast(

@@ -55,7 +55,7 @@ function AppInner() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
-  const { conn } = useBridge();
+  const { conn, ttsEnabled, avatarSpeaking } = useBridge();
   const mic = useMicSession();
 
   const [activeOverlay, setActiveOverlay] = useState<DockOverlay>(null);
@@ -225,21 +225,35 @@ function AppInner() {
     };
     const onReply = (ev: Event) => {
       const ce = ev as CustomEvent<string>;
+      // If TTS is enabled, drive lips from actual playback state instead of
+      // text arrival timing (which often starts earlier than audio).
+      if (ttsEnabled || avatarSpeaking) return;
       runtimeRef.current?.triggerTalk(String(ce.detail || ""));
     };
     const onSpeaking = (ev: Event) => {
       const ce = ev as CustomEvent<boolean>;
       runtimeRef.current?.setSpeaking(Boolean(ce.detail));
     };
+    const onViseme = (ev: Event) => {
+      const ce = ev as CustomEvent<{ vowel?: string; intensity?: number; holdMs?: number }>;
+      const d = ce.detail || {};
+      runtimeRef.current?.setViseme(
+        String(d.vowel || ""),
+        Number.isFinite(d.intensity) ? Number(d.intensity) : 1,
+        Number.isFinite(d.holdMs) ? Number(d.holdMs) : 120,
+      );
+    };
     window.addEventListener("luna-avatar-emotion", onEmotion);
     window.addEventListener("luna-assistant-reply", onReply);
     window.addEventListener("luna-avatar-speaking", onSpeaking);
+    window.addEventListener("luna-avatar-viseme", onViseme);
     return () => {
       window.removeEventListener("luna-avatar-emotion", onEmotion);
       window.removeEventListener("luna-assistant-reply", onReply);
       window.removeEventListener("luna-avatar-speaking", onSpeaking);
+      window.removeEventListener("luna-avatar-viseme", onViseme);
     };
-  }, []);
+  }, [avatarSpeaking, ttsEnabled]);
 
   // VRM runtime boot.
   useEffect(() => {

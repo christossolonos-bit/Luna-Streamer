@@ -33,6 +33,8 @@ export type VrmRuntimeCallbacks = {
 export type ChromaKeyMode = "off" | "green" | "blue";
 
 export class VrmRuntime {
+  /** Rotate loaded avatars so they face the camera at startup. */
+  private static readonly STARTUP_YAW_RAD = Math.PI;
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
   private readonly sceneFog: THREE.FogExp2;
@@ -59,6 +61,10 @@ export class VrmRuntime {
   private talkTimer = 0;
   private talkRaf = 0;
   private talkUntil = 0;
+  private _forceSpeaking = false;
+  private _visemeUntil = 0;
+  private _visemeVowel = "";
+  private _visemeAmp = 0;
   /** 0–1 mouth-open drive for jaw bone (set by lip-sync loop). */
   private _lipJawTarget = 0;
   private _lipJawSmoothed = 0;
@@ -102,6 +108,28 @@ export class VrmRuntime {
     this._jawWorkEuler.set(open * VrmRuntime.JAW_OPEN_MAX_RAD, 0, 0, "XYZ");
     this._jawWorkQuat.setFromEuler(this._jawWorkEuler);
     jaw.quaternion.copy(this._jawRestQuat).multiply(this._jawWorkQuat);
+  }
+
+  private _orientAvatarTowardCamera(vrm: VRM) {
+    vrm.scene.rotation.y = VrmRuntime.STARTUP_YAW_RAD;
+    vrm.scene.updateMatrixWorld(true);
+  }
+
+  private _setVowelExpressions(vowel: string, amp: number) {
+    if (!this.vrm?.expressionManager) return;
+    const mgr = this.vrm.expressionManager;
+    const a = Math.max(0, Math.min(1, amp));
+    const mapping: Record<string, readonly string[]> = {
+      a: ["aa", "a"],
+      i: ["ih", "i"],
+      u: ["ou", "u"],
+      e: ["ee", "e"],
+      o: ["oh", "o"],
+    };
+    for (const [k, aliases] of Object.entries(mapping)) {
+      this._trySetExpression(mgr, aliases, k === vowel ? a : 0);
+    }
+    this._lipJawTarget = a;
   }
 
   constructor(
@@ -281,6 +309,7 @@ export class VrmRuntime {
       });
 
       this.vrm = vrm;
+      this._orientAvatarTowardCamera(vrm);
       this._captureJawRestPose();
       this._ensureMixerForCurrentVrm();
       this.scene.add(vrm.scene);
@@ -314,6 +343,8 @@ export class VrmRuntime {
     });
 
     this.vrm = vrm;
+    this._orientAvatarTowardCamera(vrm);
+    this._captureJawRestPose();
     this._ensureMixerForCurrentVrm();
     this.scene.add(vrm.scene);
     this.cb.onSceneStatus(`Avatar loaded: ${label}`);
@@ -439,12 +470,13 @@ export class VrmRuntime {
     }, 900);
   }
 
-  triggerTalk(text: string) {
+  triggerTalk(text: string, holdUntilStop = false) {
     if (!this.vrm) return;
     const mgr = this.vrm.expressionManager;
 
     const clean = (text || "").trim();
     if (!clean) return;
+    this._forceSpeaking = holdUntilStop;
     const chars = Math.max(10, Math.min(420, clean.length));
     const ms = Math.max(800, Math.min(5000, chars * 45));
     this.talkUntil = performance.now() + ms;
@@ -461,7 +493,12 @@ export class VrmRuntime {
     ];
     const step = () => {
       const now = performance.now();
-      if (now >= this.talkUntil || this.disposed) {
+      if (this._visemeUntil > now) {
+        this._setVowelExpressions(this._visemeVowel, this._visemeAmp);
+        this.talkRaf = requestAnimationFrame(step);
+        return;
+      }
+      if ((!this._forceSpeaking && now >= this.talkUntil) || this.disposed) {
         if (mgr) {
           for (const aliases of vowelAliases) this._trySetExpression(mgr, aliases, 0);
         }
@@ -483,6 +520,10 @@ export class VrmRuntime {
     this.talkRaf = requestAnimationFrame(step);
 
     this.talkTimer = window.setTimeout(() => {
+      if (this._forceSpeaking) {
+        this.talkTimer = 0;
+        return;
+      }
       if (mgr) {
         for (const aliases of vowelAliases) this._trySetExpression(mgr, aliases, 0);
       }
@@ -493,10 +534,14 @@ export class VrmRuntime {
 
   setSpeaking(active: boolean) {
     if (active) {
-      this.talkUntil = performance.now() + 3600_000; // effectively "until stop signal"
-      this.triggerTalk("speaking");
+      // Keep viseme+jaw loop alive for the full TTS playback window.
+      this.triggerTalk("speaking", true);
       return;
     }
+    this._forceSpeaking = false;
+    this._visemeUntil = 0;
+    this._visemeVowel = "";
+    this._visemeAmp = 0;
     this.talkUntil = 0;
     if (this.talkTimer) window.clearTimeout(this.talkTimer);
     if (this.talkRaf) cancelAnimationFrame(this.talkRaf);
@@ -510,6 +555,24 @@ export class VrmRuntime {
         this._trySetExpression(mgr, aliases, 0);
       }
     }
+  }
+
+  setViseme(vowel: string, intensity = 1, holdMs = 120) {
+    const now = performance.now();
+    const v = String(vowel || "").toLowerCase();
+    const amp = Math.max(0, Math.min(1, Number.isFinite(intensity) ? intensity : 1));
+    const hold = Math.max(45, Math.min(400, Number.isFinite(holdMs) ? holdMs : 120));
+    if (!["a", "e", "i", "o", "u"].includes(v)) {
+      this._visemeVowel = "";
+      this._visemeAmp = 0;
+      this._visemeUntil = now + hold;
+      this._setVowelExpressions("", 0);
+      return;
+    }
+    this._visemeVowel = v;
+    this._visemeAmp = amp;
+    this._visemeUntil = now + hold;
+    this._setVowelExpressions(v, amp);
   }
 
   dispose() {

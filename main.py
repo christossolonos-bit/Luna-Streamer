@@ -16,7 +16,7 @@ import webbrowser
 from pathlib import Path
 
 
-DEFAULT_VRM = Path(r"D:\Chris Stuff\Luna.vrm")
+DEFAULT_VRM = Path(r"D:\Luna streamer\Luna.vrm")
 
 
 def _url_alive(url: str, timeout: float = 0.8) -> bool:
