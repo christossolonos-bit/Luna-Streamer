@@ -58,6 +58,10 @@ Environment (or use CLI flags where noted):
   LUNA_YOUTUBE_LIVE_AUTO_REPLY     If 1 (default), Luna replies in the viewer/TTS only (not YouTube chat).
   LUNA_YOUTUBE_LIVE_AUTO_TRIGGER   mention | all (default all for live chat).
   LUNA_YOUTUBE_LIVE_POLL_SEC       Poll interval seconds (default 0.5).
+  LUNA_SOCIAL_LIVE_SHARE           If 1, post to X/Facebook when you go live on YouTube or Twitch.
+  LUNA_SOCIAL_LIVE_POLL_SEC        How often to check for live (default 90s).
+  LUNA_SOCIAL_LIVE_TITLE_PREFIX    Prepended to stream title in social posts (default "Live now:").
+  LUNA_SOCIAL_LIVE_YOUTUBE_URLS    Extra YouTube channel/live URLs to watch (optional).
   LUNA_YT_DOWNLOAD          If 1, !play also downloads the file (default 1).
   LUNA_YT_DOWNLOAD_DIR      Folder where !play stores downloaded audio (default <project>/data/yt_audio).
   LUNA_YT_DEFAULT_FORMAT    yt-dlp format string (default bestaudio[ext=m4a]/bestaudio/best).
@@ -127,6 +131,7 @@ from youtube_live_chat import (
     youtube_live_chat_enabled,
     youtube_live_video_id,
 )
+from live_social_share import live_social_share_enabled, run_live_social_poller
 from social_playwright_share import (
     run_interactive_social_login,
     share_new_youtube_upload,
@@ -1719,6 +1724,7 @@ async def _run_async(
 
     feed_task: asyncio.Task | None = None
     yt_live_task: asyncio.Task | None = None
+    live_social_task: asyncio.Task | None = None
     if hub is not None:
         async def _hub_status(text: str) -> None:
             await hub.broadcast({"type": "status", "text": text})
@@ -1768,6 +1774,9 @@ async def _run_async(
             except Exception as exc:
                 print(f"(social playwright) share failed: {exc}", flush=True)
 
+        async def _social_playwright_live(title: str, stream_url: str) -> None:
+            await _social_playwright_upload(title, stream_url)
+
         if observe_feed_enabled():
             d_send = (
                 _discord_yt_upload
@@ -1805,6 +1814,21 @@ async def _run_async(
                 name="luna-youtube-live-chat",
             )
 
+        if live_social_share_enabled():
+
+            async def _live_social_share_send(title: str, url: str) -> None:
+                await _social_playwright_live(title, url)
+
+            live_social_task = asyncio.create_task(
+                run_live_social_poller(
+                    social_share_send=_live_social_share_send,
+                    broadcast_status=_hub_status,
+                    twitch_bot=bot,
+                    twitch_login=channel,
+                ),
+                name="luna-live-social-share",
+            )
+
     try:
         await bot.start()
     finally:
@@ -1818,6 +1842,12 @@ async def _run_async(
             yt_live_task.cancel()
             try:
                 await yt_live_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if live_social_task is not None:
+            live_social_task.cancel()
+            try:
+                await live_social_task
             except (asyncio.CancelledError, Exception):
                 pass
         if discord_bot_obj is not None:
