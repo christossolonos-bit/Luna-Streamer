@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
 import { useBridge } from "./chatBridgeContext";
-import { CloseIcon, VoiceIcon } from "./icons";
+import { CloseIcon, SocialFacebookLoginIcon, SocialXLoginIcon, VoiceIcon } from "./icons";
 import type { VrmRuntime, ChromaKeyMode } from "./vrmRuntime";
 import { AVATAR_FACE_EXPRESSIONS, type AvatarFaceExpressionId } from "./avatarExpressions";
 
@@ -70,6 +70,7 @@ export function SettingsOverlay({
     clearEnrollment,
     sendPlayRequest,
     sendYouTubeSummary,
+    sendSocialInteractiveLogin,
     addStatusLine,
   } = useBridge();
 
@@ -413,6 +414,39 @@ export function SettingsOverlay({
             <code className="chat-code">/play &lt;query&gt;</code> or{" "}
             <code className="chat-code">/explain &lt;url&gt;</code>.
           </p>
+        </section>
+
+        <section className="settings-section">
+          <h3 className="settings-section-title">Social login</h3>
+          <p className="settings-hint">
+            One-time setup for Playwright sharing. Opens Chrome on the PC running Luna — sign in,
+            then close the tab when chat says the session was saved. Set{" "}
+            <code className="chat-code">LUNA_SOCIAL_X_STORAGE_STATE</code> /{" "}
+            <code className="chat-code">LUNA_SOCIAL_FACEBOOK_STORAGE_STATE</code> in{" "}
+            <code className="chat-code">.env</code>.
+          </p>
+          <div className="settings-row">
+            <button
+              type="button"
+              className="settings-btn settings-btn--social-x"
+              disabled={conn !== "open"}
+              onClick={() => void sendSocialInteractiveLogin("x")}
+              title="Set up X (Twitter) login for social sharing"
+            >
+              <SocialXLoginIcon />
+              X login
+            </button>
+            <button
+              type="button"
+              className="settings-btn settings-btn--social-fb"
+              disabled={conn !== "open"}
+              onClick={() => void sendSocialInteractiveLogin("facebook")}
+              title="Set up Facebook login for social sharing"
+            >
+              <SocialFacebookLoginIcon />
+              Facebook login
+            </button>
+          </div>
         </section>
 
         <section className="settings-section">

@@ -55,7 +55,7 @@ function AppInner() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
-  const { conn, ttsEnabled, avatarSpeaking, sendYoutubeObserveCheck, sendSocialShareVideo, sendSocialInteractiveLogin } =
+  const { conn, ttsEnabled, avatarSpeaking, sendYoutubeObserveCheck, sendSocialShareVideo } =
     useBridge();
   const mic = useMicSession();
 
@@ -96,14 +96,6 @@ function AppInner() {
     const u = raw?.trim();
     if (u) void sendSocialShareVideo(u);
   }, [sendSocialShareVideo]);
-
-  const onSocialLoginXClick = useCallback(() => {
-    void sendSocialInteractiveLogin("x");
-  }, [sendSocialInteractiveLogin]);
-
-  const onSocialLoginFacebookClick = useCallback(() => {
-    void sendSocialInteractiveLogin("facebook");
-  }, [sendSocialInteractiveLogin]);
 
   useEffect(() => {
     try {
@@ -594,9 +586,6 @@ function AppInner() {
         onYoutubeObserveCheck={() => void sendYoutubeObserveCheck()}
         socialShareDisabled={conn !== "open"}
         onSocialShareVideo={onSocialShareVideoClick}
-        socialLoginSetupDisabled={conn !== "open"}
-        onSocialLoginX={onSocialLoginXClick}
-        onSocialLoginFacebook={onSocialLoginFacebookClick}
       />
     </div>
   );

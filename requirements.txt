@@ -29,3 +29,5 @@ pydub>=0.25.1
 # pip install playwright && python -m playwright install chrome
 # Login helper (run from repo root): python scripts/social_playwright_login.py https://x.com D:/x.json
 playwright>=1.49.0
+# Optional: read YouTube Live chat into Luna's viewer (LUNA_YOUTUBE_LIVE_CHAT=1); replies are UI-only.
+pytchat>=0.5.0

@@ -10,7 +10,7 @@ Setup (one-time per site):
   # Prefer the Luna helper (same stealth settings as posting):
   python scripts/social_playwright_login.py https://x.com D:/path/x_storage.json
   python scripts/social_playwright_login.py https://www.facebook.com D:/path/fb_storage.json
-  # Or from the viewer: key icon in the dock sends viewer_social_interactive_login (headed Chrome on the PC running Luna).
+  # Or from the viewer: Settings → Social login sends viewer_social_interactive_login (headed Chrome on the PC running Luna).
   # Optional: LUNA_SOCIAL_X_LOGIN_START_URL / LUNA_SOCIAL_FACEBOOK_LOGIN_START_URL open your profile pages instead of default login URLs.
 
 Env:
@@ -31,8 +31,11 @@ Env:
   LUNA_SOCIAL_X_INTENT_PATH=post           ``post`` (modal ``intent/post``) or ``tweet`` for ``intent/tweet``.
   LUNA_SOCIAL_FACEBOOK_LOGIN_START_URL=... Optional; first page for Facebook key-icon login (default /login).
   LUNA_SOCIAL_FACEBOOK_POST_START_URL=...  Composer flow: open this page first (default: LOGIN URL or facebook.com).
-  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_PREFIX=...  If set, ``{prefix} {title}`` then URL; else a friendly default line from the title.
-  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_TEMPLATE=...  Overrides prefix; use {title} and {url} (comment only); link is still appended below.
+  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_PREFIX=...  If set, ``{prefix} {title}`` then URL; else LLM comment (or friendly default).
+  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_TEMPLATE=...  Overrides LLM/prefix; use {title} and {url} (comment only); link is still appended below.
+  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_LLM=1       Default on when no template/prefix; uses OLLAMA_MODEL / LUNA_CHAT_MODEL + TWITCH_SYSTEM.
+  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_PROMPT=...  Optional user prompt; ``{title}`` and ``{url}`` substituted (URL still appended separately unless in template).
+  LUNA_SOCIAL_FACEBOOK_POST_COMMENT_NUM_PREDICT=120  Max tokens for the LLM comment line.
   LUNA_SOCIAL_FACEBOOK_POST_LEGACY_SHARER=1  Use sharer.php popup only (skip profile composer).
   LUNA_SOCIAL_FB_POST_UI_STEP_MS / LUNA_SOCIAL_FB_POST_UI_SETTLE_MS  Optional timeouts for Facebook UI flow.
   LUNA_SOCIAL_INTERACTIVE_EPHEMERAL=1        Key-icon login: use old temp profile (not recommended for Google OAuth on X).
@@ -364,7 +367,7 @@ async def _post_x(context: object, title: str, video_url: str) -> None:
 
 
 def _compose_fb_share_text(title: str, video_url: str) -> str:
-    """First lines: short comment tied to the video; blank line; then the URL (unless template includes {url})."""
+    """Static comment + URL (template/prefix or fallback). Prefer :func:`_compose_fb_share_text_async` for LLM."""
     title_clean = (title or "").strip()
     url_clean = (video_url or "").strip()
     tmpl = (os.environ.get("LUNA_SOCIAL_FACEBOOK_POST_COMMENT_TEMPLATE") or "").strip()
@@ -377,17 +380,236 @@ def _compose_fb_share_text(title: str, video_url: str) -> str:
         if prefix:
             comment = f"{prefix} {title_clean}".strip() if title_clean else prefix
         else:
-            # Friendly default: context from the video title, then link on its own line.
             if title_clean:
                 comment = f"Sharing something I enjoyed — {title_clean}. Give it a watch below."
             else:
                 comment = "Sharing a video — link below."
         body = f"{comment}\n\n{url_clean}".strip() if url_clean else comment
+    return _clamp_fb_share_body(body)
+
+
+def _clamp_fb_share_body(body: str) -> str:
     max_len = int((os.environ.get("LUNA_SOCIAL_FB_MAX_CHARS") or "8000").strip() or "8000")
     max_len = max(100, min(max_len, 63206))
     if len(body) > max_len:
-        body = body[: max_len - 1] + "…"
+        return body[: max_len - 1] + "…"
     return body
+
+
+def _fb_share_uses_explicit_template() -> bool:
+    return bool(
+        (os.environ.get("LUNA_SOCIAL_FACEBOOK_POST_COMMENT_TEMPLATE") or "").strip()
+        or (os.environ.get("LUNA_SOCIAL_FACEBOOK_POST_COMMENT_PREFIX") or "").strip()
+    )
+
+
+def _fb_share_comment_llm_enabled() -> bool:
+    if _fb_share_uses_explicit_template():
+        return False
+    return _env_truthy("LUNA_SOCIAL_FACEBOOK_POST_COMMENT_LLM", default=True)
+
+
+def _fb_llm_comment_user_prompt(title: str, video_url: str) -> str:
+    custom = (os.environ.get("LUNA_SOCIAL_FACEBOOK_POST_COMMENT_PROMPT") or "").strip()
+    if custom:
+        return custom.replace("{title}", (title or "").strip()).replace("{url}", (video_url or "").strip())
+    title_clean = (title or "").strip() or "Untitled video"
+    return (
+        "Write a short Facebook post comment (1–3 sentences) announcing a new YouTube upload.\n"
+        f"Video title: {title_clean}\n"
+        "Write in first person as the creator. Sound natural and warm, not salesy.\n"
+        "Do NOT include the URL, hashtags, markdown, or labels like \"Comment:\".\n"
+        "Output only the post text."
+    )
+
+
+def _fb_llm_comment_system_prompt() -> str:
+    extra = (os.environ.get("TWITCH_SYSTEM") or "").strip()
+    base = (
+        "You help a streamer write brief social posts. "
+        "Reply with plain text only — no reasoning tags, no bullet lists."
+    )
+    return f"{extra}\n\n{base}".strip() if extra else base
+
+
+def _sanitize_fb_llm_comment(raw: str, video_url: str) -> str:
+    from ollama_client import strip_think_blocks
+
+    text = strip_think_blocks((raw or "").strip())
+    text = re.sub(r"^[\"'`]+|[\"'`]+$", "", text).strip()
+    url_clean = (video_url or "").strip()
+    if url_clean:
+        text = text.replace(url_clean, "").strip()
+    text = re.sub(r"https?://\S+", "", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _generate_fb_share_comment_llm_sync(title: str, video_url: str) -> str | None:
+    from ollama_client import build_client, chat_request_kwargs
+
+    model = (os.environ.get("LUNA_CHAT_MODEL") or os.environ.get("OLLAMA_MODEL") or "").strip()
+    if not model:
+        return None
+    messages = [
+        {"role": "system", "content": _fb_llm_comment_system_prompt()},
+        {"role": "user", "content": _fb_llm_comment_user_prompt(title, video_url)},
+    ]
+    kwargs = chat_request_kwargs(model, messages, stream=False)
+    predict_raw = (os.environ.get("LUNA_SOCIAL_FACEBOOK_POST_COMMENT_NUM_PREDICT") or "120").strip() or "120"
+    try:
+        predict = max(32, int(predict_raw))
+    except ValueError:
+        predict = 120
+    opts = dict(kwargs.get("options") or {})
+    opts["num_predict"] = predict
+    kwargs["options"] = opts
+    client = build_client()
+    response = client.chat(**kwargs)
+    comment = _sanitize_fb_llm_comment(response.message.content or "", video_url)
+    return comment or None
+
+
+async def _generate_fb_share_comment_llm(title: str, video_url: str) -> str | None:
+    try:
+        return await asyncio.to_thread(_generate_fb_share_comment_llm_sync, title, video_url)
+    except Exception as exc:
+        print(f"(social playwright) Facebook comment LLM failed ({exc}); using static fallback.", flush=True)
+        return None
+
+
+async def _compose_fb_share_text_async(title: str, video_url: str) -> str:
+    """Comment from Ollama when enabled; else template/prefix/static fallback; URL on its own line."""
+    if _fb_share_uses_explicit_template():
+        return _compose_fb_share_text(title, video_url)
+    comment: str | None = None
+    if _fb_share_comment_llm_enabled():
+        comment = await _generate_fb_share_comment_llm(title, video_url)
+        if comment:
+            print(f"(social playwright) Facebook comment (LLM): {comment[:120]}{'…' if len(comment) > 120 else ''}", flush=True)
+    if not comment:
+        return _compose_fb_share_text(title, video_url)
+    url_clean = (video_url or "").strip()
+    body = f"{comment}\n\n{url_clean}".strip() if url_clean else comment
+    return _clamp_fb_share_body(body)
+
+
+def _split_fb_comment_body(body: str, video_url: str) -> tuple[str, str]:
+    """Return ``(comment, url)`` for separate Lexical typing (comment, blank line, URL)."""
+    url_clean = (video_url or "").strip()
+    comment = (body or "").strip()
+    if url_clean:
+        comment = comment.replace(url_clean, "").strip().strip("\n")
+    return comment, url_clean
+
+
+async def _fb_role_button_ready(btn: object) -> bool:
+    try:
+        disabled = await btn.get_attribute("aria-disabled")  # type: ignore[union-attr]
+        if disabled in ("true", "1"):
+            return False
+        return await btn.is_enabled()  # type: ignore[union-attr]
+    except Exception:
+        return False
+
+
+async def _fb_write_lexical_composer(
+    page: object, editor: object, comment: str, video_url: str
+) -> None:
+    """Type into Facebook's Lexical ``data-lexical-editor`` box (``fill`` often leaves Next disabled)."""
+    await editor.click(timeout=10_000)  # type: ignore[union-attr]
+    await page.wait_for_timeout(400)  # type: ignore[union-attr]
+    for key in ("Control+a", "Meta+a"):
+        try:
+            await page.keyboard.press(key)
+        except Exception:
+            pass
+    await page.keyboard.press("Backspace")
+    await page.wait_for_timeout(250)  # type: ignore[union-attr]
+
+    delay = int((os.environ.get("LUNA_SOCIAL_FB_POST_TYPE_DELAY_MS") or "14").strip() or "14")
+    comment_s = (comment or "").strip()
+    url_s = (video_url or "").strip()
+    if comment_s:
+        await page.keyboard.type(comment_s, delay=delay)  # type: ignore[union-attr]
+    if url_s:
+        if comment_s:
+            await page.keyboard.press("Enter")
+            await page.keyboard.press("Enter")
+        await page.keyboard.type(url_s, delay=max(8, delay - 2))  # type: ignore[union-attr]
+    await page.wait_for_timeout(1000)  # type: ignore[union-attr]
+
+    need = max(10, min(len(comment_s), 24)) if comment_s else 5
+    try:
+        got = (await editor.inner_text() or "").strip()  # type: ignore[union-attr]
+    except Exception:
+        got = ""
+    if len(got) >= need:
+        return
+    # Fallback: ``press_sequentially`` on the textbox node.
+    await editor.click(timeout=5000)  # type: ignore[union-attr]
+    for key in ("Control+a", "Meta+a"):
+        try:
+            await page.keyboard.press(key)
+        except Exception:
+            pass
+    await page.keyboard.press("Backspace")
+    blob = f"{comment_s}\n\n{url_s}".strip() if url_s and comment_s else (comment_s or url_s)
+    if blob:
+        await editor.press_sequentially(blob, delay=delay, timeout=180_000)  # type: ignore[union-attr]
+    await page.wait_for_timeout(800)  # type: ignore[union-attr]
+
+
+async def _fb_wait_story_ready(
+    dialog: object, editor: object, page: object, comment: str, video_url: str, step_timeout: int
+) -> None:
+    """Wait until composer has text / link preview so **Next** can turn blue."""
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    url_s = (video_url or "").strip()
+    comment_s = (comment or "").strip()
+    loops = max(40, step_timeout // 250)
+    host = (urllib.parse.urlparse(url_s).hostname or "").lower() if url_s else ""
+    tail = url_s.rsplit("/", 1)[-1][:48] if url_s and "/" in url_s else (url_s[:48] if url_s else "")
+    for _ in range(loops):
+        try:
+            body_txt = (await editor.inner_text() or "").strip()  # type: ignore[union-attr]
+        except Exception:
+            body_txt = ""
+        has_comment = len(body_txt) >= max(8, min(len(comment_s), 20)) if comment_s else len(body_txt) > 0
+        has_url = not url_s or url_s in body_txt or (tail and tail in body_txt)
+        if has_comment and has_url:
+            return
+        if host:
+            try:
+                if await dialog.locator(f'a[href*="{host}"]').count() > 0:  # type: ignore[union-attr]
+                    return
+            except Exception:
+                pass
+        await page.wait_for_timeout(250)  # type: ignore[union-attr]
+    if url_s and host:
+        try:
+            await dialog.locator(f'a[href*="{host}"]').first.wait_for(  # type: ignore[union-attr]
+                state="visible", timeout=min(step_timeout, 20_000)
+            )
+            return
+        except PWTimeout:
+            pass
+
+
+async def _fb_wait_and_click_next(dialog: object, page: object, step_timeout: int) -> None:
+    """Step 2 — blue **Next** when ``aria-disabled`` is gone."""
+    next_btn = dialog.locator('[role="button"][aria-label="Next"]').first  # type: ignore[union-attr]
+    if await next_btn.count() == 0:
+        next_btn = dialog.get_by_role("button", name="Next", exact=True)  # type: ignore[union-attr]
+    await next_btn.wait_for(state="visible", timeout=step_timeout)
+    await next_btn.scroll_into_view_if_needed()  # type: ignore[union-attr]
+    loops = max(60, step_timeout // 250)
+    for _ in range(loops):
+        if await _fb_role_button_ready(next_btn):
+            break
+        await page.wait_for_timeout(250)  # type: ignore[union-attr]
+    await next_btn.click(timeout=20_000)
 
 
 def _facebook_compose_start_url() -> str:
@@ -470,11 +692,131 @@ async def _fb_dismiss_add_to_post_dialog(page: object) -> None:
     await page.wait_for_timeout(450)
 
 
+async def _fb_resolve_post_settings_dialog(page: object, step_timeout: int) -> object:
+    """**Post settings** sheet — markers like *Post audience* / *Publish now*, not loose ``post`` substring."""
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    markers = re.compile(r"Post audience|Scheduling options|Publish now", re.I)
+    sheet = page.locator('[role="dialog"]').filter(has_text=markers).first  # type: ignore[union-attr]
+    try:
+        await sheet.wait_for(state="visible", timeout=step_timeout)
+        return sheet
+    except PWTimeout:
+        pass
+    sheet = page.get_by_role("dialog", name=re.compile(r"post settings", re.I)).first  # type: ignore[union-attr]
+    try:
+        await sheet.wait_for(state="visible", timeout=step_timeout)
+        return sheet
+    except PWTimeout:
+        pass
+    sheet = page.locator('[role="dialog"]').filter(  # type: ignore[union-attr]
+        has=page.get_by_role("heading", name=re.compile(r"post settings", re.I))
+    ).first
+    await sheet.wait_for(state="visible", timeout=step_timeout)
+    return sheet
+
+
+async def _fb_find_post_settings_publish_button(post_sheet: object) -> object | None:
+    """Blue footer **Post** beside grey **Save** — ``role=button`` whose visible label is exactly Post."""
+    deny = re.compile(r"add to|boost|audience|save|schedule|share to|back", re.I)
+
+    # Footer pair: Save (left) + Post (right) — prefer ``span`` with exact text inside ``role=button``.
+    by_span = post_sheet.locator(  # type: ignore[union-attr]
+        '[role="button"]:has(span:text-is("Post"))'
+    )
+    if await by_span.count() > 0:
+        return by_span.last
+
+    for loc in (
+        post_sheet.locator('[role="button"][aria-label="Post"]'),  # type: ignore[union-attr]
+        post_sheet.locator('[role="button"][aria-label="Publish"]'),  # type: ignore[union-attr]
+    ):
+        n = await loc.count()
+        for i in range(n - 1, -1, -1):
+            btn = loc.nth(i)
+            label = (await btn.get_attribute("aria-label") or "").strip()
+            if label not in ("Post", "Publish"):
+                continue
+            try:
+                if await btn.is_visible():
+                    return btn
+            except Exception:
+                continue
+
+    all_btns = post_sheet.locator('[role="button"]')  # type: ignore[union-attr]
+    n = await all_btns.count()
+    for i in range(n - 1, -1, -1):
+        btn = all_btns.nth(i)
+        try:
+            if not await btn.is_visible():
+                continue
+        except Exception:
+            continue
+        raw = (await btn.inner_text() or "").strip()
+        label = re.sub(r"\s+", " ", raw)
+        if label != "Post":
+            continue
+        if deny.search(raw):
+            continue
+        return btn
+
+    spans = post_sheet.get_by_text("Post", exact=True)  # type: ignore[union-attr]
+    sn = await spans.count()
+    for i in range(sn - 1, -1, -1):
+        sp = spans.nth(i)
+        try:
+            if not await sp.is_visible():
+                continue
+        except Exception:
+            continue
+        btn = sp.locator("xpath=ancestor::*[@role='button'][1]")
+        if await btn.count() == 0:
+            btn = sp.locator("xpath=ancestor::*[@tabindex='0'][1]")
+        if await btn.count() == 0:
+            continue
+        try:
+            if await btn.first.is_visible():
+                return btn.first
+        except Exception:
+            continue
+    return None
+
+
+async def _fb_click_post_settings_publish(post_sheet: object, page: object, step_timeout: int) -> None:
+    """Step 4 — click the blue footer **Post** on *Post settings*."""
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    await post_sheet.get_by_text(re.compile(r"Post audience|Scheduling options", re.I)).first.wait_for(  # type: ignore[union-attr]
+        state="visible", timeout=step_timeout
+    )
+    post_btn = None
+    for _ in range(60):
+        post_btn = await _fb_find_post_settings_publish_button(post_sheet)
+        if post_btn is not None:
+            break
+        await page.wait_for_timeout(250)  # type: ignore[union-attr]
+    if post_btn is None:
+        raise PWTimeout("Post settings: blue Post footer button not found")
+    await post_btn.wait_for(state="visible", timeout=step_timeout)
+    await post_btn.scroll_into_view_if_needed()  # type: ignore[union-attr]
+    for _ in range(80):
+        if await _fb_role_button_ready(post_btn):
+            break
+        await page.wait_for_timeout(200)  # type: ignore[union-attr]
+    await post_btn.click(timeout=20_000)
+
+
 async def _post_facebook_via_composer_ui(page: object, title: str, video_url: str) -> None:
-    """Facebook *Create post*: story box, comment + URL, wait for link in composer / preview, footer **Next** only, then **Post**."""
+    """Facebook *Create post* → **Next** → *Post settings* blue **Post** only (never *Add to your post*)."""
 
     async def _fb_story_composer(dlg: object) -> object:
-        """Main composer only — ``aria-placeholder`` *What's on your mind* / *on your mind*, not *Add to your post*."""
+        """Lexical story box — ``data-lexical-editor`` + *What's on your mind* placeholder."""
+        by_lex = dlg.locator(
+            '[data-lexical-editor="true"][role="textbox"][contenteditable="true"]'
+            '[aria-placeholder*="on your mind"]'
+        ).first
+        if await by_lex.count() > 0:
+            return by_lex
         by_ph = dlg.locator(
             '[role="textbox"][contenteditable="true"][aria-placeholder*="on your mind"]'
         ).first
@@ -497,7 +839,8 @@ async def _post_facebook_via_composer_ui(page: object, title: str, video_url: st
 
     from playwright.async_api import TimeoutError as PWTimeout
 
-    text = _compose_fb_share_text(title, video_url)
+    text = await _compose_fb_share_text_async(title, video_url)
+    comment, url_for_compose = _split_fb_comment_body(text, video_url)
     start = _facebook_compose_start_url()
     step_timeout = int((os.environ.get("LUNA_SOCIAL_FB_POST_UI_STEP_MS") or "25000").strip() or "25000")
     settle = int((os.environ.get("LUNA_SOCIAL_FB_POST_UI_SETTLE_MS") or "1200").strip() or "1200")
@@ -524,89 +867,33 @@ async def _post_facebook_via_composer_ui(page: object, title: str, video_url: st
 
     await _fb_dismiss_add_to_post_dialog(page)
 
-    # Step 1 — story composer, then nice comment + URL (see ``_compose_fb_share_text``).
+    # Step 1 — LLM comment + URL into Lexical ``What's on your mind?`` box (keyboard, not ``fill``).
     editor = await _fb_story_composer(dialog)
     await editor.wait_for(state="visible", timeout=step_timeout)
     await editor.scroll_into_view_if_needed()  # type: ignore[union-attr]
-    await editor.click(timeout=10_000)
-    try:
-        await editor.press("Control+a")  # type: ignore[union-attr]
-    except Exception:
-        try:
-            await editor.press("Meta+a")  # type: ignore[union-attr]
-        except Exception:
-            pass
-    await editor.press("Backspace")  # type: ignore[union-attr]
-    try:
-        await editor.fill(text, timeout=45_000)  # type: ignore[union-attr]
-    except Exception:
-        await editor.press_sequentially(text, delay=8, timeout=120_000)  # type: ignore[union-attr]
-
-    await page.wait_for_timeout(500)  # type: ignore[union-attr]
     await _fb_dismiss_add_to_post_dialog(page)
-
-    # Wait until the share is actually in the sheet (text + unfurl); **Next** stays disabled until then.
-    # Do not interact with *Add to your post* icon row — only the primary footer control below it.
-    url_s = (video_url or "").strip()
-    if url_s:
-        host = (urllib.parse.urlparse(url_s).hostname or "").lower()
-        if host:
-            try:
-                await dialog.locator(f'a[href*="{host}"]').first.wait_for(  # type: ignore[union-attr]
-                    state="visible", timeout=min(step_timeout, 30_000)
-                )
-            except PWTimeout:
-                pass
-        tail = url_s.rsplit("/", 1)[-1][:48] if "/" in url_s else url_s[:48]
-        for _ in range(80):
-            try:
-                body_txt = await editor.inner_text()  # type: ignore[union-attr]
-            except Exception:
-                body_txt = ""
-            if url_s in body_txt or (tail and tail in body_txt):
-                break
-            await page.wait_for_timeout(200)  # type: ignore[union-attr]
+    await _fb_write_lexical_composer(page, editor, comment, url_for_compose)
+    await _fb_dismiss_add_to_post_dialog(page)
+    await _fb_wait_story_ready(dialog, editor, page, comment, url_for_compose, step_timeout)
 
     await _fb_dismiss_add_to_post_dialog(page)
 
-    # Step 2 — **only** the blue footer **Next**: ``div``/``role="button"`` + ``aria-label="Next"`` (not inner ``span``, not toolbar).
-    next_btn = dialog.locator('[role="button"][aria-label="Next"]').first  # type: ignore[union-attr]
-    if await next_btn.count() == 0:
-        next_btn = dialog.get_by_role("button", name="Next", exact=True)  # type: ignore[union-attr]
-    await next_btn.wait_for(state="visible", timeout=step_timeout)
-    await next_btn.scroll_into_view_if_needed()  # type: ignore[union-attr]
-    for _ in range(80):
-        if await next_btn.is_enabled():
-            break
-        await page.wait_for_timeout(200)  # type: ignore[union-attr]
-    await next_btn.click(timeout=15_000)
+    # Step 2 — blue **Next** (enabled when composer has content).
+    await _fb_wait_and_click_next(dialog, page, step_timeout)
 
-    # Let **Post settings** mount; avoid ``[role=dialog].last`` — **Create post** can still be last in the tree.
+    # Step 3 — wait for *Post settings* (after **Next**).
     await page.wait_for_timeout(1200)  # type: ignore[union-attr]
-
-    # Step 3 — **Post settings** sheet only, then blue footer **Post** (not **Save**, not **Back** / compose).
-    post_sheet = page.get_by_role("dialog", name=re.compile(r"post settings", re.I)).first  # type: ignore[union-attr]
     try:
-        await post_sheet.wait_for(state="visible", timeout=step_timeout)
+        await dialog.wait_for(state="hidden", timeout=min(step_timeout, 12_000))  # type: ignore[union-attr]
     except PWTimeout:
-        post_sheet = page.locator('[role="dialog"]').filter(  # type: ignore[union-attr]
-            has_text=re.compile(r"Post settings|Post audience|Boost post", re.I)
-        ).first
-        await post_sheet.wait_for(state="visible", timeout=step_timeout)
+        pass
 
-    # Same pattern as **Next**: ``role="button"`` + ``aria-label="Post"`` on the primary control (not inner ``span``).
-    post_btn = post_sheet.locator('[role="button"][aria-label="Post"]').first  # type: ignore[union-attr]
-    if await post_btn.count() == 0:
-        post_btn = post_sheet.get_by_role("button", name="Post", exact=True).first  # type: ignore[union-attr]
-    await post_btn.wait_for(state="visible", timeout=step_timeout)
-    await post_btn.scroll_into_view_if_needed()  # type: ignore[union-attr]
-    for _ in range(80):
-        if await post_btn.is_enabled():
-            break
-        await page.wait_for_timeout(200)  # type: ignore[union-attr]
-    await post_btn.click(timeout=20_000)
+    post_sheet = await _fb_resolve_post_settings_dialog(page, step_timeout)
+
+    # Step 4 — find and click the blue footer **Post** (exact label, not *Add to your post*).
+    await _fb_click_post_settings_publish(post_sheet, page, step_timeout)
     await page.wait_for_timeout(int((os.environ.get("LUNA_SOCIAL_FB_POST_WAIT_MS") or "4000").strip() or "4000"))  # type: ignore[union-attr]
-    print("(social playwright) Facebook: posted (steps: textbox → Next → Post).", flush=True)
+    print("(social playwright) Facebook: posted (steps: textbox → Next → Post settings → Post).", flush=True)
 
 
 async def _post_facebook(context: object, title: str, video_url: str) -> None:

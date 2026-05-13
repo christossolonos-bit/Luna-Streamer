@@ -52,6 +52,12 @@ Environment (or use CLI flags where noted):
   LUNA_YOUTUBE_OBSERVE_CHANNELS  Comma/space separated @handles or URLs to watch for new uploads.
   LUNA_YOUTUBE_ANNOUNCE_DISCORD_CHANNEL_ID  Discord text channel id for those upload announcements.
   LUNA_YOUTUBE_OBSERVE_TODAY_ONLY  1 = only same-calendar-day uploads (local PC time). Default 1.
+  LUNA_YOUTUBE_LIVE_CHAT           If 1, read YouTube Live chat via pytchat (no replies posted to YouTube).
+  LUNA_YOUTUBE_LIVE_VIDEO_ID       Live stream video id (11 chars) or use LUNA_YOUTUBE_LIVE_URL.
+  LUNA_YOUTUBE_LIVE_URL            watch URL for the live stream (alternative to VIDEO_ID).
+  LUNA_YOUTUBE_LIVE_AUTO_REPLY     If 1 (default), Luna replies in the viewer/TTS only (not YouTube chat).
+  LUNA_YOUTUBE_LIVE_AUTO_TRIGGER   mention | all (default all for live chat).
+  LUNA_YOUTUBE_LIVE_POLL_SEC       Poll interval seconds (default 0.5).
   LUNA_YT_DOWNLOAD          If 1, !play also downloads the file (default 1).
   LUNA_YT_DOWNLOAD_DIR      Folder where !play stores downloaded audio (default <project>/data/yt_audio).
   LUNA_YT_DEFAULT_FORMAT    yt-dlp format string (default bestaudio[ext=m4a]/bestaudio/best).
@@ -113,6 +119,13 @@ from youtube_feed import (
     observe_feed_enabled,
     run_feed_poller as yt_run_feed_poller,
     run_observe_feed_poller as yt_run_observe_feed_poller,
+)
+from youtube_live_chat import (
+    run_youtube_live_chat_listener,
+    youtube_live_auto_reply_enabled,
+    youtube_live_auto_trigger,
+    youtube_live_chat_enabled,
+    youtube_live_video_id,
 )
 from social_playwright_share import (
     run_interactive_social_login,
@@ -796,6 +809,44 @@ class LunaTwitchBot(commands.Bot):
             return True
         lowered = text.lower()
         return "luna" in lowered or "@luna" in lowered
+
+    def _should_auto_reply_youtube(self, text: str) -> bool:
+        if not youtube_live_auto_reply_enabled():
+            return False
+        cleaned = (text or "").strip()
+        if not cleaned or cleaned.startswith("!"):
+            return False
+        now = time.time()
+        if now - self._last_auto_reply_ts < self._auto_cooldown_sec:
+            return False
+        if youtube_live_auto_trigger() == "all":
+            return True
+        lowered = cleaned.lower()
+        return "luna" in lowered or "@luna" in lowered
+
+    async def handle_youtube_live_chat(self, author: str, question: str, ts_ms: int) -> None:
+        """YouTube Live chat → viewer panel + optional Luna reply (never posted to YouTube)."""
+        source = "YouTube Live"
+        if self._chat_hub:
+            await self._chat_hub.broadcast(
+                {
+                    "type": "chat",
+                    "user": author,
+                    "text": question,
+                    "channel": source,
+                    "ts": ts_ms,
+                }
+            )
+        if not self._should_auto_reply_youtube(question):
+            return
+        await self._generate_and_dispatch_reply(
+            channel_name=source,
+            author=author,
+            question=question.strip(),
+            send_to_twitch=False,
+            source=source,
+            local_speak=True,
+        )
 
     async def _ollama_stream_to_hub(self, channel_name: str, messages: list[dict]) -> str:
         """Stream Ollama tokens to the chat hub while collecting the full reply.
@@ -1484,7 +1535,7 @@ async def _run_async(
                             "type": "status",
                             "text": (
                                 "Set LUNA_SOCIAL_X_STORAGE_STATE / LUNA_SOCIAL_FACEBOOK_STORAGE_STATE in .env, restart Luna, "
-                                "then use the **X** or **Facebook** dock buttons: sign in in the first tab, **close that tab** "
+                                "then open **Settings → Social login** (X / Facebook): sign in in the first tab, **close that tab** "
                                 "(wait for “saved” in chat). Or: python scripts/social_playwright_login.py https://x.com D:/x.json"
                             ),
                         }
@@ -1667,6 +1718,7 @@ async def _run_async(
         hub.set_client_message_handler(_on_client_message)
 
     feed_task: asyncio.Task | None = None
+    yt_live_task: asyncio.Task | None = None
     if hub is not None:
         async def _hub_status(text: str) -> None:
             await hub.broadcast({"type": "status", "text": text})
@@ -1738,6 +1790,21 @@ async def _run_async(
                 name="luna-youtube-feed",
             )
 
+        if youtube_live_chat_enabled():
+            live_vid = youtube_live_video_id()
+
+            async def _on_youtube_live_chat(author: str, text: str, ts_ms: int) -> None:
+                await bot.handle_youtube_live_chat(author, text, ts_ms)
+
+            yt_live_task = asyncio.create_task(
+                run_youtube_live_chat_listener(
+                    video_id=live_vid,
+                    on_chat=_on_youtube_live_chat,
+                    broadcast_status=_hub_status,
+                ),
+                name="luna-youtube-live-chat",
+            )
+
     try:
         await bot.start()
     finally:
@@ -1745,6 +1812,12 @@ async def _run_async(
             feed_task.cancel()
             try:
                 await feed_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if yt_live_task is not None:
+            yt_live_task.cancel()
+            try:
+                await yt_live_task
             except (asyncio.CancelledError, Exception):
                 pass
         if discord_bot_obj is not None:

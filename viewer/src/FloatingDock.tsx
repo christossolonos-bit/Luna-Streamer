@@ -4,8 +4,6 @@ import {
   ScreenIcon,
   SettingsIcon,
   ShareVideoIcon,
-  SocialFacebookLoginIcon,
-  SocialXLoginIcon,
   UploadIcon,
   YoutubeTodayCheckIcon,
 } from "./icons";
@@ -28,10 +26,6 @@ type Props = {
   /** Share any YouTube URL to X/Facebook via Playwright (server; separate from today's check). */
   socialShareDisabled?: boolean;
   onSocialShareVideo?: () => void;
-  /** Open visible Chrome to save Playwright session (paths in server .env). */
-  socialLoginSetupDisabled?: boolean;
-  onSocialLoginX?: () => void;
-  onSocialLoginFacebook?: () => void;
 };
 
 type DockBtnProps = {
@@ -79,9 +73,6 @@ export function FloatingDock({
   onYoutubeObserveCheck,
   socialShareDisabled = true,
   onSocialShareVideo,
-  socialLoginSetupDisabled = true,
-  onSocialLoginX,
-  onSocialLoginFacebook,
 }: Props) {
   return (
     <div className="dock" role="toolbar" aria-label="Luna controls">
@@ -108,26 +99,6 @@ export function FloatingDock({
           onClick={onSocialShareVideo}
         >
           <ShareVideoIcon />
-        </DockBtn>
-      ) : null}
-      {onSocialLoginX ? (
-        <DockBtn
-          label="Set up X (Twitter) login for social sharing — opens Chrome; close tab when done"
-          disabled={socialLoginSetupDisabled}
-          className="dock-btn--social-x"
-          onClick={onSocialLoginX}
-        >
-          <SocialXLoginIcon />
-        </DockBtn>
-      ) : null}
-      {onSocialLoginFacebook ? (
-        <DockBtn
-          label="Set up Facebook login for social sharing — opens Chrome; close tab when done"
-          disabled={socialLoginSetupDisabled}
-          className="dock-btn--social-fb"
-          onClick={onSocialLoginFacebook}
-        >
-          <SocialFacebookLoginIcon />
         </DockBtn>
       ) : null}
       <DockBtn
