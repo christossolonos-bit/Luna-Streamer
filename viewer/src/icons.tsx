@@ -22,6 +22,70 @@ export function UploadIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+/** Calendar with a dot: today's uploads / manual YouTube observe check. */
+export function YoutubeTodayCheckIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+      <line x1="16" y1="2" x2="16" y2="6" />
+      <line x1="8" y1="2" x2="8" y2="6" />
+      <line x1="3" y1="10" x2="21" y2="10" />
+      <circle cx="12" cy="16" r="2" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/** Share / broadcast (manual social post for a YouTube URL). */
+export function ShareVideoIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="18" cy="5" r="3" />
+      <circle cx="6" cy="12" r="3" />
+      <circle cx="18" cy="19" r="3" />
+      <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+      <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+    </svg>
+  );
+}
+
+/** Key — open browser to log in to X/Facebook for Playwright (legacy / optional). */
+export function SocialLoginKeyIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="8" cy="16" r="5" />
+      <path d="M10.5 11.5 21 2" />
+      <path d="m13 9 3 3" />
+    </svg>
+  );
+}
+
+/** X — open Chrome to save session for X posting (server Playwright). */
+export function SocialXLoginIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <line x1="5" y1="5" x2="19" y2="19" strokeWidth={2.4} />
+      <line x1="19" y1="5" x2="5" y2="19" strokeWidth={2.4} />
+    </svg>
+  );
+}
+
+/** Facebook — open Chrome to save session for Facebook posting. */
+export function SocialFacebookLoginIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      width={18}
+      height={18}
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      stroke="none"
+      aria-hidden="true"
+      {...props}
+    >
+      <path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3.5l.5-4H14V7a1 1 0 0 1 1-1h3V2z" />
+    </svg>
+  );
+}
+
 export function ScreenIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...base} {...props}>

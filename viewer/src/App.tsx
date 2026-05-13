@@ -55,7 +55,8 @@ function AppInner() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
-  const { conn, ttsEnabled, avatarSpeaking } = useBridge();
+  const { conn, ttsEnabled, avatarSpeaking, sendYoutubeObserveCheck, sendSocialShareVideo, sendSocialInteractiveLogin } =
+    useBridge();
   const mic = useMicSession();
 
   const [activeOverlay, setActiveOverlay] = useState<DockOverlay>(null);
@@ -87,6 +88,22 @@ function AppInner() {
     }
     runtimeRef.current?.setChromaKeyMode(mode);
   }, []);
+
+  const onSocialShareVideoClick = useCallback(() => {
+    const raw = window.prompt(
+      "Paste a YouTube video URL to share on X and Facebook (works for older uploads too). Server needs LUNA_SOCIAL_PLAYWRIGHT and storage JSON paths.",
+    );
+    const u = raw?.trim();
+    if (u) void sendSocialShareVideo(u);
+  }, [sendSocialShareVideo]);
+
+  const onSocialLoginXClick = useCallback(() => {
+    void sendSocialInteractiveLogin("x");
+  }, [sendSocialInteractiveLogin]);
+
+  const onSocialLoginFacebookClick = useCallback(() => {
+    void sendSocialInteractiveLogin("facebook");
+  }, [sendSocialInteractiveLogin]);
 
   useEffect(() => {
     try {
@@ -573,6 +590,13 @@ function AppInner() {
         onToggleMic={() => void mic.toggle()}
         chatOpen={chatOpen}
         onToggleChat={() => setChatOpen((v) => !v)}
+        ytObserveCheckDisabled={conn !== "open"}
+        onYoutubeObserveCheck={() => void sendYoutubeObserveCheck()}
+        socialShareDisabled={conn !== "open"}
+        onSocialShareVideo={onSocialShareVideoClick}
+        socialLoginSetupDisabled={conn !== "open"}
+        onSocialLoginX={onSocialLoginXClick}
+        onSocialLoginFacebook={onSocialLoginFacebookClick}
       />
     </div>
   );

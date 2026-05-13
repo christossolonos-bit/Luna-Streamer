@@ -252,11 +252,12 @@
   cursor: not-allowed;
 }
 
-.dock-btn--active {
-  color: #00f0ff;
-  border-color: #00f0ff;
-  background: rgba(0, 240, 255, 0.12);
-  box-shadow: 0 0 16px rgba(0, 240, 255, 0.35);
+.dock-btn--social-x:hover:not(:disabled) {
+  color: #e7e9ea;
+}
+
+.dock-btn--social-fb:hover:not(:disabled) {
+  color: #8ab4f8;
 }
 
 .dock-btn--mic {

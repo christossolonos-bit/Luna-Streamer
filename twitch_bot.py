@@ -47,9 +47,11 @@ Environment (or use CLI flags where noted):
   LUNA_SCREEN_YIELD_TO_CHAT  If 0, may run vision while a reply generates (default 1 = skip frames while chat uses Ollama)
   LUNA_STREAM_ASSISTANT_WS  If 1 (default), stream tokens to the viewer over WS as they arrive (faster perceived replies)
   LUNA_OLLAMA_PRINT_STREAM  If 1, also print streamed tokens to the console (default 0; reduces overhead on Windows)
-  LUNA_YOUTUBE_CHANNEL_ID   YouTube channel id (UC…) to watch for new uploads (announces in panel; optional Twitch chat).
-  LUNA_YOUTUBE_POLL_SEC     Poll interval in seconds (default 300, min 60).
-  LUNA_YOUTUBE_ANNOUNCE_TWITCH  If 1 and send_replies is on, also post the upload line in Twitch chat.
+  LUNA_YOUTUBE_CHANNEL_ID   UC… id for legacy single-feed poller (ignored if LUNA_YOUTUBE_OBSERVE_CHANNELS is set).
+  LUNA_YOUTUBE_POLL_SEC     Poll interval for YouTube RSS (default 300, min 60).
+  LUNA_YOUTUBE_OBSERVE_CHANNELS  Comma/space separated @handles or URLs to watch for new uploads.
+  LUNA_YOUTUBE_ANNOUNCE_DISCORD_CHANNEL_ID  Discord text channel id for those upload announcements.
+  LUNA_YOUTUBE_OBSERVE_TODAY_ONLY  1 = only same-calendar-day uploads (local PC time). Default 1.
   LUNA_YT_DOWNLOAD          If 1, !play also downloads the file (default 1).
   LUNA_YT_DOWNLOAD_DIR      Folder where !play stores downloaded audio (default <project>/data/yt_audio).
   LUNA_YT_DEFAULT_FORMAT    yt-dlp format string (default bestaudio[ext=m4a]/bestaudio/best).
@@ -99,11 +101,24 @@ from luna_stt import prewarm as stt_prewarm, stt_status_line, transcribe_audio
 from youtube_audio import (
     download_enabled as yt_download_enabled,
     download_to_dir as yt_download_to_dir,
+    extract_video_id as yt_extract_video_id,
     fetch_transcript as yt_fetch_transcript,
     resolve_track as yt_resolve_track,
     short_status_line as yt_short_status_line,
 )
-from youtube_feed import channel_id as yt_channel_id, run_feed_poller as yt_run_feed_poller
+from youtube_feed import (
+    announce_discord_channel_id,
+    channel_id as yt_channel_id,
+    manual_check_today_uploads,
+    observe_feed_enabled,
+    run_feed_poller as yt_run_feed_poller,
+    run_observe_feed_poller as yt_run_observe_feed_poller,
+)
+from social_playwright_share import (
+    run_interactive_social_login,
+    share_new_youtube_upload,
+    social_playwright_configured,
+)
 from ollama_client import (
     ThinkStripper,
     build_client,
@@ -1417,6 +1432,127 @@ async def _run_async(
                 )
                 return
 
+            if msg_type == "viewer_youtube_observe_check":
+                if not observe_feed_enabled():
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "YouTube observe: not configured (set LUNA_YOUTUBE_OBSERVE_CHANNELS).",
+                        }
+                    )
+                    return
+                try:
+                    lines = await manual_check_today_uploads()
+                except Exception as exc:
+                    await hub.broadcast(
+                        {"type": "status", "text": f"YouTube observe check failed: {exc}"},
+                    )
+                    return
+                for line in lines:
+                    await hub.broadcast({"type": "status", "text": line})
+                if discord_bot_obj is not None and announce_discord_channel_id() is not None:
+                    body = "\n".join(lines)
+                    for start in range(0, len(body), 1900):
+                        await _discord_yt_upload(body[start : start + 1900])
+                return
+
+            if msg_type == "viewer_social_share_video":
+                url = str(payload.get("url") or "").strip()
+                if not url:
+                    await hub.broadcast({"type": "status", "text": "Social share: missing URL."})
+                    return
+                if not yt_extract_video_id(url):
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "Social share: use a YouTube video link (watch, Shorts, or youtu.be).",
+                        }
+                    )
+                    return
+                if not social_playwright_configured():
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": (
+                                "Social share: not configured. The dock button does not open a login browser. "
+                                "Log in once from a terminal (see next line), then set LUNA_SOCIAL_* in .env and restart Luna."
+                            ),
+                        }
+                    )
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": (
+                                "Set LUNA_SOCIAL_X_STORAGE_STATE / LUNA_SOCIAL_FACEBOOK_STORAGE_STATE in .env, restart Luna, "
+                                "then use the **X** or **Facebook** dock buttons: sign in in the first tab, **close that tab** "
+                                "(wait for “saved” in chat). Or: python scripts/social_playwright_login.py https://x.com D:/x.json"
+                            ),
+                        }
+                    )
+                    return
+
+                async def _manual_social_share() -> None:
+                    try:
+                        ok, meta = await asyncio.to_thread(yt_resolve_track, url)
+                        if not ok or not isinstance(meta, dict):
+                            err = meta if isinstance(meta, str) else "Could not resolve that URL."
+                            await hub.broadcast({"type": "status", "text": f"Social share: {err}"})
+                            return
+                        title = (meta.get("title") or "YouTube").strip()
+                        web_url = (meta.get("web_url") or url).strip()
+                        await share_new_youtube_upload(title=title, video_url=web_url)
+                    except Exception as exc:
+                        await hub.broadcast({"type": "status", "text": f"Social share: {exc}"})
+                        return
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "Social share: Playwright run finished (check X/Facebook or terminal if nothing posted).",
+                        }
+                    )
+
+                await hub.broadcast(
+                    {"type": "status", "text": "Social share: resolving title, then Playwright (X/Facebook)..."}
+                )
+                asyncio.create_task(_manual_social_share())
+                return
+
+            if msg_type == "viewer_social_interactive_login":
+                site_raw = str(payload.get("site") or "x").strip().lower()
+                if site_raw in ("facebook", "fb"):
+                    site = "facebook"
+                    env_key = "LUNA_SOCIAL_FACEBOOK_STORAGE_STATE"
+                else:
+                    site = "x"
+                    env_key = "LUNA_SOCIAL_X_STORAGE_STATE"
+                out_raw = str(payload.get("out_path") or os.environ.get(env_key) or "").strip()
+                if not out_raw:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": f"Social login: set {env_key} in .env to the JSON path to create (e.g. D:/secrets/luna_x.json).",
+                        }
+                    )
+                    return
+                out_path = Path(out_raw).expanduser()
+
+                async def _login_bcast(text: str) -> None:
+                    await hub.broadcast({"type": "status", "text": text})
+
+                def _login_done(task: asyncio.Task) -> None:
+                    try:
+                        exc = task.exception()
+                    except asyncio.CancelledError:
+                        return
+                    if exc:
+                        print(f"(social playwright) interactive login: {exc}", flush=True)
+
+                tsk = asyncio.create_task(
+                    run_interactive_social_login(site=site, out_path=out_path, broadcast=_login_bcast)
+                )
+                tsk.add_done_callback(_login_done)
+                return
+
             if msg_type == "viewer_prompt":
                 text = str(payload.get("text", "")).strip()
                 if not text:
@@ -1531,7 +1667,7 @@ async def _run_async(
         hub.set_client_message_handler(_on_client_message)
 
     feed_task: asyncio.Task | None = None
-    if hub is not None and yt_channel_id():
+    if hub is not None:
         async def _hub_status(text: str) -> None:
             await hub.broadcast({"type": "status", "text": text})
 
@@ -1544,10 +1680,63 @@ async def _run_async(
                 except Exception:
                     pass
 
-        feed_task = asyncio.create_task(
-            yt_run_feed_poller(broadcast_status=_hub_status, twitch_send=_twitch_announce),
-            name="luna-youtube-feed",
-        )
+        async def _discord_yt_upload(text: str) -> None:
+            if discord_bot_obj is None:
+                return
+            cid = announce_discord_channel_id()
+            if cid is None:
+                return
+            dbot = discord_bot_obj.bot
+            try:
+                await asyncio.wait_for(dbot.wait_until_ready(), timeout=180.0)
+            except Exception as exc:
+                print(f"(discord yt announce) wait_until_ready failed: {exc}", flush=True)
+                return
+            for attempt in range(6):
+                ch = dbot.get_channel(cid)
+                if ch is None:
+                    try:
+                        ch = await dbot.fetch_channel(cid)
+                    except Exception as exc:
+                        if attempt == 5:
+                            print(f"(discord yt announce) fetch_channel({cid}) failed: {exc}", flush=True)
+                        ch = None
+                if ch is not None:
+                    try:
+                        await ch.send(text[:1900])
+                    except Exception as exc:
+                        print(f"(discord yt announce) send failed: {exc}", flush=True)
+                    return
+                await asyncio.sleep(1.2)
+            print(f"(discord yt announce) channel {cid} not available after retries.", flush=True)
+
+        async def _social_playwright_upload(title: str, video_url: str) -> None:
+            try:
+                await share_new_youtube_upload(title=title, video_url=video_url)
+            except Exception as exc:
+                print(f"(social playwright) share failed: {exc}", flush=True)
+
+        if observe_feed_enabled():
+            d_send = (
+                _discord_yt_upload
+                if discord_bot_obj is not None and announce_discord_channel_id() is not None
+                else None
+            )
+            s_send = _social_playwright_upload if social_playwright_configured() else None
+            feed_task = asyncio.create_task(
+                yt_run_observe_feed_poller(
+                    broadcast_status=_hub_status,
+                    twitch_send=_twitch_announce,
+                    discord_send=d_send,
+                    social_share_send=s_send,
+                ),
+                name="luna-youtube-observe",
+            )
+        elif yt_channel_id():
+            feed_task = asyncio.create_task(
+                yt_run_feed_poller(broadcast_status=_hub_status, twitch_send=_twitch_announce),
+                name="luna-youtube-feed",
+            )
 
     try:
         await bot.start()
@@ -1575,7 +1764,9 @@ async def _run_async(
 
 def main() -> None:
     if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        # Playwright's async driver uses asyncio.create_subprocess_exec; SelectorEventLoop
+        # does not implement subprocess transport on Windows (NotImplementedError). Proactor does.
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     configure_stdio_utf8()
     if load_dotenv:
         # override=True so values in .env beat any pre-set Windows/Shell env vars

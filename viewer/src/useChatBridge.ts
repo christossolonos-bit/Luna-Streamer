@@ -541,6 +541,43 @@ export function useChatBridge(enabled: boolean) {
     return true;
   }, []);
 
+  const sendYoutubeObserveCheck = useCallback(async () => {
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    addStatusLine("YouTube: checking observe channels...");
+    ws.send(JSON.stringify({ type: "viewer_youtube_observe_check" }));
+    return true;
+  }, [addStatusLine]);
+
+  const sendSocialInteractiveLogin = useCallback(async (site: string) => {
+    const s = site.trim().toLowerCase();
+    if (!s) return false;
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    addStatusLine(`Social login (${s}): requesting browser from server...`);
+    ws.send(JSON.stringify({ type: "viewer_social_interactive_login", site: s }));
+    return true;
+  }, [addStatusLine]);
+
+  const sendSocialShareVideo = useCallback(async (url: string) => {
+    const u = url.trim();
+    if (!u) return false;
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    addStatusLine("Social share: sending to server...");
+    ws.send(JSON.stringify({ type: "viewer_social_share_video", url: u }));
+    return true;
+  }, [addStatusLine]);
+
   const pickTtsVoice = useCallback((id: string) => {
     setTtsSpeakerId(id);
     try {
@@ -581,5 +618,8 @@ export function useChatBridge(enabled: boolean) {
     requestEnrollState,
     sendPlayRequest,
     sendYouTubeSummary,
+    sendYoutubeObserveCheck,
+    sendSocialShareVideo,
+    sendSocialInteractiveLogin,
   };
 }

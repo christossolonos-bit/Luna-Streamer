@@ -25,5 +25,7 @@ discord.py[voice]>=2.3.0
 # Optional Luna voice (LUNA_TTS=1): Edge TTS backend (Python 3.13 friendly).
 edge-tts>=6.1.0
 pydub>=0.25.1
-# Optional alternative backend:
-# chatterbox-tts
+# Optional: Playwright posts new observe uploads to X / Facebook (saved browser sessions).
+# pip install playwright && python -m playwright install chrome
+# Login helper (run from repo root): python scripts/social_playwright_login.py https://x.com D:/x.json
+playwright>=1.49.0
