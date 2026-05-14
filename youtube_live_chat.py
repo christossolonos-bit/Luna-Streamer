@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from youtube_audio import extract_video_id
 
 OnChat = Callable[[str, str, int], Awaitable[None]]
 BroadcastStatus = Callable[[str], Awaitable[None]]
+OnStopped = Callable[[], Awaitable[None]]
 
 
 def _env_truthy(key: str, *, default: bool = False) -> bool:
@@ -37,8 +38,26 @@ def youtube_live_video_id() -> str:
     return ""
 
 
+def youtube_live_chat_requested() -> bool:
+    """Master switch for YouTube Live chat (URL may be supplied later from the viewer)."""
+    return _env_truthy("LUNA_YOUTUBE_LIVE_CHAT", default=False)
+
+
 def youtube_live_chat_enabled() -> bool:
-    return _env_truthy("LUNA_YOUTUBE_LIVE_CHAT", default=False) and bool(youtube_live_video_id())
+    return youtube_live_chat_requested() and bool(youtube_live_video_id())
+
+
+def set_youtube_live_url(url: str) -> str:
+    """Persist the live watch URL in-process and return the extracted video id."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    vid = extract_video_id(raw)
+    if not vid:
+        return ""
+    os.environ["LUNA_YOUTUBE_LIVE_URL"] = raw
+    os.environ["LUNA_YOUTUBE_LIVE_VIDEO_ID"] = vid
+    return vid
 
 
 def youtube_live_auto_reply_enabled() -> bool:
@@ -48,6 +67,79 @@ def youtube_live_auto_reply_enabled() -> bool:
 def youtube_live_auto_trigger() -> str:
     raw = (os.environ.get("LUNA_YOUTUBE_LIVE_AUTO_TRIGGER") or "all").strip().lower()
     return raw if raw in {"mention", "all"} else "all"
+
+
+def youtube_live_check_probe_url() -> str:
+    """Single channel /live page to probe when the viewer taps “check YouTube live”."""
+    raw = (os.environ.get("LUNA_YOUTUBE_LIVE_CHECK_URL") or "").strip()
+    if raw:
+        return raw
+    return "https://www.youtube.com/@Solonaras1/live"
+
+
+class YouTubeLiveChatRunner:
+    """Start/stop the pytchat listener for a single live video id."""
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+        self._video_id = ""
+
+    @property
+    def active_video_id(self) -> str:
+        return self._video_id
+
+    @property
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def stop(self) -> None:
+        task = self._task
+        self._task = None
+        self._video_id = ""
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    async def start(
+        self,
+        *,
+        video_id: str,
+        on_chat: OnChat,
+        broadcast_status: BroadcastStatus | None = None,
+        on_stopped: OnStopped | None = None,
+    ) -> asyncio.Task[None] | None:
+        vid = (video_id or "").strip()
+        if not vid:
+            return None
+        if self.is_running and self._video_id == vid:
+            return self._task
+        await self.stop()
+        self._video_id = vid
+
+        async def _run() -> None:
+            try:
+                await run_youtube_live_chat_listener(
+                    video_id=vid,
+                    on_chat=on_chat,
+                    broadcast_status=broadcast_status,
+                )
+            finally:
+                self._task = None
+                self._video_id = ""
+                if on_stopped is not None:
+                    try:
+                        await on_stopped()
+                    except Exception:
+                        pass
+
+        self._task = asyncio.create_task(_run(), name=f"luna-youtube-live-chat-{vid}")
+        return self._task
 
 
 async def run_youtube_live_chat_listener(
@@ -71,11 +163,11 @@ async def run_youtube_live_chat_listener(
     url = f"https://www.youtube.com/watch?v={video_id}"
     print(f"(youtube live) listening: {url}", flush=True)
     if broadcast_status:
-        await broadcast_status(f"YouTube Live chat: listening ({video_id})…")
+        await broadcast_status(f"YouTube Live chat (pytchat): listening ({video_id})…")
 
     seen: set[str] = set()
 
-    def _open():
+    def _open() -> Any:
         return pytchat.create(video_id=video_id)
 
     chat = await asyncio.to_thread(_open)

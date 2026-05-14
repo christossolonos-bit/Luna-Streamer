@@ -17,7 +17,8 @@ Environment (or use CLI flags where noted):
   LUNA_CHAT_WS_HOST  WebSocket bind host (default 127.0.0.1)
   LUNA_CHAT_WS_PORT  WebSocket port; set 0 to disable (default 8765)
   LUNA_TTS           If 1, enable Edge TTS synthesis after each reply
-  LUNA_TTS_PLAY      If 1, play generated WAV locally
+  LUNA_TTS_PLAY      If 1, play on PC speakers when LUNA_TTS_PLAY_TARGET is local or both
+  LUNA_TTS_PLAY_TARGET  local (default) | viewer (VRM browser / OBS) | both
   LUNA_EDGE_VOICE    Default Edge voice id (e.g. en-US-JennyNeural)
   LUNA_EDGE_RATE     Edge rate adjustment like +0% / -10%
   LUNA_EDGE_PITCH    Edge pitch adjustment like +0Hz / -2Hz
@@ -57,11 +58,16 @@ Environment (or use CLI flags where noted):
   LUNA_YOUTUBE_LIVE_URL            watch URL for the live stream (alternative to VIDEO_ID).
   LUNA_YOUTUBE_LIVE_AUTO_REPLY     If 1 (default), Luna replies in the viewer/TTS only (not YouTube chat).
   LUNA_YOUTUBE_LIVE_AUTO_TRIGGER   mention | all (default all for live chat).
-  LUNA_YOUTUBE_LIVE_POLL_SEC       Poll interval seconds (default 0.5).
+  LUNA_YOUTUBE_LIVE_CHECK_URL      Single @handle/live or watch URL for manual “check YouTube live” (default @Solonaras1/live).
   LUNA_SOCIAL_LIVE_SHARE           If 1, post to X/Facebook when you go live on YouTube or Twitch.
   LUNA_SOCIAL_LIVE_POLL_SEC        How often to check for live (default 90s).
   LUNA_SOCIAL_LIVE_TITLE_PREFIX    Prepended to stream title in social posts (default "Live now:").
   LUNA_SOCIAL_LIVE_YOUTUBE_URLS    Extra YouTube channel/live URLs to watch (optional).
+  LUNA_TWITCH_LIVE_ANNOUNCE        If 1, detect Twitch go-live (Discord all servers + optional X/Facebook).
+  LUNA_TWITCH_LIVE_DISCORD         If 1 (default when ANNOUNCE=1), post to every Discord server Luna is in.
+  LUNA_TWITCH_LIVE_SOCIAL          If 1 (default when ANNOUNCE=1), post invitation on X and Facebook profile.
+  LUNA_TWITCH_LIVE_DISCORD_MESSAGE Template with {title} and {url} for Discord go-live posts.
+  DISCORD_LIVE_ANNOUNCE_CHANNEL_ID Optional. Fixed text channel id for go-live posts (else system/first writable).
   LUNA_YT_DOWNLOAD          If 1, !play also downloads the file (default 1).
   LUNA_YT_DOWNLOAD_DIR      Folder where !play stores downloaded audio (default <project>/data/yt_audio).
   LUNA_YT_DEFAULT_FORMAT    yt-dlp format string (default bestaudio[ext=m4a]/bestaudio/best).
@@ -96,8 +102,12 @@ from luna_tts import (
     maybe_speak,
     prewarm_edge_tts,
     set_selected_speaker,
+    synthesize_playback_bundle,
     synthesize_reply_to_file,
     tts_enabled,
+    tts_play_locally,
+    tts_play_to_viewer,
+    tts_play_target,
     tts_playback_enabled,
     tts_voices_control_message,
 )
@@ -125,13 +135,19 @@ from youtube_feed import (
     run_observe_feed_poller as yt_run_observe_feed_poller,
 )
 from youtube_live_chat import (
-    run_youtube_live_chat_listener,
+    YouTubeLiveChatRunner,
+    set_youtube_live_url,
     youtube_live_auto_reply_enabled,
     youtube_live_auto_trigger,
-    youtube_live_chat_enabled,
+    youtube_live_chat_requested,
+    youtube_live_check_probe_url,
     youtube_live_video_id,
 )
-from live_social_share import live_social_share_enabled, run_live_social_poller
+from live_social_share import (
+    live_social_share_enabled,
+    live_watch_enabled,
+    run_live_social_poller,
+)
 from social_playwright_share import (
     run_interactive_social_login,
     share_new_youtube_upload,
@@ -462,6 +478,16 @@ class LunaTwitchBot(commands.Bot):
         except RuntimeError:
             return
         self._mic_ready_task = loop.create_task(self._mic_ready_broadcast_after_delay(hub, delay))
+
+    async def finish_viewer_tts(self) -> None:
+        """Viewer finished playing ``tts_audio`` — release speaking gate + mic tail guard."""
+        self._avatar_speaking = False
+        self._last_avatar_speaking_end_ts = time.monotonic()
+        if self._chat_hub:
+            await self._chat_hub.broadcast(
+                {"type": "control", "name": "avatar_speaking", "value": False}
+            )
+            self._schedule_mic_ready_after_tts(self._chat_hub)
 
     @staticmethod
     def _normalize_text_for_echo(text: str) -> str:
@@ -1090,6 +1116,7 @@ class LunaTwitchBot(commands.Bot):
 
         if local_speak and tts_enabled():
             loop = asyncio.get_running_loop()
+            viewer_only = tts_play_to_viewer() and not tts_play_locally()
 
             def _emit_viseme(vowel: str, intensity: float, hold_ms: int) -> None:
                 hub = self._chat_hub
@@ -1105,23 +1132,41 @@ class LunaTwitchBot(commands.Bot):
                 try:
                     asyncio.run_coroutine_threadsafe(hub.broadcast(payload), loop)
                 except RuntimeError:
-                    # Event loop stopped during shutdown.
                     pass
 
             try:
-                await asyncio.to_thread(maybe_speak, reply_stripped, viseme_cb=_emit_viseme)
-            finally:
-                self._avatar_speaking = False
-                self._last_avatar_speaking_end_ts = time.monotonic()
-                if self._chat_hub:
-                    await self._chat_hub.broadcast(
-                        {
-                            "type": "control",
-                            "name": "avatar_speaking",
-                            "value": False,
-                        }
+                if tts_play_to_viewer() and self._chat_hub:
+                    bundle = await asyncio.to_thread(
+                        synthesize_playback_bundle, reply_stripped
                     )
-                    self._schedule_mic_ready_after_tts(self._chat_hub)
+                    if bundle is not None:
+                        await self._chat_hub.broadcast(
+                            {
+                                "type": "control",
+                                "name": "tts_audio",
+                                "mime": bundle.mime,
+                                "data": base64.b64encode(bundle.audio).decode("ascii"),
+                                "duration_ms": bundle.duration_ms,
+                                "visemes": bundle.visemes,
+                            }
+                        )
+                if tts_play_locally():
+                    await asyncio.to_thread(
+                        maybe_speak, reply_stripped, viseme_cb=_emit_viseme
+                    )
+            finally:
+                if not viewer_only:
+                    self._avatar_speaking = False
+                    self._last_avatar_speaking_end_ts = time.monotonic()
+                    if self._chat_hub:
+                        await self._chat_hub.broadcast(
+                            {
+                                "type": "control",
+                                "name": "avatar_speaking",
+                                "value": False,
+                            }
+                        )
+                        self._schedule_mic_ready_after_tts(self._chat_hub)
         return reply_stripped
 
     async def handle_discord_chat(
@@ -1395,6 +1440,48 @@ async def _run_async(
     if discord_bot_obj is not None:
         discord_bot_obj.set_chat_handler(bot.handle_discord_chat)
 
+    prompted_yt_stream_ids: set[str] = set()
+    yt_runner = YouTubeLiveChatRunner()
+
+    async def _hub_status(text: str) -> None:
+        if hub is not None:
+            await hub.broadcast({"type": "status", "text": text})
+
+    async def _on_youtube_live_chat(author: str, text: str, ts_ms: int) -> None:
+        await bot.handle_youtube_live_chat(author, text, ts_ms)
+
+    async def _on_yt_live_stopped() -> None:
+        pass
+
+    async def _prompt_youtube_live_url(item: dict[str, str], *, force: bool = False) -> None:
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            return
+        if yt_runner.is_running and yt_runner.active_video_id == sid:
+            if hub is not None:
+                await hub.broadcast(
+                    {
+                        "type": "status",
+                        "text": f"YouTube Live chat (pytchat): already listening ({sid}).",
+                    }
+                )
+            return
+        if not force and sid in prompted_yt_stream_ids:
+            return
+        prompted_yt_stream_ids.add(sid)
+        if hub is None:
+            return
+        await hub.broadcast(
+            {
+                "type": "control",
+                "name": "youtube_live_prompt",
+                "open": True,
+                "title": str(item.get("title") or "YouTube Live"),
+                "url": str(item.get("url") or ""),
+                "stream_id": sid,
+            }
+        )
+
     # Kick off STT + TTS warmups in the background. These cost a few seconds
     # of model load / DNS handshake the FIRST time they're called, so doing
     # them up front means the first user utterance / first reply is fast.
@@ -1512,6 +1599,31 @@ async def _run_async(
                         await _discord_yt_upload(body[start : start + 1900])
                 return
 
+            if msg_type == "viewer_youtube_live_check":
+                if not youtube_live_chat_requested():
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "YouTube Live chat off — set LUNA_YOUTUBE_LIVE_CHAT=1.",
+                        },
+                    )
+                    return
+                from live_social_share import probe_youtube_live
+
+                url = youtube_live_check_probe_url()
+                await hub.broadcast({"type": "status", "text": f"YouTube live: checking {url}…"})
+                item = await asyncio.to_thread(probe_youtube_live, url)
+                if not item:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "YouTube live: not detected on this channel (tap again after you go live).",
+                        },
+                    )
+                    return
+                await _prompt_youtube_live_url(item, force=True)
+                return
+
             if msg_type == "viewer_social_share_video":
                 url = str(payload.get("url") or "").strip()
                 if not url:
@@ -1609,6 +1721,10 @@ async def _run_async(
                 tsk.add_done_callback(_login_done)
                 return
 
+            if msg_type == "viewer_tts_ended":
+                await bot.finish_viewer_tts()
+                return
+
             if msg_type == "viewer_prompt":
                 text = str(payload.get("text", "")).strip()
                 if not text:
@@ -1628,6 +1744,57 @@ async def _run_async(
                     question=text,
                     send_to_twitch=False,
                     source="viewer panel",
+                )
+                return
+
+            if msg_type == "viewer_youtube_live_url":
+                url = str(payload.get("url") or "").strip()
+                if not url:
+                    await hub.broadcast(
+                        {"type": "status", "text": "YouTube Live: paste a watch URL."},
+                    )
+                    return
+                vid = set_youtube_live_url(url)
+                if not vid:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "YouTube Live: use a YouTube watch, live, or youtu.be link.",
+                        },
+                    )
+                    return
+                await yt_runner.start(
+                    video_id=vid,
+                    on_chat=_on_youtube_live_chat,
+                    broadcast_status=_hub_status,
+                    on_stopped=_on_yt_live_stopped,
+                )
+                prompted_yt_stream_ids.add(vid)
+                await hub.broadcast(
+                    {
+                        "type": "control",
+                        "name": "youtube_live_prompt",
+                        "open": False,
+                    }
+                )
+                await hub.broadcast(
+                    {
+                        "type": "status",
+                        "text": f"YouTube Live chat (pytchat): connected ({vid}).",
+                    }
+                )
+                return
+
+            if msg_type == "viewer_youtube_live_dismiss":
+                sid = str(payload.get("stream_id") or "").strip()
+                if sid:
+                    prompted_yt_stream_ids.add(sid)
+                await hub.broadcast(
+                    {
+                        "type": "control",
+                        "name": "youtube_live_prompt",
+                        "open": False,
+                    }
                 )
                 return
 
@@ -1723,12 +1890,8 @@ async def _run_async(
         hub.set_client_message_handler(_on_client_message)
 
     feed_task: asyncio.Task | None = None
-    yt_live_task: asyncio.Task | None = None
     live_social_task: asyncio.Task | None = None
     if hub is not None:
-        async def _hub_status(text: str) -> None:
-            await hub.broadcast({"type": "status", "text": text})
-
         async def _twitch_announce(text: str) -> None:
             if not bot._send_replies:
                 return
@@ -1799,29 +1962,36 @@ async def _run_async(
                 name="luna-youtube-feed",
             )
 
-        if youtube_live_chat_enabled():
-            live_vid = youtube_live_video_id()
-
-            async def _on_youtube_live_chat(author: str, text: str, ts_ms: int) -> None:
-                await bot.handle_youtube_live_chat(author, text, ts_ms)
-
-            yt_live_task = asyncio.create_task(
-                run_youtube_live_chat_listener(
-                    video_id=live_vid,
+        if youtube_live_chat_requested():
+            if youtube_live_video_id():
+                await yt_runner.start(
+                    video_id=youtube_live_video_id(),
                     on_chat=_on_youtube_live_chat,
                     broadcast_status=_hub_status,
-                ),
-                name="luna-youtube-live-chat",
-            )
+                    on_stopped=_on_yt_live_stopped,
+                )
 
-        if live_social_share_enabled():
+        if live_watch_enabled():
 
             async def _live_social_share_send(title: str, url: str) -> None:
                 await _social_playwright_live(title, url)
 
+            async def _discord_twitch_live_announce(text: str) -> None:
+                if discord_bot_obj is None:
+                    return
+                dbot = discord_bot_obj.bot
+                try:
+                    await asyncio.wait_for(dbot.wait_until_ready(), timeout=180.0)
+                except Exception as exc:
+                    print(f"(discord live) wait_until_ready failed: {exc}", flush=True)
+                    return
+                n = await discord_bot_obj.announce_live_all_guilds(text)
+                await _hub_status(f"Discord live announce: posted to {n} server(s).")
+
             live_social_task = asyncio.create_task(
                 run_live_social_poller(
                     social_share_send=_live_social_share_send,
+                    discord_live_send=_discord_twitch_live_announce,
                     broadcast_status=_hub_status,
                     twitch_bot=bot,
                     twitch_login=channel,
@@ -1838,12 +2008,7 @@ async def _run_async(
                 await feed_task
             except (asyncio.CancelledError, Exception):
                 pass
-        if yt_live_task is not None:
-            yt_live_task.cancel()
-            try:
-                await yt_live_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await yt_runner.stop()
         if live_social_task is not None:
             live_social_task.cancel()
             try:
@@ -1931,7 +2096,8 @@ def main() -> None:
         f"Starting Twitch bot | channel #{channel} | model {args.model} | "
         f"ollama {os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')} | "
         f"send_replies={send_replies} | auto_reply={auto_reply} ({auto_trigger}) | "
-        f"LUNA_TTS={tts_enabled()} | LUNA_TTS_PLAY={tts_playback_enabled()}",
+        f"LUNA_TTS={tts_enabled()} | LUNA_TTS_PLAY={tts_playback_enabled()} | "
+        f"LUNA_TTS_PLAY_TARGET={tts_play_target()}",
         flush=True,
     )
     if tts_enabled():

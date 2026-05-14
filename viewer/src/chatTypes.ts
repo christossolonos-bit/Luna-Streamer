@@ -78,6 +78,20 @@ export type BridgeControlMicReadyMessage = {
   hint?: string;
 };
 
+export type BridgeControlTtsAudioMessage = {
+  type: "control";
+  name: "tts_audio";
+  mime: string;
+  data: string;
+  duration_ms?: number;
+  visemes?: Array<{
+    at_ms?: number;
+    vowel?: string;
+    intensity?: number;
+    hold_ms?: number;
+  }>;
+};
+
 export type BridgeControlEnrollStateMessage = {
   type: "control";
   name: "enroll_state";
@@ -88,6 +102,15 @@ export type BridgeControlEnrollStateMessage = {
   samples?: number;
 };
 
+export type BridgeControlYoutubeLivePromptMessage = {
+  type: "control";
+  name: "youtube_live_prompt";
+  open: boolean;
+  title?: string;
+  url?: string;
+  stream_id?: string;
+};
+
 export type BridgeControlMessage =
   | BridgeControlSpeakMessage
   | BridgeControlTtsVoicesMessage
@@ -96,7 +119,9 @@ export type BridgeControlMessage =
   | BridgeControlAvatarSpeakingMessage
   | BridgeControlAvatarVisemeMessage
   | BridgeControlMicReadyMessage
-  | BridgeControlEnrollStateMessage;
+  | BridgeControlTtsAudioMessage
+  | BridgeControlEnrollStateMessage
+  | BridgeControlYoutubeLivePromptMessage;
 
 export type BridgeMessage =
   | BridgeChatMessage
@@ -174,6 +199,29 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       hint: typeof o.hint === "string" ? o.hint : undefined,
     };
   }
+  if (t === "control" && o.name === "tts_audio" && typeof o.data === "string") {
+    const visemes = Array.isArray(o.visemes)
+      ? o.visemes
+          .filter((v) => v && typeof v === "object")
+          .map((v) => {
+            const row = v as Record<string, unknown>;
+            return {
+              at_ms: typeof row.at_ms === "number" ? row.at_ms : undefined,
+              vowel: typeof row.vowel === "string" ? row.vowel : undefined,
+              intensity: typeof row.intensity === "number" ? row.intensity : undefined,
+              hold_ms: typeof row.hold_ms === "number" ? row.hold_ms : undefined,
+            };
+          })
+      : undefined;
+    return {
+      type: "control",
+      name: "tts_audio",
+      mime: typeof o.mime === "string" ? o.mime : "audio/mpeg",
+      data: o.data,
+      duration_ms: typeof o.duration_ms === "number" ? o.duration_ms : undefined,
+      visemes,
+    };
+  }
   if (t === "control" && o.name === "enroll_state") {
     const enabled = o.enabled === true;
     const enrolled = o.enrolled === true;
@@ -193,6 +241,17 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       min_sim: minSim,
       last_sim: lastSim,
       samples,
+    };
+  }
+  if (t === "control" && o.name === "youtube_live_prompt") {
+    const open = o.open !== false;
+    return {
+      type: "control",
+      name: "youtube_live_prompt",
+      open,
+      title: typeof o.title === "string" ? o.title : undefined,
+      url: typeof o.url === "string" ? o.url : undefined,
+      stream_id: typeof o.stream_id === "string" ? o.stream_id : undefined,
     };
   }
   if (t === "chat" && typeof o.user === "string" && typeof o.text === "string") {

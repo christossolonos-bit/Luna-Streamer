@@ -371,6 +371,41 @@ class LunaDiscordBot:
         player = self._player(guild_id)
         await player.play_tts_file(audio_path)
 
+    def _announce_text_channel(self, guild: Any) -> Any | None:
+        import discord  # noqa: PLC0415
+
+        forced_id = _int_env("DISCORD_LIVE_ANNOUNCE_CHANNEL_ID")
+        if forced_id:
+            ch = guild.get_channel(forced_id)
+            if ch is not None and isinstance(ch, discord.TextChannel):
+                if ch.permissions_for(guild.me).send_messages:
+                    return ch
+        sys_ch = guild.system_channel
+        if sys_ch is not None and sys_ch.permissions_for(guild.me).send_messages:
+            return sys_ch
+        for c in guild.text_channels:
+            if c.permissions_for(guild.me).send_messages:
+                return c
+        return None
+
+    async def announce_live_all_guilds(self, text: str) -> int:
+        """Post a go-live line to every joined server (system or first writable text channel)."""
+        if not text.strip():
+            return 0
+        sent = 0
+        for guild in self.bot.guilds:
+            channel = self._announce_text_channel(guild)
+            if channel is None:
+                print(f"(discord live) skip {guild.name!r}: no writable text channel", flush=True)
+                continue
+            try:
+                await channel.send(text[:1900])
+                sent += 1
+                print(f"(discord live) posted in #{channel.name} ({guild.name})", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"(discord live) {guild.name!r}: {exc}", flush=True)
+        return sent
+
     async def announce_now_playing(self, guild_id: int, track: Track) -> None:
         guild = self.bot.get_guild(guild_id)
         if guild is None:

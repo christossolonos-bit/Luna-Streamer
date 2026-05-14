@@ -35,6 +35,16 @@ export function YoutubeTodayCheckIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+/** Broadcast / go-live: manual check whether your YouTube channel is live (one URL from server). */
+export function YoutubeLiveCheckIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="12" cy="12" r="8" />
+      <polygon points="10 9 10 15 16 12" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 /** Share / broadcast (manual social post for a YouTube URL). */
 export function ShareVideoIcon(props: SVGProps<SVGSVGElement>) {
   return (

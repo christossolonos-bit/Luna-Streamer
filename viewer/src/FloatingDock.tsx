@@ -5,6 +5,7 @@ import {
   SettingsIcon,
   ShareVideoIcon,
   UploadIcon,
+  YoutubeLiveCheckIcon,
   YoutubeTodayCheckIcon,
 } from "./icons";
 
@@ -20,6 +21,9 @@ type Props = {
   onToggleMic: () => void;
   chatOpen: boolean;
   onToggleChat: () => void;
+  /** Manual: probe one YouTube /live URL for go-live (pytchat prompt). */
+  ytLiveCheckDisabled?: boolean;
+  onYoutubeLiveCheck?: () => void;
   /** Manual poll: today's uploads on YouTube observe channels (server). */
   ytObserveCheckDisabled?: boolean;
   onYoutubeObserveCheck?: () => void;
@@ -71,6 +75,8 @@ export function FloatingDock({
   onToggleChat,
   ytObserveCheckDisabled = true,
   onYoutubeObserveCheck,
+  ytLiveCheckDisabled = true,
+  onYoutubeLiveCheck,
   socialShareDisabled = true,
   onSocialShareVideo,
 }: Props) {
@@ -83,6 +89,15 @@ export function FloatingDock({
       >
         <UploadIcon />
       </DockBtn>
+      {onYoutubeLiveCheck ? (
+        <DockBtn
+          label="Check YouTube live (one channel URL from server; opens pytchat URL prompt if live)"
+          disabled={ytLiveCheckDisabled}
+          onClick={onYoutubeLiveCheck}
+        >
+          <YoutubeLiveCheckIcon />
+        </DockBtn>
+      ) : null}
       {onYoutubeObserveCheck ? (
         <DockBtn
           label="Check today's YouTube uploads (observe channels)"

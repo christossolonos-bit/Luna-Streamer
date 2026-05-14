@@ -12,6 +12,7 @@ import { ChatOverlay } from "./ChatOverlay";
 import { CaptionsOverlay } from "./CaptionsOverlay";
 import { FloatingDock, type DockOverlay } from "./FloatingDock";
 import { SettingsOverlay } from "./SettingsOverlay";
+import { YouTubeLivePromptOverlay } from "./YouTubeLivePromptOverlay";
 import { CloseIcon } from "./icons";
 import { useMicSession } from "./useMicSession";
 import { VrmRuntime, type ChromaKeyMode } from "./vrmRuntime";
@@ -55,8 +56,15 @@ function AppInner() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
-  const { conn, ttsEnabled, avatarSpeaking, sendYoutubeObserveCheck, sendSocialShareVideo } =
-    useBridge();
+  const {
+    conn,
+    ttsEnabled,
+    avatarSpeaking,
+    sendYoutubeObserveCheck,
+    sendYoutubeLiveCheck,
+    sendSocialShareVideo,
+    youtubeLivePrompt,
+  } = useBridge();
   const mic = useMicSession();
 
   const [activeOverlay, setActiveOverlay] = useState<DockOverlay>(null);
@@ -453,6 +461,13 @@ function AppInner() {
 
       <CaptionsOverlay enabled={captionsEnabled} />
 
+      <YouTubeLivePromptOverlay
+        open={youtubeLivePrompt.open}
+        title={youtubeLivePrompt.title}
+        hintUrl={youtubeLivePrompt.hintUrl}
+        streamId={youtubeLivePrompt.streamId}
+      />
+
       {activeOverlay === "upload" && (
         <div className="overlay-card overlay-card--center" role="dialog" aria-label="Upload avatar">
           <div className="overlay-card-header">
@@ -584,6 +599,8 @@ function AppInner() {
         onToggleChat={() => setChatOpen((v) => !v)}
         ytObserveCheckDisabled={conn !== "open"}
         onYoutubeObserveCheck={() => void sendYoutubeObserveCheck()}
+        ytLiveCheckDisabled={conn !== "open"}
+        onYoutubeLiveCheck={() => void sendYoutubeLiveCheck()}
         socialShareDisabled={conn !== "open"}
         onSocialShareVideo={onSocialShareVideoClick}
       />

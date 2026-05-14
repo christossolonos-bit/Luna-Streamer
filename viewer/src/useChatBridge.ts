@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
 import { type BridgeMessage, type BridgeTtsVoice, parseBridgeMessage } from "./chatTypes";
+import { playViewerTts } from "./viewerTtsPlayer";
 
 const DEFAULT_WS = "ws://127.0.0.1:8765/ws";
 const MAX_LINES = 250;
@@ -114,6 +115,13 @@ export type EnrollState = {
   samples: number;
 };
 
+export type YoutubeLivePromptState = {
+  open: boolean;
+  title: string;
+  hintUrl: string;
+  streamId: string;
+};
+
 export function useChatBridge(enabled: boolean) {
   const [lines, setLines] = useState<ChatLine[]>(() => loadPersistedLines());
   const [conn, setConn] = useState<"connecting" | "open" | "closed">("closed");
@@ -127,6 +135,12 @@ export function useChatBridge(enabled: boolean) {
     minSim: 0,
     lastSim: null,
     samples: 0,
+  });
+  const [youtubeLivePrompt, setYoutubeLivePrompt] = useState<YoutubeLivePromptState>({
+    open: false,
+    title: "",
+    hintUrl: "",
+    streamId: "",
   });
   /** True while Luna is synthesising / playing TTS locally (viewer path). */
   const [avatarSpeaking, setAvatarSpeaking] = useState(false);
@@ -250,6 +264,27 @@ export function useChatBridge(enabled: boolean) {
         );
         return;
       }
+      if (msg.name === "tts_audio") {
+        playViewerTts(
+          {
+            mime: msg.mime,
+            data: msg.data,
+            duration_ms: msg.duration_ms,
+            visemes: msg.visemes,
+          },
+          () => {
+            const ws = wsRef.current;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: "viewer_tts_ended" }));
+            }
+            setAvatarSpeaking(false);
+            window.dispatchEvent(
+              new CustomEvent("luna-avatar-speaking", { detail: false }),
+            );
+          },
+        );
+        return;
+      }
       if (msg.name === "mic_ready") {
         const hint =
           typeof msg.hint === "string" && msg.hint.trim().length > 0
@@ -272,6 +307,19 @@ export function useChatBridge(enabled: boolean) {
           minSim: msg.min_sim,
           lastSim: msg.last_sim,
           samples: typeof msg.samples === "number" ? msg.samples : 0,
+        });
+        return;
+      }
+      if (msg.name === "youtube_live_prompt") {
+        if (!msg.open) {
+          setYoutubeLivePrompt((p) => ({ ...p, open: false }));
+          return;
+        }
+        setYoutubeLivePrompt({
+          open: true,
+          title: msg.title?.trim() || "YouTube Live",
+          hintUrl: msg.url?.trim() || "",
+          streamId: msg.stream_id?.trim() || "",
         });
         return;
       }
@@ -552,6 +600,17 @@ export function useChatBridge(enabled: boolean) {
     return true;
   }, [addStatusLine]);
 
+  const sendYoutubeLiveCheck = useCallback(async () => {
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    addStatusLine("YouTube live: checking channel…");
+    ws.send(JSON.stringify({ type: "viewer_youtube_live_check" }));
+    return true;
+  }, [addStatusLine]);
+
   const sendSocialInteractiveLogin = useCallback(async (site: string) => {
     const s = site.trim().toLowerCase();
     if (!s) return false;
@@ -577,6 +636,30 @@ export function useChatBridge(enabled: boolean) {
     ws.send(JSON.stringify({ type: "viewer_social_share_video", url: u }));
     return true;
   }, [addStatusLine]);
+
+  const sendYouTubeLiveUrl = useCallback(async (url: string) => {
+    const u = url.trim();
+    if (!u) return false;
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 5000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "viewer_youtube_live_url", url: u }));
+    return true;
+  }, []);
+
+  const dismissYouTubeLivePrompt = useCallback((streamId: string) => {
+    setYoutubeLivePrompt((p) => ({ ...p, open: false }));
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(
+      JSON.stringify({
+        type: "viewer_youtube_live_dismiss",
+        stream_id: streamId || undefined,
+      }),
+    );
+  }, []);
 
   const pickTtsVoice = useCallback((id: string) => {
     setTtsSpeakerId(id);
@@ -619,7 +702,11 @@ export function useChatBridge(enabled: boolean) {
     sendPlayRequest,
     sendYouTubeSummary,
     sendYoutubeObserveCheck,
+    sendYoutubeLiveCheck,
     sendSocialShareVideo,
     sendSocialInteractiveLogin,
+    sendYouTubeLiveUrl,
+    dismissYouTubeLivePrompt,
+    youtubeLivePrompt,
   };
 }

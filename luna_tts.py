@@ -2,7 +2,8 @@
 
 Env:
   LUNA_TTS                If 1/true/yes, synthesize after each reply.
-  LUNA_TTS_PLAY           If 1, play the WAV locally.
+  LUNA_TTS_PLAY           If 1, play on the PC speakers (``local`` / ``both`` targets).
+  LUNA_TTS_PLAY_TARGET    ``local`` (default), ``viewer`` (VRM browser / OBS window), or ``both``.
   LUNA_TTS_BACKEND        edge (default) or chatterbox
   LUNA_EDGE_VOICE         Edge voice id; default en-US-JennyNeural
   LUNA_EDGE_RATE          Rate adjustment, e.g. +0% / -10%
@@ -39,6 +40,7 @@ import time
 import wave
 from pathlib import Path
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 _selected_speaker: str | None = None
@@ -56,8 +58,34 @@ def tts_enabled() -> bool:
     return _env_bool("LUNA_TTS")
 
 
+def tts_play_target() -> str:
+    """Where synthesized audio is played: ``local`` | ``viewer`` | ``both``."""
+    raw = (os.environ.get("LUNA_TTS_PLAY_TARGET") or "local").strip().lower()
+    if raw in ("viewer", "browser", "vrm", "obs"):
+        return "viewer"
+    if raw == "both":
+        return "both"
+    return "local"
+
+
+def tts_play_to_viewer() -> bool:
+    return tts_play_target() in ("viewer", "both")
+
+
+def tts_play_locally() -> bool:
+    return _env_bool("LUNA_TTS_PLAY") and tts_play_target() in ("local", "both")
+
+
 def tts_playback_enabled() -> bool:
-    return _env_bool("LUNA_TTS_PLAY")
+    return tts_play_locally()
+
+
+@dataclass(frozen=True)
+class TtsPlaybackBundle:
+    audio: bytes
+    mime: str
+    duration_ms: int
+    visemes: list[dict[str, Any]]
 
 
 def _default_voice() -> str:
@@ -317,9 +345,115 @@ def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
     return text, emotion
 
 
-def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> None:
-    """Synthesize and PLAY a reply locally (used by Twitch / viewer pipelines)."""
+def _visemes_for_timeline(
+    timeline: list[tuple[float, str, float, int]] | None,
+) -> list[dict[str, Any]]:
+    offset = float(os.environ.get("LUNA_TTS_VISEME_OFFSET_SEC", "0.05").strip() or "0.05")
+    out: list[dict[str, Any]] = []
+    for at_sec, vis, amp, hold_ms in sorted(timeline or [], key=lambda x: x[0]):
+        out.append(
+            {
+                "at_ms": max(0, int((at_sec + offset) * 1000)),
+                "vowel": str(vis or "").lower(),
+                "intensity": max(0.0, min(1.0, float(amp))),
+                "hold_ms": max(40, min(400, int(hold_ms))),
+            }
+        )
+    return out
+
+
+def synthesize_playback_bundle(reply_text: str) -> TtsPlaybackBundle | None:
+    """Synthesize reply audio + lip-sync timeline for the VRM viewer (no local playback)."""
     if not tts_enabled():
+        return None
+    text, emotion = _clean_text_for_tts(reply_text)
+    if not text:
+        return None
+    rate, pitch = _prosody_for_emotion(emotion)
+    backend = _backend()
+    with _tts_play_lock:
+        try:
+            if backend == "chatterbox":
+                chunk_chars = int(os.environ.get("LUNA_CHATTERBOX_CHUNK_CHARS", "120").strip() or "120")
+                chunks = _split_tts_chunks(text, chunk_chars)
+                if not chunks:
+                    return None
+                fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_viewer_")
+                os.close(fd)
+                wav_out = Path(tmp)
+                try:
+                    if len(chunks) == 1:
+                        _synthesize_chatterbox_to_wav(chunks[0], wav_out, emotion=emotion)
+                    else:
+                        tmp_parts: list[Path] = []
+                        try:
+                            for i, part in enumerate(chunks):
+                                fd_p, p_tmp = tempfile.mkstemp(
+                                    suffix=".wav", prefix=f"luna_viewer_part_{i}_"
+                                )
+                                os.close(fd_p)
+                                p = Path(p_tmp)
+                                _synthesize_chatterbox_to_wav(part, p, emotion=emotion)
+                                tmp_parts.append(p)
+                            _concat_audio_with_ffmpeg(tmp_parts, wav_out)
+                        finally:
+                            for p in tmp_parts:
+                                try:
+                                    p.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                    cues = _resolve_viseme_timeline(wav_out, [])
+                    audio = wav_out.read_bytes()
+                    dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
+                    return TtsPlaybackBundle(
+                        audio=audio,
+                        mime="audio/wav",
+                        duration_ms=dur_ms,
+                        visemes=_visemes_for_timeline(cues),
+                    )
+                finally:
+                    try:
+                        wav_out.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_viewer_")
+            os.close(fd)
+            mp3_out = Path(tmp)
+            wav_out = mp3_out.with_suffix(".wav")
+            try:
+                cues_edge = _synthesize_edge_to_mp3(
+                    text,
+                    mp3_out,
+                    voice=get_effective_speaker(),
+                    rate=rate,
+                    pitch=pitch,
+                )
+                _mp3_to_wav(mp3_out, wav_out)
+                cues = _resolve_viseme_timeline(wav_out, cues_edge)
+                audio = mp3_out.read_bytes()
+                dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
+                return TtsPlaybackBundle(
+                    audio=audio,
+                    mime="audio/mpeg",
+                    duration_ms=dur_ms,
+                    visemes=_visemes_for_timeline(cues),
+                )
+            finally:
+                try:
+                    mp3_out.unlink(missing_ok=True)
+                    wav_out.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except Exception as exc:
+            print(f"(LUNA_TTS {backend} viewer bundle failed: {exc})", flush=True)
+            return None
+    return None
+
+
+def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> None:
+    """Synthesize and PLAY a reply on local speakers (when ``LUNA_TTS_PLAY_TARGET`` includes ``local``)."""
+    if not tts_enabled() or not tts_play_locally():
         return
     text, emotion = _clean_text_for_tts(reply_text)
     if not text:
@@ -340,13 +474,12 @@ def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> 
                     wav_out = Path(tmp)
                     try:
                         _synthesize_chatterbox_to_wav(part, wav_out, emotion=emotion)
-                        if tts_playback_enabled():
-                            cues = _resolve_viseme_timeline(wav_out, [])
-                            _play_wav(
-                                wav_out,
-                                viseme_events=cues or None,
-                                viseme_cb=viseme_cb,
-                            )
+                        cues = _resolve_viseme_timeline(wav_out, [])
+                        _play_wav(
+                            wav_out,
+                            viseme_events=cues or None,
+                            viseme_cb=viseme_cb,
+                        )
                     finally:
                         try:
                             wav_out.unlink(missing_ok=True)
@@ -367,13 +500,12 @@ def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> 
                     pitch=pitch,
                 )
                 _mp3_to_wav(mp3_out, wav_out)
-                if tts_playback_enabled():
-                    cues = _resolve_viseme_timeline(wav_out, cues_edge)
-                    _play_wav(
-                        wav_out,
-                        viseme_events=cues or None,
-                        viseme_cb=viseme_cb,
-                    )
+                cues = _resolve_viseme_timeline(wav_out, cues_edge)
+                _play_wav(
+                    wav_out,
+                    viseme_events=cues or None,
+                    viseme_cb=viseme_cb,
+                )
             finally:
                 try:
                     mp3_out.unlink(missing_ok=True)

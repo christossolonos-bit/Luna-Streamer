@@ -1,4 +1,4 @@
-"""Detect YouTube / Twitch go-live and post to X + Facebook (same Playwright flow as uploads)."""
+"""Detect YouTube / Twitch go-live; announce on Discord + post to X / Facebook."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
 
 from youtube_audio import extract_video_id
 from youtube_feed import (
@@ -21,6 +20,7 @@ from youtube_live_chat import youtube_live_video_id
 
 SocialShareSend = Callable[[str, str], Awaitable[None]]
 BroadcastStatus = Callable[[str], Awaitable[None]]
+DiscordLiveSend = Callable[[str], Awaitable[None]]
 
 
 def _env_truthy(key: str, *, default: bool = False) -> bool:
@@ -34,6 +34,30 @@ def live_social_share_enabled() -> bool:
     from social_playwright_share import social_playwright_configured
 
     return social_playwright_configured() and _env_truthy("LUNA_SOCIAL_LIVE_SHARE", default=False)
+
+
+def twitch_live_announce_enabled() -> bool:
+    return _env_truthy("LUNA_TWITCH_LIVE_ANNOUNCE", default=False)
+
+
+def twitch_live_discord_enabled() -> bool:
+    if not twitch_live_announce_enabled():
+        return False
+    return _env_truthy("LUNA_TWITCH_LIVE_DISCORD", default=True)
+
+
+def twitch_live_social_enabled() -> bool:
+    if not twitch_live_announce_enabled():
+        return False
+    if not _env_truthy("LUNA_TWITCH_LIVE_SOCIAL", default=True):
+        return False
+    from social_playwright_share import social_playwright_configured
+
+    return social_playwright_configured()
+
+
+def live_watch_enabled() -> bool:
+    return live_social_share_enabled() or twitch_live_announce_enabled()
 
 
 def live_social_poll_sec() -> float:
@@ -123,6 +147,26 @@ def youtube_live_probe_targets() -> list[str]:
     return out
 
 
+def probe_youtube_live(url: str) -> dict[str, str] | None:
+    return _probe_youtube_live_sync(url)
+
+
+class _YDLQuietLogger:
+    """Swallow yt-dlp stderr noise when probing offline channels."""
+
+    def debug(self, msg: str) -> None:  # noqa: ARG002
+        pass
+
+    def info(self, msg: str) -> None:  # noqa: ARG002
+        pass
+
+    def warning(self, msg: str) -> None:  # noqa: ARG002
+        pass
+
+    def error(self, msg: str) -> None:  # noqa: ARG002
+        pass
+
+
 def _probe_youtube_live_sync(url: str) -> dict[str, str] | None:
     try:
         import yt_dlp
@@ -131,6 +175,7 @@ def _probe_youtube_live_sync(url: str) -> dict[str, str] | None:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "logger": _YDLQuietLogger(),
         "skip_download": True,
         "noplaylist": True,
         "ignoreerrors": True,
@@ -159,7 +204,7 @@ async def probe_twitch_live(bot: object, login: str) -> dict[str, str] | None:
     if not login:
         return None
     try:
-        streams = await bot.fetch_streams(user_login=[login])  # type: ignore[union-attr]
+        streams = await bot.fetch_streams(user_logins=[login])  # type: ignore[union-attr]
     except Exception as exc:
         print(f"(live social) Twitch stream check failed: {exc}", flush=True)
         return None
@@ -186,11 +231,30 @@ def _live_post_title(platform: str, title: str) -> str:
     return title
 
 
+def format_twitch_live_discord_message(title: str, url: str) -> str:
+    tmpl = (
+        os.environ.get("LUNA_TWITCH_LIVE_DISCORD_MESSAGE")
+        or "🔴 **Live now on Twitch!**\n{title}\n\nJoin here: {url}"
+    ).strip()
+    return tmpl.replace("{title}", title).replace("{url}", url)
+
+
+def _should_social_share(platform: str) -> bool:
+    if platform == "twitch":
+        return live_social_share_enabled() or twitch_live_social_enabled()
+    return live_social_share_enabled()
+
+
+def _should_discord_announce(platform: str) -> bool:
+    return platform == "twitch" and twitch_live_discord_enabled()
+
+
 async def _announce_live(
     item: dict[str, str],
     *,
     state: dict[str, Any],
     social_share_send: SocialShareSend | None,
+    discord_live_send: DiscordLiveSend | None,
     broadcast_status: BroadcastStatus | None,
 ) -> None:
     platform = item.get("platform") or "live"
@@ -208,11 +272,21 @@ async def _announce_live(
 
     post_title = _live_post_title(platform, title)
     line = f"Going live on {platform}: {title} — {url}"
-    print(f"(live social) {line}", flush=True)
+    print(f"(live announce) {line}", flush=True)
     if broadcast_status:
         await broadcast_status(line)
-    if social_share_send is not None:
-        await social_share_send(post_title, url)
+
+    if _should_discord_announce(platform) and discord_live_send is not None:
+        try:
+            await discord_live_send(format_twitch_live_discord_message(title, url))
+        except Exception as exc:
+            print(f"(live announce) Discord failed: {exc}", flush=True)
+
+    if _should_social_share(platform) and social_share_send is not None:
+        try:
+            await social_share_send(post_title, url)
+        except Exception as exc:
+            print(f"(live announce) social share failed: {exc}", flush=True)
 
     ids.append(sid)
     announced[key] = ids[-40:]
@@ -223,21 +297,25 @@ async def _announce_live(
 async def run_live_social_poller(
     *,
     social_share_send: SocialShareSend | None,
+    discord_live_send: DiscordLiveSend | None = None,
     broadcast_status: BroadcastStatus | None,
     twitch_bot: object | None = None,
     twitch_login: str = "",
 ) -> None:
-    """Poll YouTube / Twitch; on new live session, trigger X + Facebook share once per broadcast id."""
-    if not live_social_share_enabled():
+    """Poll YouTube / Twitch; on new live session announce Discord + X/Facebook once per id."""
+    if not live_watch_enabled():
         return
 
     interval = live_social_poll_sec()
-    yt_targets = youtube_live_probe_targets()
+    yt_targets = youtube_live_probe_targets() if live_social_share_enabled() else []
     twitch_login = (twitch_login or os.environ.get("TWITCH_CHANNEL") or "").strip().lower().lstrip("#")
+    watch_twitch = bool(twitch_login) and (
+        twitch_live_announce_enabled() or live_social_share_enabled()
+    )
 
-    if not yt_targets and not twitch_login:
-        msg = "Live social: set LUNA_YOUTUBE_OBSERVE_CHANNELS, LUNA_YOUTUBE_LIVE_URL, or TWITCH_CHANNEL."
-        print(f"(live social) {msg}", flush=True)
+    if not yt_targets and not watch_twitch:
+        msg = "Live announce: set TWITCH_CHANNEL and/or LUNA_YOUTUBE_OBSERVE_CHANNELS."
+        print(f"(live announce) {msg}", flush=True)
         if broadcast_status:
             await broadcast_status(msg)
         return
@@ -246,10 +324,18 @@ async def run_live_social_poller(
     parts = []
     if yt_targets:
         parts.append(f"{len(yt_targets)} YouTube target(s)")
-    if twitch_login:
+    if watch_twitch:
         parts.append(f"Twitch #{twitch_login}")
-    hello = f"Live social: watching {' + '.join(parts)} every {int(interval)}s (X/Facebook when live)."
-    print(f"(live social) {hello}", flush=True)
+    actions = []
+    if twitch_live_discord_enabled():
+        actions.append("Discord (all servers)")
+    if live_social_share_enabled() or twitch_live_social_enabled():
+        actions.append("X/Facebook")
+    action_txt = " + ".join(actions) if actions else "status only"
+    hello = (
+        f"Live announce: watching {' + '.join(parts)} every {int(interval)}s ({action_txt})."
+    )
+    print(f"(live announce) {hello}", flush=True)
     if broadcast_status:
         await broadcast_status(hello)
 
@@ -262,21 +348,23 @@ async def run_live_social_poller(
                         item,
                         state=state,
                         social_share_send=social_share_send,
+                        discord_live_send=discord_live_send,
                         broadcast_status=broadcast_status,
                     )
 
-            if twitch_bot is not None and twitch_login:
+            if twitch_bot is not None and watch_twitch:
                 t_item = await probe_twitch_live(twitch_bot, twitch_login)
                 if t_item:
                     await _announce_live(
                         t_item,
                         state=state,
                         social_share_send=social_share_send,
+                        discord_live_send=discord_live_send,
                         broadcast_status=broadcast_status,
                     )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"(live social) poll error: {exc}", flush=True)
+            print(f"(live announce) poll error: {exc}", flush=True)
 
         await asyncio.sleep(interval)
