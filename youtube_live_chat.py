@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from youtube_audio import extract_video_id
 
@@ -167,10 +167,31 @@ async def run_youtube_live_chat_listener(
 
     seen: set[str] = set()
 
-    def _open() -> Any:
-        return pytchat.create(video_id=video_id)
+    # pytchat registers signal.SIGINT in __init__ — that only works on the main thread,
+    # so we must not use asyncio.to_thread() for create() (worker thread → crash, no chat).
+    try:
+        chat = pytchat.create(video_id=video_id)
+    except Exception as exc:
+        print(f"(youtube live) pytchat.create failed: {exc}", flush=True)
+        if broadcast_status:
+            await broadcast_status(f"YouTube Live chat: could not start pytchat ({exc}).")
+        return
 
-    chat = await asyncio.to_thread(_open)
+    def _pull_sync() -> list[tuple[str, str, str]]:
+        out: list[tuple[str, str, str]] = []
+        data = chat.get()
+        if data is None:
+            return out
+        for m in data.sync_items():
+            mid = str(getattr(m, "id", "") or "").strip()
+            if not mid:
+                author_id = getattr(getattr(m, "author", None), "channelId", "") or ""
+                mid = f"{author_id}:{getattr(m, 'datetime', '')}:{m.message}"
+            author = (getattr(getattr(m, "author", None), "name", None) or "viewer").strip()
+            text = (m.message or "").strip()
+            out.append((mid, author, text))
+        return out
+
     try:
         while True:
             if not chat.is_alive():
@@ -179,23 +200,8 @@ async def run_youtube_live_chat_listener(
                     await broadcast_status("YouTube Live chat: stream ended or chat closed.")
                 break
 
-            def _pull() -> list[tuple[str, str, str]]:
-                out: list[tuple[str, str, str]] = []
-                data = chat.get()
-                if data is None:
-                    return out
-                for m in data.sync_items():
-                    mid = str(getattr(m, "id", "") or "").strip()
-                    if not mid:
-                        author_id = getattr(getattr(m, "author", None), "channelId", "") or ""
-                        mid = f"{author_id}:{getattr(m, 'datetime', '')}:{m.message}"
-                    author = (getattr(getattr(m, "author", None), "name", None) or "viewer").strip()
-                    text = (m.message or "").strip()
-                    out.append((mid, author, text))
-                return out
-
             try:
-                batch = await asyncio.to_thread(_pull)
+                batch = _pull_sync()
             except Exception as exc:
                 print(f"(youtube live) poll error: {exc}", flush=True)
                 await asyncio.sleep(poll)
