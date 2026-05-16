@@ -13,6 +13,7 @@ import { CaptionsOverlay } from "./CaptionsOverlay";
 import { FloatingDock, type DockOverlay } from "./FloatingDock";
 import { SettingsOverlay } from "./SettingsOverlay";
 import { YouTubeLivePromptOverlay } from "./YouTubeLivePromptOverlay";
+import { getCohostSoloMode, readCohostSoloModeStored } from "./cohostScenePrefs";
 import { CloseIcon } from "./icons";
 import { useMicSession } from "./useMicSession";
 import { VrmRuntime, type ChromaKeyMode } from "./vrmRuntime";
@@ -20,11 +21,12 @@ import { wsUrl } from "./useChatBridge";
 
 const CHROMA_STORAGE_KEY = "luna.chromaKey.v1";
 const CAPTIONS_STORAGE_KEY = "luna.captions.v1";
+const COHOST_FULL_CONVERSATION_KEY = "luna.cohostFullConversation.v1";
 
 function readStoredChromaKey(): ChromaKeyMode {
   try {
     const v = window.localStorage.getItem(CHROMA_STORAGE_KEY);
-    if (v === "green" || v === "blue" || v === "off") return v;
+    if (v === "green" || v === "blue" || v === "off" || v === "transparent") return v;
   } catch {
     /* ignore */
   }
@@ -42,6 +44,15 @@ function readStoredCaptionsEnabled(): boolean {
   return true;
 }
 
+function readStoredCohostFullConversation(): boolean {
+  try {
+    return window.localStorage.getItem(COHOST_FULL_CONVERSATION_KEY) === "1";
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
 export default function App() {
   return (
     <ChatBridgeProvider>
@@ -53,6 +64,9 @@ export default function App() {
 function AppInner() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const runtimeRef = useRef<VrmRuntime | null>(null);
+  const cohostVrmUrlRef = useRef("");
+  const cohostIdleUrlsRef = useRef<string[]>([]);
+  const cohostNameRef = useRef("Co-host");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -63,7 +77,12 @@ function AppInner() {
     sendYoutubeObserveCheck,
     sendYoutubeLiveCheck,
     sendSocialShareVideo,
+    sendYouTubeSummary,
+    addStatusLine,
     youtubeLivePrompt,
+    sendCohostBanterNow,
+    sendCohostIdleFullScriptPreference,
+    sendViewerCohostScene,
   } = useBridge();
   const mic = useMicSession();
 
@@ -86,6 +105,13 @@ function AppInner() {
   const [chromaKey, setChromaKeyState] = useState<ChromaKeyMode>(() =>
     readStoredChromaKey(),
   );
+  const [cohostAvailable, setCohostAvailable] = useState(false);
+  const [cohostInScene, setCohostInScene] = useState(() => !readCohostSoloModeStored());
+  const [cohostBusy, setCohostBusy] = useState(false);
+  const [cohostDisplayName, setCohostDisplayName] = useState("Co-host");
+  const [cohostFullConversation, setCohostFullConversation] = useState(() =>
+    readStoredCohostFullConversation(),
+  );
 
   const setChromaKey = useCallback((mode: ChromaKeyMode) => {
     setChromaKeyState(mode);
@@ -105,6 +131,21 @@ function AppInner() {
     if (u) void sendSocialShareVideo(u);
   }, [sendSocialShareVideo]);
 
+  const onYoutubeCommentClick = useCallback(() => {
+    const raw = window.prompt(
+      "Paste a YouTube video URL — Luna reacts on stream (viewer + TTS) and posts a public comment when LUNA_SOCIAL_YOUTUBE_STORAGE_STATE is set.",
+    );
+    const u = raw?.trim();
+    if (!u) return;
+    void sendYouTubeSummary(u).then((ok) => {
+      if (ok) {
+        addStatusLine("Luna is reviewing that video (and may post a YouTube comment)…");
+      } else {
+        setLastError("YouTube comment failed: chat bridge not connected (wait for ● live).");
+      }
+    });
+  }, [sendYouTubeSummary, addStatusLine]);
+
   useEffect(() => {
     try {
       window.localStorage.setItem(CAPTIONS_STORAGE_KEY, captionsEnabled ? "1" : "0");
@@ -114,7 +155,33 @@ function AppInner() {
   }, [captionsEnabled]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        COHOST_FULL_CONVERSATION_KEY,
+        cohostFullConversation ? "1" : "0",
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [cohostFullConversation]);
+
+  useEffect(() => {
+    if (conn !== "open") return;
+    void sendCohostIdleFullScriptPreference(cohostFullConversation);
+  }, [conn, cohostFullConversation, sendCohostIdleFullScriptPreference]);
+
+  useEffect(() => {
     runtimeRef.current?.setChromaKeyMode(chromaKey);
+  }, [chromaKey]);
+
+  useEffect(() => {
+    const on = chromaKey !== "off";
+    document.documentElement.classList.toggle("luna-capture", on);
+    document.body.classList.toggle("luna-capture", on);
+    return () => {
+      document.documentElement.classList.remove("luna-capture");
+      document.body.classList.remove("luna-capture");
+    };
   }, [chromaKey]);
 
   // Screen-share preview hookup.
@@ -143,8 +210,18 @@ function AppInner() {
     const intervalMsRaw = import.meta.env.VITE_SCREEN_CONTEXT_INTERVAL_MS;
     const intervalMs =
       typeof intervalMsRaw === "string" && intervalMsRaw.trim()
-        ? Math.max(3000, Number(intervalMsRaw) || 15000)
-        : 15000;
+        ? Math.max(500, Number(intervalMsRaw) || 1000)
+        : 1000;
+    const maxWRaw = import.meta.env.VITE_SCREEN_CAPTURE_MAX_WIDTH;
+    const maxW =
+      typeof maxWRaw === "string" && maxWRaw.trim()
+        ? Math.max(480, Math.min(1920, Number(maxWRaw) || 1280))
+        : 1280;
+    const qualityRaw = import.meta.env.VITE_SCREEN_CAPTURE_JPEG_QUALITY;
+    const jpegQuality =
+      typeof qualityRaw === "string" && qualityRaw.trim()
+        ? Math.max(0.45, Math.min(0.92, Number(qualityRaw) || 0.72))
+        : 0.72;
 
     let ws: WebSocket | null = null;
     let closed = false;
@@ -189,7 +266,6 @@ function AppInner() {
       const h = v.videoHeight;
       if (w < 2 || h < 2) return;
 
-      const maxW = 960;
       const scale = Math.min(1, maxW / w);
       const tw = Math.max(2, Math.round(w * scale));
       const th = Math.max(2, Math.round(h * scale));
@@ -200,7 +276,7 @@ function AppInner() {
       const ctx = c.getContext("2d");
       if (!ctx) return;
       ctx.drawImage(v, 0, 0, tw, th);
-      const jpeg = c.toDataURL("image/jpeg", 0.68);
+      const jpeg = c.toDataURL("image/jpeg", jpegQuality);
       const comma = jpeg.indexOf(",");
       const b64 = comma >= 0 ? jpeg.slice(comma + 1) : "";
       if (!b64) return;
@@ -306,7 +382,59 @@ function AppInner() {
 
     const params = new URLSearchParams(window.location.search);
     const vrmParam = params.get("vrm");
+    const cohostVrmParam = params.get("cohost_vrm")?.trim() || "";
+    const cohostNameParam = params.get("cohost_name")?.trim() || "Co-host";
     const idleUrls = params.getAll("idle").filter((v) => v.trim().length > 0);
+    cohostIdleUrlsRef.current = params.getAll("cohost_idle").filter((v) => v.trim().length > 0);
+    const cohostSkipParam = params.get("cohost_idle_skip_sec");
+    if (cohostSkipParam != null && cohostSkipParam.trim() !== "") {
+      const skipSec = parseFloat(cohostSkipParam);
+      if (Number.isFinite(skipSec) && skipSec >= 0) {
+        runtime.setCohostIdleSkipSec(skipSec);
+      }
+    }
+
+    if (cohostVrmParam) {
+      cohostVrmUrlRef.current = cohostVrmParam;
+      cohostNameRef.current = cohostNameParam;
+      setCohostAvailable(true);
+      setCohostDisplayName(cohostNameParam);
+    }
+
+    const onCohostAvatar = (ev: Event) => {
+      const ce = ev as CustomEvent<{
+        dualLayout?: boolean;
+        vrmUrl?: string;
+        activeSpeaker?: "luna" | "cohost";
+      }>;
+      const rt = runtimeRef.current;
+      if (!rt) return;
+      if (ce.detail?.dualLayout) {
+        if (rt.isCohostSoloMode()) {
+          return;
+        }
+        const url = ce.detail.vrmUrl?.trim() || cohostVrmUrlRef.current;
+        if (url) cohostVrmUrlRef.current = url;
+        void rt.enableDualCohostLayout(url).then(async () => {
+          setCohostInScene(rt.isCohostInScene());
+          if (cohostIdleUrlsRef.current.length > 0) {
+            await rt.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
+          }
+        });
+      }
+      if (ce.detail?.activeSpeaker) {
+        if (rt.isCohostSoloMode() && ce.detail.activeSpeaker === "cohost") {
+          return;
+        }
+        rt.setActiveSpeaker(ce.detail.activeSpeaker);
+      }
+    };
+    window.addEventListener("luna-cohost-avatar", onCohostAvatar);
+
+    if (readCohostSoloModeStored()) {
+      setCohostInScene(false);
+    }
+
     if (vrmParam) {
       setLoadPct(0);
       setLastError(null);
@@ -317,6 +445,10 @@ function AppInner() {
           setLoadPct(100);
           if (idleUrls.length > 0) {
             await runtime.setIdleMotionUrls(idleUrls);
+          }
+          if (getCohostSoloMode()) {
+            runtime.dismissCohost();
+            setCohostInScene(false);
           }
         })
         .catch((err: unknown) => {
@@ -333,6 +465,7 @@ function AppInner() {
     ro.observe(canvas.parentElement!);
 
     return () => {
+      window.removeEventListener("luna-cohost-avatar", onCohostAvatar);
       ro.disconnect();
       window.removeEventListener("resize", onResize);
       runtime.dispose();
@@ -425,6 +558,39 @@ function AppInner() {
     setActiveOverlay((current) => (current === id ? null : id));
   }, []);
 
+  const toggleCohost = useCallback(() => {
+    const rt = runtimeRef.current;
+    if (!rt || cohostBusy) return;
+    if (rt.isCohostInScene()) {
+      rt.dismissCohost();
+      setCohostInScene(false);
+      void sendViewerCohostScene(false);
+      return;
+    }
+    const url = cohostVrmUrlRef.current;
+    if (!url) {
+      setLastError("No co-host VRM URL — set LUNA_COHOST_VRM in .env and restart main.py");
+      return;
+    }
+    setCohostBusy(true);
+    setLastError(null);
+    const label = url.split("/").pop() || "cohost.vrm";
+    void rt
+      .summonCohost(url, label)
+      .then(async () => {
+        setCohostInScene(true);
+        void sendViewerCohostScene(true);
+        if (cohostIdleUrlsRef.current.length > 0) {
+          await rt.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        setLastError(msg);
+      })
+      .finally(() => setCohostBusy(false));
+  }, [cohostBusy, sendViewerCohostScene]);
+
   const connLabel =
     conn === "open" ? "● live" : conn === "connecting" ? "◌ connecting…" : "○ offline";
 
@@ -515,7 +681,10 @@ function AppInner() {
               <div className="progress-bar" style={{ width: `${loadPct}%` }} />
             </div>
             {lastError && <p className="settings-hint settings-hint--err">{lastError}</p>}
-            <p className="settings-hint">Orbit: drag · zoom: scroll · pan: right-drag</p>
+            <p className="settings-hint">
+              Left-drag on avatar: camera up/down around them · Right-drag on avatar: move · Right-drag empty:
+              pan · Scroll: zoom
+            </p>
           </div>
         </div>
       )}
@@ -603,6 +772,17 @@ function AppInner() {
         onYoutubeLiveCheck={() => void sendYoutubeLiveCheck()}
         socialShareDisabled={conn !== "open"}
         onSocialShareVideo={onSocialShareVideoClick}
+        ytCommentDisabled={conn !== "open"}
+        onYoutubeComment={onYoutubeCommentClick}
+        cohostAvailable={cohostAvailable}
+        cohostInScene={cohostInScene}
+        cohostName={cohostDisplayName}
+        cohostBusy={cohostBusy}
+        onToggleCohost={toggleCohost}
+        banterWsDisabled={conn !== "open"}
+        cohostFullConversation={cohostFullConversation}
+        onCohostFullConversationChange={setCohostFullConversation}
+        onCohostBanterNow={(full) => void sendCohostBanterNow(full)}
       />
     </div>
   );

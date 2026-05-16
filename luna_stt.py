@@ -159,6 +159,19 @@ def _transcribe_wav_path(wav_path: Path) -> str:
     return " ".join(parts).strip()
 
 
+def transcribe_wav_file(wav_path: Path) -> tuple[str, str]:
+    """Transcribe a 16 kHz mono WAV on disk (no viewer speaker gate)."""
+    if not wav_path.is_file() or wav_path.stat().st_size < 256:
+        return "", "failed: audio file missing or too small"
+    try:
+        text = _transcribe_wav_path(wav_path)
+        if not text:
+            return "", "failed: no speech detected"
+        return text, "faster-whisper"
+    except Exception as exc:
+        return "", f"failed: {exc}"
+
+
 def transcribe_audio(audio: bytes, mime: str = "") -> tuple[str, str]:
     """Return (transcript, note). note is ``faster-whisper`` or ``failed: …``."""
     if not audio or len(audio) < 64:

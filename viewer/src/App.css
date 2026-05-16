@@ -5,10 +5,18 @@
   color: #c8eef5;
 }
 
-/* Cleaner capture for chroma key — hide film overlays on the 3D view */
+/* OBS capture — hide film overlays; page/canvas area transparent when keyed */
+.app--chroma {
+  background: transparent;
+}
+
 .app--chroma .scanlines,
 .app--chroma .vignette {
   display: none;
+}
+
+.app--chroma .canvas-wrap {
+  background: transparent;
 }
 
 .canvas-wrap {
@@ -205,6 +213,7 @@
   bottom: 1.25rem;
   transform: translateX(-50%);
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 0.4rem;
   padding: 0.45rem 0.6rem;
@@ -248,6 +257,113 @@
 }
 
 .dock-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.dock-btn--cohost.dock-btn--active {
+  color: #c9a0ff;
+  border-color: rgba(160, 100, 255, 0.65);
+  background: rgba(120, 60, 200, 0.18);
+  box-shadow:
+    0 0 18px rgba(140, 80, 255, 0.45),
+    inset 0 0 10px rgba(140, 80, 255, 0.12);
+}
+
+.dock-btn--yt-comment:hover:not(:disabled) {
+  color: #ff6b6b;
+  border-color: rgba(255, 80, 80, 0.55);
+  background: rgba(255, 60, 60, 0.1);
+}
+
+.dock-btn--cohost-opts.dock-btn--active,
+.dock-cohost-cluster--open .dock-btn--cohost-opts {
+  color: #c9a0ff;
+  border-color: rgba(160, 100, 255, 0.55);
+}
+
+.dock-cohost-cluster {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.dock-cohost-cluster-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.dock-cohost-panel {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max(260px, 18vw);
+  max-width: min(340px, 92vw);
+  padding: 0.65rem 0.85rem;
+  background: rgba(4, 8, 16, 0.94);
+  border: 1px solid rgba(160, 100, 255, 0.35);
+  border-radius: 12px;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.55),
+    0 0 20px rgba(120, 60, 200, 0.15);
+  backdrop-filter: blur(12px);
+  z-index: 12;
+}
+
+.dock-cohost-panel-title {
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #cfa8ff;
+  margin-bottom: 0.5rem;
+}
+
+.dock-cohost-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-size: 0.75rem;
+  line-height: 1.35;
+  color: #b8dae8;
+  margin-bottom: 0.45rem;
+  cursor: pointer;
+}
+
+.dock-cohost-check input {
+  margin-top: 0.12rem;
+  accent-color: #b080ff;
+  flex-shrink: 0;
+}
+
+.dock-cohost-run {
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 10px;
+  border: 1px solid rgba(160, 100, 255, 0.45);
+  background: rgba(100, 50, 180, 0.22);
+  color: #ecd9ff;
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.dock-cohost-run:hover:not(:disabled) {
+  border-color: rgba(200, 140, 255, 0.75);
+  background: rgba(120, 70, 200, 0.34);
+}
+
+.dock-cohost-run:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }

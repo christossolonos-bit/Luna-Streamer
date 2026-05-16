@@ -362,7 +362,11 @@ def _visemes_for_timeline(
     return out
 
 
-def synthesize_playback_bundle(reply_text: str) -> TtsPlaybackBundle | None:
+def synthesize_playback_bundle(
+    reply_text: str,
+    *,
+    voice: str | None = None,
+) -> TtsPlaybackBundle | None:
     """Synthesize reply audio + lip-sync timeline for the VRM viewer (no local playback)."""
     if not tts_enabled():
         return None
@@ -370,6 +374,7 @@ def synthesize_playback_bundle(reply_text: str) -> TtsPlaybackBundle | None:
     if not text:
         return None
     rate, pitch = _prosody_for_emotion(emotion)
+    edge_voice = (voice or "").strip() or get_effective_speaker()
     backend = _backend()
     with _tts_play_lock:
         try:
@@ -425,7 +430,7 @@ def synthesize_playback_bundle(reply_text: str) -> TtsPlaybackBundle | None:
                 cues_edge = _synthesize_edge_to_mp3(
                     text,
                     mp3_out,
-                    voice=get_effective_speaker(),
+                    voice=edge_voice,
                     rate=rate,
                     pitch=pitch,
                 )
@@ -433,11 +438,12 @@ def synthesize_playback_bundle(reply_text: str) -> TtsPlaybackBundle | None:
                 cues = _resolve_viseme_timeline(wav_out, cues_edge)
                 audio = mp3_out.read_bytes()
                 dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
+                visemes = _visemes_for_timeline(cues)
                 return TtsPlaybackBundle(
                     audio=audio,
                     mime="audio/mpeg",
                     duration_ms=dur_ms,
-                    visemes=_visemes_for_timeline(cues),
+                    visemes=visemes,
                 )
             finally:
                 try:
@@ -451,7 +457,12 @@ def synthesize_playback_bundle(reply_text: str) -> TtsPlaybackBundle | None:
     return None
 
 
-def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> None:
+def maybe_speak(
+    reply_text: str,
+    *,
+    viseme_cb: VisemeCallback | None = None,
+    voice: str | None = None,
+) -> None:
     """Synthesize and PLAY a reply on local speakers (when ``LUNA_TTS_PLAY_TARGET`` includes ``local``)."""
     if not tts_enabled() or not tts_play_locally():
         return
@@ -492,10 +503,11 @@ def maybe_speak(reply_text: str, *, viseme_cb: VisemeCallback | None = None) -> 
             mp3_out = Path(tmp)
             wav_out = mp3_out.with_suffix(".wav")
             try:
+                edge_voice = (voice or "").strip() or get_effective_speaker()
                 cues_edge = _synthesize_edge_to_mp3(
                     text,
                     mp3_out,
-                    voice=get_effective_speaker(),
+                    voice=edge_voice,
                     rate=rate,
                     pitch=pitch,
                 )

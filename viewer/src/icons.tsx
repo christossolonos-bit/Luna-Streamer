@@ -45,6 +45,17 @@ export function YoutubeLiveCheckIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+/** Play + chat bubble — Luna comments on a YouTube video you paste. */
+export function YoutubeCommentIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <rect x="2" y="7" width="13" height="10" rx="2" />
+      <polygon points="7 10 7 14 11 12" fill="currentColor" stroke="none" />
+      <path d="M14 5c3.3 0 6 2.7 6 6s-2.7 6-6 6h-4l-3 3v-3h-1c-3.3 0-6-2.7-6-6s2.7-6 6-6h4" />
+    </svg>
+  );
+}
+
 /** Share / broadcast (manual social post for a YouTube URL). */
 export function ShareVideoIcon(props: SVGProps<SVGSVGElement>) {
   return (
@@ -75,6 +86,16 @@ export function SocialXLoginIcon(props: SVGProps<SVGSVGElement>) {
     <svg {...base} {...props}>
       <line x1="5" y1="5" x2="19" y2="19" strokeWidth={2.4} />
       <line x1="19" y1="5" x2="5" y2="19" strokeWidth={2.4} />
+    </svg>
+  );
+}
+
+/** YouTube — open Chrome to save session for posting video comments. */
+export function SocialYoutubeLoginIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <rect x="2" y="6" width="14" height="10" rx="2" />
+      <polygon points="7 9 7 13 11 11" fill="currentColor" stroke="none" />
     </svg>
   );
 }
@@ -112,6 +133,27 @@ export function MicIcon(props: SVGProps<SVGSVGElement>) {
       <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
       <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
       <line x1="12" x2="12" y1="19" y2="22" />
+    </svg>
+  );
+}
+
+/** Dual figures — summon / dismiss co-host (e.g. Viktor). */
+export function CohostSummonIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="9" cy="8" r="2.5" />
+      <path d="M5 19v-1.5a4 4 0 0 1 8 0V19" />
+      <circle cx="16" cy="8" r="2.5" />
+      <path d="M12 19v-1.5a4 4 0 0 1 8 0V19" />
+    </svg>
+  );
+}
+
+/** Small chevron — co-host dock opens a panel upward. */
+export function CohostOptionsIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} width={14} height={14} {...props}>
+      <polyline points="18 15 12 9 6 15" />
     </svg>
   );
 }

@@ -10,6 +10,7 @@ Setup (one-time per site):
   # Prefer the Luna helper (same stealth settings as posting):
   python scripts/social_playwright_login.py https://x.com D:/path/x_storage.json
   python scripts/social_playwright_login.py https://www.facebook.com D:/path/fb_storage.json
+  python scripts/social_playwright_login.py https://www.youtube.com D:/path/luna_youtube.json
   # Or from the viewer: Settings → Social login sends viewer_social_interactive_login (headed Chrome on the PC running Luna).
   # Optional: LUNA_SOCIAL_X_LOGIN_START_URL / LUNA_SOCIAL_FACEBOOK_LOGIN_START_URL open your profile pages instead of default login URLs.
 
@@ -17,6 +18,12 @@ Env:
   LUNA_SOCIAL_PLAYWRIGHT=1                 Enable automatic share on new observe uploads and manual viewer shares.
   LUNA_SOCIAL_X_STORAGE_STATE=path         JSON from the login helper above.
   LUNA_SOCIAL_FACEBOOK_STORAGE_STATE=path  Same for facebook.com (logged-in session).
+  LUNA_SOCIAL_YOUTUBE_STORAGE_STATE=path   Saved Chrome session for Luna's YouTube account (comment on videos).
+  LUNA_SOCIAL_YOUTUBE_COMMENT=1            Post to YouTube's comment box when storage is set (set 0 to disable).
+  LUNA_SOCIAL_YOUTUBE_LOGIN_START_URL=...  Key-icon login first page (default https://www.youtube.com).
+  LUNA_SOCIAL_YOUTUBE_COMMENT_PROMPT=...   Optional LLM user prompt; {title} {url} {transcript}.
+  LUNA_SOCIAL_YOUTUBE_COMMENT_NUM_PREDICT=80
+  LUNA_SOCIAL_YOUTUBE_COMMENT_MAX_CHARS=900
   LUNA_SOCIAL_PLAYWRIGHT_HEADLESS=1        Default 1; set 0 to watch the browser (debug).
   LUNA_SOCIAL_PLAYWRIGHT_SHOW_BROWSER=1    If set, always show Chrome for auto/manual share (overrides HEADLESS).
   LUNA_SOCIAL_PLAYWRIGHT_VISIBLE=1         Same as SHOW_BROWSER (alias).
@@ -222,7 +229,392 @@ def interactive_login_start_url(site: str) -> str:
     if s == "facebook":
         raw = (os.environ.get("LUNA_SOCIAL_FACEBOOK_LOGIN_START_URL") or "").strip()
         return raw or "https://www.facebook.com/login/"
+    if s in ("youtube", "yt"):
+        raw = (os.environ.get("LUNA_SOCIAL_YOUTUBE_LOGIN_START_URL") or "").strip()
+        return raw or "https://www.youtube.com"
     return "https://x.com/i/flow/login"
+
+
+def default_youtube_storage_path() -> Path:
+    """Default session JSON next to other Luna data (Settings → YouTube login)."""
+    return (Path(__file__).resolve().parent / "data" / "luna_youtube.json").resolve()
+
+
+def youtube_comment_storage_path(*, warn: bool = False) -> Path | None:
+    raw = (os.environ.get("LUNA_SOCIAL_YOUTUBE_STORAGE_STATE") or "").strip()
+    if raw:
+        p = Path(raw).expanduser()
+        if p.is_file():
+            return p
+        if warn:
+            print(
+                f"(social playwright) missing YouTube storage file (LUNA_SOCIAL_YOUTUBE_STORAGE_STATE): {p}",
+                flush=True,
+            )
+        return None
+    default = default_youtube_storage_path()
+    if default.is_file():
+        return default
+    return None
+
+
+def youtube_comment_posting_requested() -> bool:
+    raw = (os.environ.get("LUNA_SOCIAL_YOUTUBE_COMMENT") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def youtube_comment_posting_enabled() -> bool:
+    """True when a saved YouTube session exists and posting is not disabled."""
+    if not youtube_comment_posting_requested():
+        return False
+    return youtube_comment_storage_path(warn=False) is not None
+
+
+def youtube_comment_setup_hint() -> str:
+    default = default_youtube_storage_path()
+    env_hint = (
+        os.environ.get("LUNA_SOCIAL_YOUTUBE_STORAGE_STATE") or str(default)
+    ).strip()
+    return (
+        "YouTube comment needs a saved login. Set "
+        f"LUNA_SOCIAL_YOUTUBE_STORAGE_STATE={env_hint} in .env, restart Luna, then "
+        "Settings → YouTube login (sign in, close tab when chat says saved). "
+        "Or: python scripts/social_playwright_login.py https://www.youtube.com "
+        f'"{env_hint}"'
+    )
+
+
+def clamp_youtube_public_comment(text: str) -> str:
+    t = (text or "").strip()
+    max_len = _yt_comment_max_chars()
+    if len(t) > max_len:
+        t = t[: max_len - 1].rstrip() + "…"
+    return t
+
+
+def _yt_comment_max_chars() -> int:
+    raw = (os.environ.get("LUNA_SOCIAL_YOUTUBE_COMMENT_MAX_CHARS") or "900").strip() or "900"
+    try:
+        return max(80, min(int(raw), 9500))
+    except ValueError:
+        return 900
+
+
+def _yt_llm_comment_user_prompt(
+    title: str, video_url: str, transcript: str, *, context_source: str = ""
+) -> str:
+    custom = (os.environ.get("LUNA_SOCIAL_YOUTUBE_COMMENT_PROMPT") or "").strip()
+    title_clean = (title or "").strip() or "this video"
+    src = (context_source or "video context").strip()
+    if custom:
+        return (
+            custom.replace("{title}", title_clean)
+            .replace("{url}", (video_url or "").strip())
+            .replace("{transcript}", (transcript or "").strip())
+            .replace("{context}", (transcript or "").strip())
+            .replace("{context_source}", src)
+        )
+    snippet = (transcript or "").strip()
+    if len(snippet) > 2500:
+        snippet = snippet[:2499] + "…"
+    return (
+        "Write a short public YouTube comment (1–2 sentences) reacting to this video.\n"
+        f"Video title: {title_clean}\n"
+        f"Context ({src}):\n{snippet or '(minimal metadata)'}\n\n"
+        "Write in first person as the channel host. Sound natural and specific, not spammy.\n"
+        "Do NOT include URLs, hashtags, markdown, or labels like \"Comment:\".\n"
+        "Output only the comment text."
+    )
+
+
+def _sanitize_yt_public_comment(raw: str, video_url: str) -> str:
+    from ollama_client import strip_think_blocks
+
+    text = strip_think_blocks((raw or "").strip())
+    text = re.sub(r"^[\"'`]+|[\"'`]+$", "", text).strip()
+    url_clean = (video_url or "").strip()
+    if url_clean:
+        text = text.replace(url_clean, "").strip()
+    text = re.sub(r"https?://\S+", "", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    max_len = _yt_comment_max_chars()
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text.strip()
+
+
+def _generate_yt_public_comment_llm_sync(
+    title: str, video_url: str, transcript: str, *, context_source: str = ""
+) -> str | None:
+    from ollama_client import build_client, chat_request_kwargs
+
+    model = (os.environ.get("LUNA_CHAT_MODEL") or os.environ.get("OLLAMA_MODEL") or "").strip()
+    if not model:
+        return None
+    messages = [
+        {"role": "system", "content": _fb_llm_comment_system_prompt()},
+        {
+            "role": "user",
+            "content": _yt_llm_comment_user_prompt(
+                title, video_url, transcript, context_source=context_source
+            ),
+        },
+    ]
+    kwargs = chat_request_kwargs(model, messages, stream=False)
+    predict_raw = (os.environ.get("LUNA_SOCIAL_YOUTUBE_COMMENT_NUM_PREDICT") or "80").strip() or "80"
+    try:
+        predict = max(24, int(predict_raw))
+    except ValueError:
+        predict = 80
+    opts = dict(kwargs.get("options") or {})
+    opts["num_predict"] = predict
+    kwargs["options"] = opts
+    client = build_client()
+    response = client.chat(**kwargs)
+    comment = _sanitize_yt_public_comment(response.message.content or "", video_url)
+    return comment or None
+
+
+async def generate_youtube_public_comment(
+    *, title: str, video_url: str, transcript: str, context_source: str = ""
+) -> str | None:
+    try:
+        return await asyncio.to_thread(
+            _generate_yt_public_comment_llm_sync,
+            title,
+            video_url,
+            transcript,
+            context_source=context_source,
+        )
+    except Exception as exc:
+        print(f"(social playwright) YouTube comment LLM failed ({exc}).", flush=True)
+        return None
+
+
+async def _yt_dismiss_consent(page: object) -> None:
+    """Best-effort dismiss of cookie / consent overlays."""
+    for pattern in (
+        re.compile(r"accept all", re.I),
+        re.compile(r"i agree", re.I),
+        re.compile(r"reject all", re.I),
+    ):
+        try:
+            btn = page.get_by_role("button", name=pattern).first  # type: ignore[union-attr]
+            if await btn.count() > 0:
+                await btn.click(timeout=4000)
+                await page.wait_for_timeout(400)  # type: ignore[union-attr]
+                return
+        except Exception:
+            continue
+
+
+async def _yt_scroll_to_comments(page: object) -> None:
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    try:
+        comments = page.locator("#comments").first  # type: ignore[union-attr]
+        await comments.wait_for(state="attached", timeout=25_000)
+        await comments.scroll_into_view_if_needed(timeout=20_000)
+    except PWTimeout:
+        await page.evaluate("window.scrollBy(0, Math.min(900, window.innerHeight))")  # type: ignore[union-attr]
+    await page.wait_for_timeout(int((os.environ.get("LUNA_SOCIAL_YT_COMMENT_SETTLE_MS") or "1200").strip() or "1200"))  # type: ignore[union-attr]
+
+
+def _yt_comment_editor_locator(page: object) -> object:
+    """``div#contenteditable-root`` inside ``ytd-commentbox`` (locale-agnostic)."""
+    return page.locator(  # type: ignore[union-attr]
+        "ytd-commentbox div#contenteditable-root[contenteditable='true']"
+    ).first
+
+
+async def _yt_open_comment_composer(page: object) -> object:
+    """Focus the public comment field under the video (``#contenteditable-root``)."""
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    await _yt_scroll_to_comments(page)
+    editor = _yt_comment_editor_locator(page)
+
+    # Signed-in layout: the Lexical/contenteditable box is already in the comment thread header.
+    try:
+        await editor.wait_for(state="visible", timeout=15_000)
+        await editor.scroll_into_view_if_needed()
+        await editor.click(timeout=12_000)
+        await page.wait_for_timeout(400)  # type: ignore[union-attr]
+        return editor
+    except PWTimeout:
+        pass
+
+    # Collapsed placeholder (some layouts / not yet focused).
+    for sel in (
+        "ytd-comment-simplebox-renderer #placeholder-area",
+        "ytd-comment-simplebox-renderer #simplebox-placeholder",
+        "#placeholder-area",
+    ):
+        loc = page.locator(sel).first  # type: ignore[union-attr]
+        try:
+            if await loc.count() == 0:
+                continue
+            await loc.scroll_into_view_if_needed()
+            await loc.click(timeout=12_000)
+            await page.wait_for_timeout(600)  # type: ignore[union-attr]
+            await editor.wait_for(state="visible", timeout=12_000)
+            await editor.click(timeout=10_000)
+            return editor
+        except Exception:
+            continue
+    raise PWTimeout(
+        "YouTube comment editor (#contenteditable-root in ytd-commentbox) not found — sign in?"
+    )
+
+
+async def _yt_write_contenteditable(page: object, editor: object, text: str) -> None:
+    """Type into YouTube's ``#contenteditable-root`` (``fill`` alone often leaves Comment disabled)."""
+    await editor.click(timeout=10_000)  # type: ignore[union-attr]
+    await page.wait_for_timeout(250)  # type: ignore[union-attr]
+    for key in ("Control+a", "Meta+a"):
+        try:
+            await page.keyboard.press(key)
+        except Exception:
+            pass
+    await page.keyboard.press("Backspace")
+    delay = int((os.environ.get("LUNA_SOCIAL_YT_COMMENT_TYPE_DELAY_MS") or "12").strip() or "12")
+    blob = (text or "").strip()
+    if not blob:
+        return
+    try:
+        await editor.press_sequentially(blob, delay=delay, timeout=180_000)  # type: ignore[union-attr]
+    except Exception:
+        await page.keyboard.type(blob, delay=delay)  # type: ignore[union-attr]
+    await page.wait_for_timeout(600)  # type: ignore[union-attr]
+    need = max(8, min(len(blob), 24))
+    try:
+        got = (await editor.inner_text() or "").strip()  # type: ignore[union-attr]
+    except Exception:
+        got = ""
+    if len(got) >= need:
+        return
+    await editor.click(timeout=5000)  # type: ignore[union-attr]
+    await page.keyboard.type(blob, delay=delay)  # type: ignore[union-attr]
+
+
+async def _yt_type_and_submit_comment(page: object, editor: object, comment: str) -> None:
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    await _yt_write_contenteditable(page, editor, comment)
+    await page.wait_for_timeout(500)  # type: ignore[union-attr]
+
+    # Submit lives in the same ytd-commentbox footer (#submit-button); label varies by locale.
+    box = page.locator("ytd-commentbox").first  # type: ignore[union-attr]
+    submit_selectors = (
+        "ytd-button-renderer#submit-button:not([hidden]) button",
+        "#submit-button:not([hidden]) button",
+        "ytd-button-renderer#submit-button button",
+    )
+    for sel in submit_selectors:
+        btn = box.locator(sel).first  # type: ignore[union-attr]
+        try:
+            if await btn.count() == 0:
+                continue
+            await btn.wait_for(state="visible", timeout=10_000)
+            for _ in range(50):
+                if await btn.is_enabled():
+                    break
+                await page.wait_for_timeout(200)  # type: ignore[union-attr]
+            await btn.click(timeout=15_000)
+            await page.wait_for_timeout(int((os.environ.get("LUNA_SOCIAL_YT_COMMENT_POST_WAIT_MS") or "3000").strip() or "3000"))  # type: ignore[union-attr]
+            return
+        except PWTimeout:
+            continue
+    # Greek: Σχόλιο, English: Comment, etc.
+    named = box.get_by_role("button", name=re.compile(r"comment|σχόλ|kommentar|coment", re.I)).first  # type: ignore[union-attr]
+    await named.wait_for(state="visible", timeout=10_000)
+    for _ in range(50):
+        if await named.is_enabled():
+            break
+        await page.wait_for_timeout(200)  # type: ignore[union-attr]
+    await named.click(timeout=15_000)
+    await page.wait_for_timeout(int((os.environ.get("LUNA_SOCIAL_YT_COMMENT_POST_WAIT_MS") or "3000").strip() or "3000"))  # type: ignore[union-attr]
+
+
+async def _post_youtube_comment_on_page(page: object, video_url: str, comment: str) -> None:
+    from youtube_audio import extract_video_id
+
+    vid = extract_video_id(video_url)
+    watch = video_url.strip()
+    if vid and "watch" not in watch.lower():
+        watch = f"https://www.youtube.com/watch?v={vid}"
+    await page.goto(watch, wait_until="domcontentloaded", timeout=120_000)  # type: ignore[union-attr]
+    await page.wait_for_timeout(int((os.environ.get("LUNA_SOCIAL_YT_COMMENT_PAGE_MS") or "2500").strip() or "2500"))  # type: ignore[union-attr]
+    await _yt_dismiss_consent(page)
+    editor = await _yt_open_comment_composer(page)
+    await _yt_type_and_submit_comment(page, editor, comment)
+    print(f"(social playwright) YouTube: posted comment on {watch}", flush=True)
+
+
+async def post_youtube_video_comment(*, video_url: str, comment: str) -> tuple[bool, str]:
+    """Post ``comment`` on ``video_url`` using Luna's saved YouTube session (Playwright + Chrome)."""
+    text = clamp_youtube_public_comment(comment)
+    if not text:
+        return False, "YouTube comment: empty text."
+    yt_path = youtube_comment_storage_path(warn=True)
+    if yt_path is None:
+        return False, youtube_comment_setup_hint()
+
+    print(
+        f"(social playwright) YouTube: opening Chrome to post comment on {video_url.strip()[:80]}…",
+        flush=True,
+    )
+
+    async with _share_lock:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return False, "YouTube comment: pip install playwright && python -m playwright install chrome"
+
+        headless = social_playwright_share_headless()
+        slow_mo = int((os.environ.get("LUNA_SOCIAL_PLAYWRIGHT_SLOW_MO") or "0").strip() or "0")
+        try:
+            async with async_playwright() as p:
+                launch_kw = stealth_browser_launch_kwargs(headless=headless, slow_mo=slow_mo)
+                browser = await p.chromium.launch(**launch_kw)
+                try:
+                    ctx = await browser.new_context(
+                        **stealth_browser_context_kwargs(storage_state=yt_path)
+                    )
+                    await ctx.add_init_script(STEALTH_INIT_SCRIPT)
+                    page = await ctx.new_page()
+                    try:
+                        await _post_youtube_comment_on_page(page, video_url, text)
+                    finally:
+                        await page.close()
+                        await ctx.close()
+                finally:
+                    await browser.close()
+        except Exception as exc:
+            print(f"(social playwright) YouTube comment failed: {exc}", flush=True)
+            return False, f"YouTube comment failed: {exc}"
+    return True, "YouTube comment posted."
+
+
+async def generate_and_post_youtube_video_comment(
+    *,
+    video_url: str,
+    title: str,
+    transcript: str,
+    context_source: str = "",
+) -> tuple[bool, str]:
+    """LLM-write a public comment from the same video context as !explain, then post via Playwright."""
+    comment = await generate_youtube_public_comment(
+        title=title,
+        video_url=video_url,
+        transcript=transcript,
+        context_source=context_source,
+    )
+    if not comment:
+        return False, "YouTube comment: could not generate text (check Ollama model)."
+    preview = comment[:120] + ("…" if len(comment) > 120 else "")
+    print(f"(social playwright) YouTube comment (LLM): {preview}", flush=True)
+    return await post_youtube_video_comment(video_url=video_url, comment=comment)
 
 
 def _compose_x_text(title: str, video_url: str) -> str:
@@ -424,7 +816,9 @@ def _fb_llm_comment_user_prompt(title: str, video_url: str) -> str:
 
 
 def _fb_llm_comment_system_prompt() -> str:
-    extra = (os.environ.get("TWITCH_SYSTEM") or "").strip()
+    from luna_persona import build_luna_system_prompt
+
+    extra = build_luna_system_prompt()
     base = (
         "You help a streamer write brief social posts. "
         "Reply with plain text only — no reasoning tags, no bullet lists."
@@ -978,8 +1372,10 @@ async def run_interactive_social_login(
         s = "x"
     elif s in ("facebook", "fb"):
         s = "facebook"
+    elif s in ("youtube", "yt"):
+        s = "youtube"
     else:
-        await broadcast("Social login: use site x or facebook.")
+        await broadcast("Social login: use site x, facebook, or youtube.")
         return
 
     start_url = interactive_login_start_url(s)
@@ -1071,7 +1467,7 @@ async def run_interactive_social_login(
                     await ctx.storage_state(path=str(out))
                     await broadcast(
                         f"Social login: saved to {out}. "
-                        f"Ensure LUNA_SOCIAL_{'FACEBOOK' if s == 'facebook' else 'X'}_STORAGE_STATE matches this path; restart Luna if you changed it."
+                        f"Ensure LUNA_SOCIAL_{'FACEBOOK' if s == 'facebook' else 'YOUTUBE' if s == 'youtube' else 'X'}_STORAGE_STATE matches this path; restart Luna if you changed it."
                     )
                 except Exception as exc:
                     await broadcast(f"Social login: could not save storage ({exc}).")

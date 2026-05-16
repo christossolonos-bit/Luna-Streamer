@@ -13,6 +13,12 @@ body,
   background: #030308;
 }
 
+html.luna-capture,
+html.luna-capture body,
+html.luna-capture #root {
+  background: transparent !important;
+}
+
 body {
   font-family: "JetBrains Mono", ui-monospace, monospace;
 }

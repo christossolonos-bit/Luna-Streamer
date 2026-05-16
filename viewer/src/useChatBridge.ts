@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
 import { type BridgeMessage, type BridgeTtsVoice, parseBridgeMessage } from "./chatTypes";
+import { getCohostSoloMode, readCohostSoloModeStored } from "./cohostScenePrefs";
 import { playViewerTts } from "./viewerTtsPlayer";
 
 const DEFAULT_WS = "ws://127.0.0.1:8765/ws";
@@ -7,6 +8,16 @@ const MAX_LINES = 250;
 const RECONNECT_MS = 450;
 const CHAT_STORAGE_KEY = "luna.chat.lines.v1";
 const TTS_SPEAKER_STORAGE_KEY = "luna.tts.speaker.v1";
+/** Matches App.tsx: “full conversation” = open-ended script (`LUNA_COHOST_FULL_BANTER_MAX_LINES` caps parse). */
+const COHOST_FULL_SCRIPT_STORAGE_KEY = "luna.cohostFullConversation.v1";
+
+function readCohostFullScriptStored(): boolean {
+  try {
+    return window.localStorage.getItem(COHOST_FULL_SCRIPT_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export type ChatLine =
   | { id: string; kind: "status"; text: string; ts: number }
@@ -264,23 +275,63 @@ export function useChatBridge(enabled: boolean) {
         );
         return;
       }
+      if (msg.name === "cohost_avatar") {
+        const solo = getCohostSoloMode();
+        window.dispatchEvent(
+          new CustomEvent("luna-cohost-avatar", {
+            detail: {
+              dualLayout: !solo && msg.dual_layout === true,
+              vrmUrl: msg.vrm_url?.trim() || "",
+              activeSpeaker:
+                solo && msg.active_speaker === "cohost"
+                  ? "luna"
+                  : msg.active_speaker,
+            },
+          }),
+        );
+        return;
+      }
       if (msg.name === "tts_audio") {
+        const solo = getCohostSoloMode();
+        const speaker = msg.avatar === "cohost" ? "cohost" : "luna";
+        if (solo && speaker === "cohost") {
+          const ws = wsRef.current;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "viewer_tts_ended" }));
+          }
+          return;
+        }
+        const driveAvatar = msg.drive_avatar !== false;
+        window.dispatchEvent(
+          new CustomEvent("luna-cohost-avatar", {
+            detail: { activeSpeaker: speaker },
+          }),
+        );
+        if (driveAvatar) {
+          setAvatarSpeaking(true);
+          window.dispatchEvent(
+            new CustomEvent("luna-avatar-speaking", { detail: true }),
+          );
+        }
         playViewerTts(
           {
             mime: msg.mime,
             data: msg.data,
             duration_ms: msg.duration_ms,
             visemes: msg.visemes,
+            driveAvatar,
           },
           () => {
             const ws = wsRef.current;
             if (ws && ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: "viewer_tts_ended" }));
             }
-            setAvatarSpeaking(false);
-            window.dispatchEvent(
-              new CustomEvent("luna-avatar-speaking", { detail: false }),
-            );
+            if (driveAvatar) {
+              setAvatarSpeaking(false);
+              window.dispatchEvent(
+                new CustomEvent("luna-avatar-speaking", { detail: false }),
+              );
+            }
           },
         );
         return;
@@ -372,6 +423,22 @@ export function useChatBridge(enabled: boolean) {
       ws.onopen = () => {
         if (closed) return;
         setConn("open");
+        try {
+          ws.send(
+            JSON.stringify({
+              type: "viewer_cohost_idle_full_script",
+              full: readCohostFullScriptStored(),
+            }),
+          );
+          ws.send(
+            JSON.stringify({
+              type: "viewer_cohost_scene",
+              in_scene: !readCohostSoloModeStored(),
+            }),
+          );
+        } catch {
+          /* ignore */
+        }
       };
 
       ws.onmessage = (ev) => {
@@ -409,6 +476,15 @@ export function useChatBridge(enabled: boolean) {
       w?.close();
     };
   }, [enabled, appendParsed, bridgeUrl]);
+
+  useEffect(() => {
+    const onSpeakingEvt = (ev: Event) => {
+      const d = (ev as CustomEvent<boolean>).detail;
+      if (typeof d === "boolean") setAvatarSpeaking(d);
+    };
+    window.addEventListener("luna-avatar-speaking", onSpeakingEvt);
+    return () => window.removeEventListener("luna-avatar-speaking", onSpeakingEvt);
+  }, []);
 
   // Debounce localStorage writes — streaming token deltas can fire 100+
   // setState calls per reply. Writing every one of those serialises the full
@@ -661,6 +737,36 @@ export function useChatBridge(enabled: boolean) {
     );
   }, []);
 
+  const sendCohostBanterNow = useCallback(async (fullConversation: boolean) => {
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "viewer_cohost_banter", full: fullConversation }));
+    return true;
+  }, []);
+
+  const sendViewerCohostScene = useCallback(async (inScene: boolean) => {
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "viewer_cohost_scene", in_scene: inScene }));
+    return true;
+  }, []);
+
+  const sendCohostIdleFullScriptPreference = useCallback(async (full: boolean) => {
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ type: "viewer_cohost_idle_full_script", full }));
+    return true;
+  }, []);
+
   const pickTtsVoice = useCallback((id: string) => {
     setTtsSpeakerId(id);
     try {
@@ -708,5 +814,8 @@ export function useChatBridge(enabled: boolean) {
     sendYouTubeLiveUrl,
     dismissYouTubeLivePrompt,
     youtubeLivePrompt,
+    sendCohostBanterNow,
+    sendCohostIdleFullScriptPreference,
+    sendViewerCohostScene,
   };
 }

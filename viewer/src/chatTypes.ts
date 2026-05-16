@@ -90,6 +90,19 @@ export type BridgeControlTtsAudioMessage = {
     intensity?: number;
     hold_ms?: number;
   }>;
+  /** @deprecated use avatar */
+  drive_avatar?: boolean;
+  /** Speaking avatar for routing / lip-sync — default Luna when omitted. */
+  avatar?: "luna" | "cohost";
+};
+
+export type BridgeControlCohostAvatarMessage = {
+  type: "control";
+  name: "cohost_avatar";
+  /** When true, show Luna + co-host together (no swapping). */
+  dual_layout?: boolean;
+  vrm_url?: string;
+  active_speaker?: "luna" | "cohost";
 };
 
 export type BridgeControlEnrollStateMessage = {
@@ -121,7 +134,8 @@ export type BridgeControlMessage =
   | BridgeControlMicReadyMessage
   | BridgeControlTtsAudioMessage
   | BridgeControlEnrollStateMessage
-  | BridgeControlYoutubeLivePromptMessage;
+  | BridgeControlYoutubeLivePromptMessage
+  | BridgeControlCohostAvatarMessage;
 
 export type BridgeMessage =
   | BridgeChatMessage
@@ -213,6 +227,9 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
             };
           })
       : undefined;
+    const avatarRaw = typeof o.avatar === "string" ? o.avatar.trim().toLowerCase() : "";
+    const avatar: "luna" | "cohost" = avatarRaw === "cohost" ? "cohost" : "luna";
+    const drive_avatar = o.drive_avatar !== false;
     return {
       type: "control",
       name: "tts_audio",
@@ -220,6 +237,18 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       data: o.data,
       duration_ms: typeof o.duration_ms === "number" ? o.duration_ms : undefined,
       visemes,
+      drive_avatar,
+      avatar,
+    };
+  }
+  if (t === "control" && o.name === "cohost_avatar") {
+    const sp = typeof o.active_speaker === "string" ? o.active_speaker.trim().toLowerCase() : "";
+    return {
+      type: "control",
+      name: "cohost_avatar",
+      dual_layout: o.dual_layout === true || o.visible === true,
+      vrm_url: typeof o.vrm_url === "string" ? o.vrm_url : undefined,
+      active_speaker: sp === "cohost" ? "cohost" : sp === "luna" ? "luna" : undefined,
     };
   }
   if (t === "control" && o.name === "enroll_state") {

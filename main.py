@@ -58,12 +58,24 @@ def _viewer_page_url(
     vrm_file: Path,
     idle_motion_files: list[Path],
     *,
+    cohost_idle_motion_files: list[Path] | None = None,
     chat_ws: str | None = None,
+    cohost_vrm_file: Path | None = None,
+    cohost_display_name: str | None = None,
+    cohost_idle_skip_sec: float | None = None,
 ) -> str:
     fs_url = _to_vite_fs_url(vrm_file)
     payload: list[tuple[str, str]] = [("vrm", fs_url)]
     for motion in idle_motion_files:
         payload.append(("idle", _to_vite_fs_url(motion)))
+    for motion in cohost_idle_motion_files or []:
+        payload.append(("cohost_idle", _to_vite_fs_url(motion)))
+    if cohost_vrm_file is not None and cohost_vrm_file.is_file():
+        payload.append(("cohost_vrm", _to_vite_fs_url(cohost_vrm_file)))
+    if cohost_display_name:
+        payload.append(("cohost_name", cohost_display_name.strip()))
+    if cohost_idle_skip_sec is not None and cohost_idle_skip_sec > 0:
+        payload.append(("cohost_idle_skip_sec", str(cohost_idle_skip_sec)))
     if chat_ws:
         payload.append(("chat_ws", chat_ws))
     query = urllib.parse.urlencode(payload, doseq=True)
@@ -205,6 +217,19 @@ def main() -> None:
         default=Path(__file__).resolve().parent / "expressions",
         help="Folder containing idle VRMA files.",
     )
+    root_dir_pre = Path(__file__).resolve().parent
+    _cohost_idle_env = (os.environ.get("LUNA_COHOST_EXPRESSIONS_DIR") or "").strip()
+    _cohost_idle_default = (
+        Path(_cohost_idle_env).expanduser().resolve()
+        if _cohost_idle_env
+        else root_dir_pre / "expressions1"
+    )
+    parser.add_argument(
+        "--cohost-expressions-dir",
+        type=Path,
+        default=_cohost_idle_default,
+        help="Folder containing co-host (Viktor) idle VRMA files (same style as Luna).",
+    )
     args = parser.parse_args()
 
     root_dir = Path(__file__).resolve().parent
@@ -212,6 +237,7 @@ def main() -> None:
     viewer_dir = args.viewer_dir.resolve()
     viewer_dist = viewer_dir / "dist"
     expressions_dir = args.expressions_dir.resolve()
+    cohost_expressions_dir = args.cohost_expressions_dir.resolve()
     active_port = args.port
     base_url = f"http://127.0.0.1:{active_port}/"
 
@@ -239,6 +265,13 @@ def main() -> None:
     else:
         idle_motion_files = []
     print(f"Idle motions found: {len(idle_motion_files)} in {expressions_dir}")
+    if cohost_expressions_dir.is_dir():
+        cohost_idle_motion_files = sorted(cohost_expressions_dir.glob("**/*.vrma"))
+    else:
+        cohost_idle_motion_files = []
+    print(
+        f"Co-host idle motions: {len(cohost_idle_motion_files)} in {cohost_expressions_dir}",
+    )
 
     viewer_server: http.server.ThreadingHTTPServer | None = None
     viewer_proc: subprocess.Popen[str] | None = None
@@ -256,8 +289,38 @@ def main() -> None:
     chat_ws_url = (
         f"ws://127.0.0.1:{chat_ws_port}/ws" if chat_ws_port > 0 else None
     )
+    cohost_vrm: Path | None = None
+    cohost_name: str | None = None
+    try:
+        from vampire_cohost import cohost_name as _cohost_name
+        from vampire_cohost import cohost_vrm_path
+
+        cohost_name = _cohost_name()
+        p = cohost_vrm_path()
+        if p.is_file():
+            cohost_vrm = p
+            print(
+                f"Co-host VRM (summon from viewer dock): {cohost_vrm} ({cohost_name})"
+            )
+    except Exception:
+        cohost_vrm = None
+        cohost_name = None
+
+    _cohost_skip_raw = (os.environ.get("LUNA_COHOST_IDLE_SKIP_SEC") or "2").strip() or "2"
+    try:
+        cohost_idle_skip_sec = max(0.0, float(_cohost_skip_raw))
+    except ValueError:
+        cohost_idle_skip_sec = 2.0
+
     page_url = _viewer_page_url(
-        active_port, vrm_file, idle_motion_files, chat_ws=chat_ws_url
+        active_port,
+        vrm_file,
+        idle_motion_files,
+        cohost_idle_motion_files=cohost_idle_motion_files,
+        chat_ws=chat_ws_url,
+        cohost_vrm_file=cohost_vrm,
+        cohost_display_name=cohost_name,
+        cohost_idle_skip_sec=cohost_idle_skip_sec,
     )
     if viewer_already_running:
         print(f"Viewer already running at {base_url}")

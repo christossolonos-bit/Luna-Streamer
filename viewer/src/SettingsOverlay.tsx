@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
 import { useBridge } from "./chatBridgeContext";
-import { CloseIcon, SocialFacebookLoginIcon, SocialXLoginIcon, VoiceIcon } from "./icons";
+import {
+  CloseIcon,
+  SocialFacebookLoginIcon,
+  SocialXLoginIcon,
+  SocialYoutubeLoginIcon,
+  VoiceIcon,
+} from "./icons";
 import type { VrmRuntime, ChromaKeyMode } from "./vrmRuntime";
 import { AVATAR_FACE_EXPRESSIONS, type AvatarFaceExpressionId } from "./avatarExpressions";
 
@@ -404,7 +410,7 @@ export function SettingsOverlay({
               className="settings-btn"
               onClick={() => void submitYt("explain")}
               disabled={conn !== "open" || ytBusy || ytInput.trim().length === 0}
-              title="Fetch the transcript and let Luna react"
+              title="Fetch transcript, react on stream, and post a YouTube comment when configured"
             >
               Explain
             </button>
@@ -419,10 +425,11 @@ export function SettingsOverlay({
         <section className="settings-section">
           <h3 className="settings-section-title">Social login</h3>
           <p className="settings-hint">
-            One-time setup for Playwright sharing. Opens Chrome on the PC running Luna — sign in,
-            then close the tab when chat says the session was saved. Set{" "}
-            <code className="chat-code">LUNA_SOCIAL_X_STORAGE_STATE</code> /{" "}
-            <code className="chat-code">LUNA_SOCIAL_FACEBOOK_STORAGE_STATE</code> in{" "}
+            One-time setup for Playwright sharing and YouTube comments. Opens Chrome on the PC
+            running Luna — sign in, then close the tab when chat says the session was saved. Set{" "}
+            <code className="chat-code">LUNA_SOCIAL_X_STORAGE_STATE</code>,{" "}
+            <code className="chat-code">LUNA_SOCIAL_FACEBOOK_STORAGE_STATE</code>, and/or{" "}
+            <code className="chat-code">LUNA_SOCIAL_YOUTUBE_STORAGE_STATE</code> in{" "}
             <code className="chat-code">.env</code>.
           </p>
           <div className="settings-row">
@@ -446,15 +453,26 @@ export function SettingsOverlay({
               <SocialFacebookLoginIcon />
               Facebook login
             </button>
+            <button
+              type="button"
+              className="settings-btn settings-btn--social-yt"
+              disabled={conn !== "open"}
+              onClick={() => void sendSocialInteractiveLogin("youtube")}
+              title="Set up YouTube login for posting video comments"
+            >
+              <SocialYoutubeLoginIcon />
+              YouTube login
+            </button>
           </div>
         </section>
 
         <section className="settings-section">
-          <h3 className="settings-section-title">Chroma key</h3>
+          <h3 className="settings-section-title">OBS background</h3>
           <div className="settings-row">
             {(
               [
                 ["off", "Off"],
+                ["transparent", "Transparent"],
                 ["green", "Green"],
                 ["blue", "Blue"],
               ] as const
@@ -470,7 +488,8 @@ export function SettingsOverlay({
             ))}
           </div>
           <p className="settings-hint">
-            Flat #00ff00 / #0047bb background, scanlines hidden — drop in OBS as a browser source.
+            <strong>Transparent</strong>: real alpha for OBS (no chroma filter). Green/blue: classic
+            color key. Scanlines hidden in all capture modes.
           </p>
         </section>
 

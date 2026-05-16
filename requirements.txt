@@ -16,7 +16,7 @@ librosa>=0.10.0
 
 # YouTube integration: !play (audio resolver/download) + !explain (transcript).
 yt-dlp>=2024.4.9
-youtube-transcript-api>=0.6.2
+youtube-transcript-api>=1.0.0
 
 # Optional: Discord music bot for voice-channel playback (DISCORD_TOKEN required).
 # The [voice] extra pulls PyNaCl. FFmpeg must be in PATH (already required for STT).

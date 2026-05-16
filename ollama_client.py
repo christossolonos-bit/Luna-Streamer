@@ -264,6 +264,61 @@ def summarize_viewer_screen(client: Client, model: str, image_b64: str) -> str:
     return (response.message.content or "").strip()
 
 
+def describe_youtube_video(
+    client: Client,
+    model: str,
+    images_b64: list[str],
+    *,
+    title: str = "",
+) -> str:
+    """Describe a YouTube video from evenly spaced JPEG frames (Qwen / other vision models)."""
+    if not images_b64:
+        return ""
+    title_line = f'Video title: {(title or "").strip() or "(unknown)"}\n'
+    default_prompt = (
+        "You are helping a stream host comment on a YouTube video. "
+        f"{title_line}"
+        f"You are shown {len(images_b64)} frame(s) sampled across the video.\n"
+        "Describe what the video is about in 4-8 short sentences: setting, visuals, mood, "
+        "on-screen text if readable, and what a viewer would take away. "
+        "If it is mostly music/visuals with no speech, say that. Plain text only, no markdown."
+    )
+    prompt = (os.environ.get("LUNA_YT_VISION_PROMPT") or default_prompt).strip()
+    prompt = prompt.replace("{title}", (title or "").strip()).replace("{n_frames}", str(len(images_b64)))
+    predict_raw = (os.environ.get("LUNA_YT_VISION_NUM_PREDICT") or "320").strip() or "320"
+    try:
+        predict = max(64, int(predict_raw))
+    except ValueError:
+        predict = 320
+    ka = ollama_keep_alive()
+    opts = build_ollama_options(for_screen=True) or {}
+    opts = dict(opts)
+    opts["num_predict"] = predict
+    think = ollama_think_mode()
+    base_messages = [
+        {
+            "role": "user",
+            "content": prompt,
+            "images": images_b64,
+        }
+    ]
+    final_messages = base_messages
+    if think is not None and not _THINK_KWARG_SUPPORTED:
+        final_messages = _apply_think_directive(base_messages, think)
+    kwargs: dict = {
+        "model": model,
+        "messages": final_messages,
+        "stream": False,
+        "options": opts,
+    }
+    if ka is not None:
+        kwargs["keep_alive"] = ka
+    if think is not None and _THINK_KWARG_SUPPORTED:
+        kwargs["think"] = think
+    response = client.chat(**kwargs)
+    return (response.message.content or "").strip()
+
+
 def chat_once(
     client: Client,
     model: str,

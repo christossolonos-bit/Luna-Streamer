@@ -10,6 +10,8 @@ export type ViewerTtsPayload = {
   data: string;
   duration_ms?: number;
   visemes?: ViewerTtsViseme[];
+  /** When false, play audio only (co-host voice; no Luna lip-sync). */
+  driveAvatar?: boolean;
 };
 
 let activeAudio: HTMLAudioElement | null = null;
@@ -59,6 +61,7 @@ export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
   audio.onerror = finish;
 
   void audio.play().then(() => {
+    if (payload.driveAvatar === false) return;
     for (const v of payload.visemes ?? []) {
       const at = Math.max(0, Number(v.at_ms) || 0);
       const t = window.setTimeout(() => {
