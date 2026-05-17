@@ -406,9 +406,16 @@ function AppInner() {
         dualLayout?: boolean;
         vrmUrl?: string;
         activeSpeaker?: "luna" | "cohost";
+        chatReply?: boolean;
       }>;
       const rt = runtimeRef.current;
       if (!rt) return;
+      if (ce.detail?.chatReply && ce.detail.activeSpeaker === "cohost") {
+        const url = ce.detail.vrmUrl?.trim() || cohostVrmUrlRef.current;
+        if (url) cohostVrmUrlRef.current = url;
+        void rt.prepareCohostChatReply(url);
+        return;
+      }
       if (ce.detail?.dualLayout) {
         if (rt.isCohostSoloMode()) {
           return;
@@ -429,7 +436,11 @@ function AppInner() {
         rt.setActiveSpeaker(ce.detail.activeSpeaker);
       }
     };
+    const onCohostChatReplyEnd = () => {
+      runtimeRef.current?.finishCohostChatReply();
+    };
     window.addEventListener("luna-cohost-avatar", onCohostAvatar);
+    window.addEventListener("luna-cohost-chat-reply-end", onCohostChatReplyEnd);
 
     if (readCohostSoloModeStored()) {
       setCohostInScene(false);
@@ -466,6 +477,7 @@ function AppInner() {
 
     return () => {
       window.removeEventListener("luna-cohost-avatar", onCohostAvatar);
+      window.removeEventListener("luna-cohost-chat-reply-end", onCohostChatReplyEnd);
       ro.disconnect();
       window.removeEventListener("resize", onResize);
       runtime.dispose();

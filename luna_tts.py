@@ -335,7 +335,7 @@ def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
     text = re.sub(r"\(([^()]+)\)", lambda m: _action_sound(m.group(1)), text)
     text = re.sub(r"[*_`]+", "", text)
     text = re.sub(r"\s+", " ", text)
-    max_chars = int(os.environ.get("LUNA_TTS_MAX_CHARS", "500").strip() or "500")
+    max_chars = int(os.environ.get("LUNA_TTS_MAX_CHARS", "2500").strip() or "2500")
     if len(text) > max_chars:
         text = text[: max_chars - 3].rstrip() + "..."
     if not text:
@@ -422,32 +422,81 @@ def synthesize_playback_bundle(
                     except OSError:
                         pass
 
-            fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_viewer_")
+            chunk_chars = int(os.environ.get("LUNA_TTS_CHUNK_CHARS", "380").strip() or "380")
+            chunks = _split_tts_chunks(text, chunk_chars)
+            if len(chunks) <= 1:
+                fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_viewer_")
+                os.close(fd)
+                mp3_out = Path(tmp)
+                wav_out = mp3_out.with_suffix(".wav")
+                try:
+                    cues_edge = _synthesize_edge_to_mp3(
+                        text,
+                        mp3_out,
+                        voice=edge_voice,
+                        rate=rate,
+                        pitch=pitch,
+                    )
+                    _mp3_to_wav(mp3_out, wav_out)
+                    cues = _resolve_viseme_timeline(wav_out, cues_edge)
+                    audio = mp3_out.read_bytes()
+                    dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
+                    visemes = _visemes_for_timeline(cues)
+                    return TtsPlaybackBundle(
+                        audio=audio,
+                        mime="audio/mpeg",
+                        duration_ms=dur_ms,
+                        visemes=visemes,
+                    )
+                finally:
+                    try:
+                        mp3_out.unlink(missing_ok=True)
+                        wav_out.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_viewer_long_")
             os.close(fd)
-            mp3_out = Path(tmp)
-            wav_out = mp3_out.with_suffix(".wav")
+            wav_out = Path(tmp)
+            tmp_parts: list[Path] = []
             try:
-                cues_edge = _synthesize_edge_to_mp3(
-                    text,
-                    mp3_out,
-                    voice=edge_voice,
-                    rate=rate,
-                    pitch=pitch,
-                )
-                _mp3_to_wav(mp3_out, wav_out)
-                cues = _resolve_viseme_timeline(wav_out, cues_edge)
-                audio = mp3_out.read_bytes()
+                for i, part in enumerate(chunks):
+                    fd_p, p_tmp = tempfile.mkstemp(
+                        suffix=".mp3", prefix=f"luna_viewer_edge_{i}_"
+                    )
+                    os.close(fd_p)
+                    mp3_part = Path(p_tmp)
+                    wav_part = mp3_part.with_suffix(".wav")
+                    _synthesize_edge_to_mp3(
+                        part,
+                        mp3_part,
+                        voice=edge_voice,
+                        rate=rate,
+                        pitch=pitch,
+                    )
+                    _mp3_to_wav(mp3_part, wav_part)
+                    tmp_parts.append(wav_part)
+                    try:
+                        mp3_part.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                _concat_audio_with_ffmpeg(tmp_parts, wav_out)
+                cues = _resolve_viseme_timeline(wav_out, [])
+                audio = wav_out.read_bytes()
                 dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
-                visemes = _visemes_for_timeline(cues)
                 return TtsPlaybackBundle(
                     audio=audio,
-                    mime="audio/mpeg",
+                    mime="audio/wav",
                     duration_ms=dur_ms,
-                    visemes=visemes,
+                    visemes=_visemes_for_timeline(cues),
                 )
             finally:
+                for p in tmp_parts:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 try:
-                    mp3_out.unlink(missing_ok=True)
                     wav_out.unlink(missing_ok=True)
                 except OSError:
                     pass

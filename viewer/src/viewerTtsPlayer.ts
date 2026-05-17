@@ -17,6 +17,7 @@ export type ViewerTtsPayload = {
 let activeAudio: HTMLAudioElement | null = null;
 let objectUrl: string | null = null;
 let visemeTimers: number[] = [];
+let playGeneration = 0;
 
 function clearVisemeTimers() {
   for (const t of visemeTimers) window.clearTimeout(t);
@@ -24,6 +25,7 @@ function clearVisemeTimers() {
 }
 
 export function stopViewerTts() {
+  playGeneration += 1;
   clearVisemeTimers();
   if (activeAudio) {
     activeAudio.pause();
@@ -36,9 +38,20 @@ export function stopViewerTts() {
   }
 }
 
+function safetyTimeoutMs(audio: HTMLAudioElement, payload: ViewerTtsPayload): number {
+  const fromMeta =
+    Number.isFinite(audio.duration) && audio.duration > 0
+      ? audio.duration * 1000 + 3000
+      : 0;
+  const fromPayload = (payload.duration_ms || 0) * 1.25 + 2500;
+  const charEst = 8000;
+  return Math.min(120_000, Math.max(6000, fromMeta, fromPayload, charEst));
+}
+
 /** Play TTS in the browser (OBS window / Browser Source audio). */
 export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
   stopViewerTts();
+  const gen = playGeneration;
   const raw = (payload.data || "").trim();
   if (!raw) {
     onEnded();
@@ -52,19 +65,37 @@ export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
   const audio = new Audio(objectUrl);
   activeAudio = audio;
 
+  let finished = false;
+  let safetyTimer = 0;
+
   const finish = () => {
+    if (finished || gen !== playGeneration) return;
+    finished = true;
+    if (safetyTimer) window.clearTimeout(safetyTimer);
     stopViewerTts();
     onEnded();
   };
 
-  audio.onended = finish;
-  audio.onerror = finish;
+  audio.onended = () => finish();
+
+  audio.onerror = () => finish();
+
+  const armSafety = () => {
+    if (finished || gen !== playGeneration) return;
+    if (safetyTimer) window.clearTimeout(safetyTimer);
+    safetyTimer = window.setTimeout(() => finish(), safetyTimeoutMs(audio, payload));
+  };
+
+  audio.addEventListener("loadedmetadata", armSafety, { once: true });
+  audio.addEventListener("durationchange", armSafety, { once: true });
 
   void audio.play().then(() => {
+    armSafety();
     if (payload.driveAvatar === false) return;
     for (const v of payload.visemes ?? []) {
       const at = Math.max(0, Number(v.at_ms) || 0);
       const t = window.setTimeout(() => {
+        if (gen !== playGeneration) return;
         window.dispatchEvent(
           new CustomEvent("luna-avatar-viseme", {
             detail: {
@@ -77,5 +108,5 @@ export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
       }, at);
       visemeTimers.push(t);
     }
-  }).catch(finish);
+  }).catch(() => finish());
 }

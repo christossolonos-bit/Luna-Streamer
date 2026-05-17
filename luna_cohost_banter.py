@@ -144,9 +144,18 @@ async def run_cohost_banter_loop(bot: "LunaTwitchBot") -> None:
                 continue
             if not bot.cohost_idle_ready():
                 continue
+            if bot.public_chat_reply_priority_busy():
+                continue
             if not bot._viewer_cohost_in_scene:
                 continue
-            await bot.run_cohost_banter_exchange(full_conversation=bot._cohost_idle_full_script)
+            if bot._cohost_banter_task is not None and not bot._cohost_banter_task.done():
+                continue
+            bot._cohost_banter_task = asyncio.create_task(
+                bot.run_cohost_banter_exchange(
+                    full_conversation=bot._cohost_idle_full_script
+                ),
+                name="luna-cohost-banter-idle",
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -94,6 +94,13 @@ export type BridgeControlTtsAudioMessage = {
   drive_avatar?: boolean;
   /** Speaking avatar for routing / lip-sync — default Luna when omitted. */
   avatar?: "luna" | "cohost";
+  /** Twitch/YouTube @Viktor reply — show co-host VRM/voice even in solo mode. */
+  chat_reply?: boolean;
+};
+
+export type BridgeControlStopTtsMessage = {
+  type: "control";
+  name: "stop_tts";
 };
 
 export type BridgeControlCohostAvatarMessage = {
@@ -103,6 +110,8 @@ export type BridgeControlCohostAvatarMessage = {
   dual_layout?: boolean;
   vrm_url?: string;
   active_speaker?: "luna" | "cohost";
+  /** Twitch/YouTube live chat routed to Viktor — bypass solo-mode viewer blocks. */
+  chat_reply?: boolean;
 };
 
 export type BridgeControlEnrollStateMessage = {
@@ -133,6 +142,7 @@ export type BridgeControlMessage =
   | BridgeControlAvatarVisemeMessage
   | BridgeControlMicReadyMessage
   | BridgeControlTtsAudioMessage
+  | BridgeControlStopTtsMessage
   | BridgeControlEnrollStateMessage
   | BridgeControlYoutubeLivePromptMessage
   | BridgeControlCohostAvatarMessage;
@@ -239,7 +249,11 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       visemes,
       drive_avatar,
       avatar,
+      chat_reply: o.chat_reply === true,
     };
+  }
+  if (t === "control" && o.name === "stop_tts") {
+    return { type: "control", name: "stop_tts" };
   }
   if (t === "control" && o.name === "cohost_avatar") {
     const sp = typeof o.active_speaker === "string" ? o.active_speaker.trim().toLowerCase() : "";
@@ -249,6 +263,7 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       dual_layout: o.dual_layout === true || o.visible === true,
       vrm_url: typeof o.vrm_url === "string" ? o.vrm_url : undefined,
       active_speaker: sp === "cohost" ? "cohost" : sp === "luna" ? "luna" : undefined,
+      chat_reply: o.chat_reply === true,
     };
   }
   if (t === "control" && o.name === "enroll_state") {

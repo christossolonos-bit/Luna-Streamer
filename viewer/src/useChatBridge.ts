@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
 import { type BridgeMessage, type BridgeTtsVoice, parseBridgeMessage } from "./chatTypes";
 import { getCohostSoloMode, readCohostSoloModeStored } from "./cohostScenePrefs";
-import { playViewerTts } from "./viewerTtsPlayer";
+import { playViewerTts, stopViewerTts } from "./viewerTtsPlayer";
 
 const DEFAULT_WS = "ws://127.0.0.1:8765/ws";
 const MAX_LINES = 250;
@@ -276,25 +276,39 @@ export function useChatBridge(enabled: boolean) {
         return;
       }
       if (msg.name === "cohost_avatar") {
+        const chatReply = msg.chat_reply === true;
         const solo = getCohostSoloMode();
         window.dispatchEvent(
           new CustomEvent("luna-cohost-avatar", {
             detail: {
-              dualLayout: !solo && msg.dual_layout === true,
+              dualLayout: chatReply ? msg.dual_layout === true : !solo && msg.dual_layout === true,
               vrmUrl: msg.vrm_url?.trim() || "",
               activeSpeaker:
-                solo && msg.active_speaker === "cohost"
+                !chatReply && solo && msg.active_speaker === "cohost"
                   ? "luna"
                   : msg.active_speaker,
+              chatReply,
             },
           }),
         );
         return;
       }
+      if (msg.name === "stop_tts") {
+        stopViewerTts();
+        window.dispatchEvent(
+          new CustomEvent("luna-avatar-speaking", { detail: false }),
+        );
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "viewer_tts_ended" }));
+        }
+        return;
+      }
       if (msg.name === "tts_audio") {
+        const chatReply = msg.chat_reply === true;
         const solo = getCohostSoloMode();
         const speaker = msg.avatar === "cohost" ? "cohost" : "luna";
-        if (solo && speaker === "cohost") {
+        if (solo && speaker === "cohost" && !chatReply) {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "viewer_tts_ended" }));
@@ -302,11 +316,17 @@ export function useChatBridge(enabled: boolean) {
           return;
         }
         const driveAvatar = msg.drive_avatar !== false;
-        window.dispatchEvent(
-          new CustomEvent("luna-cohost-avatar", {
-            detail: { activeSpeaker: speaker },
-          }),
-        );
+        if (speaker === "cohost") {
+          window.dispatchEvent(
+            new CustomEvent("luna-cohost-avatar", {
+              detail: {
+                activeSpeaker: "cohost",
+                vrmUrl: "",
+                chatReply,
+              },
+            }),
+          );
+        }
         if (driveAvatar) {
           setAvatarSpeaking(true);
           window.dispatchEvent(
@@ -331,6 +351,9 @@ export function useChatBridge(enabled: boolean) {
               window.dispatchEvent(
                 new CustomEvent("luna-avatar-speaking", { detail: false }),
               );
+            }
+            if (chatReply && speaker === "cohost") {
+              window.dispatchEvent(new CustomEvent("luna-cohost-chat-reply-end"));
             }
           },
         );

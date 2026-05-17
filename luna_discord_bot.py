@@ -26,8 +26,15 @@ Env:
   LUNA_DISCORD_CHAT_TRIGGER        "all" (any non-command msg in allowed channels) or
                                    "mention" (only when bot is @-mentioned or "luna" appears).
                                    Default "mention".
-  LUNA_DISCORD_CHAT_CHANNEL_IDS    Optional comma-separated allowlist of text channel ids.
-                                   Empty = all text channels Luna can see.
+  LUNA_DISCORD_CHAT_CHANNEL_IDS    Optional global allowlist (all servers). Empty = all channels
+                                   except servers listed in LUNA_DISCORD_GUILD_CHAT_CHANNELS.
+  LUNA_DISCORD_GUILD_CHAT_CHANNELS Per-server allowlists: guild_id:channel_id[,channel_id…]
+                                   separated by spaces. Example:
+                                   1464575233783631886:1505683058601361488
+  LUNA_DISCORD_CHAT_READ_BOTS      1 to treat other bots like users in allowed channels (default 0).
+                                   Bots must still @-mention Luna or say "luna" (even if TRIGGER=all).
+  LUNA_DISCORD_CHAT_BOT_IDS        Optional comma-separated bot user ids; empty = any bot (not self).
+  LUNA_DISCORD_CHAT_DEBUG          1 to log skipped messages and reasons (default 0).
   LUNA_DISCORD_CHAT_DM             1 to also reply to DMs (default 1).
   LUNA_DISCORD_CHAT_COOLDOWN_SEC   Min seconds between Luna replies per channel. Default 4.
   LUNA_DISCORD_TTS                 1 to attach a TTS voice clip of Luna's reply under the
@@ -35,9 +42,12 @@ Env:
                                    per-reply and uploaded as a file; it does NOT play on
                                    the streamer's local speakers (the VRM viewer's TTS is
                                    skipped for Discord-originated messages).
-  LUNA_DISCORD_VOICE_TTS           If 1 (default), after a chat reply Luna also plays the
-                                   same TTS audio in the voice channel she is connected to,
-                                   when VC is idle (no !play music). Users in VC hear her.
+  LUNA_DISCORD_VOICE_TTS           If 1 (default), after a chat reply Luna queues TTS in the
+                                   same voice pipeline as !play (FFmpeg queue; waits behind songs).
+  LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS  Optional comma-separated voice channel ids Luna may join
+                                   to speak when you are not in VC (you are always followed
+                                   into your current voice channel). Empty = only VCs she is
+                                   already connected to.
   Voice context                    When the author is in a voice channel, Luna's model
                                    prompt includes which VC they are in (so she can refer
                                    to it). !join replies also name that channel explicitly.
@@ -47,6 +57,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -81,12 +93,143 @@ def _env_truthy(key: str, default: bool = False) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def _channel_allowed_for_chat(channel_id: int) -> bool:
+def _discord_chat_allowed_channel_ids() -> frozenset[str]:
     raw = (os.environ.get("LUNA_DISCORD_CHAT_CHANNEL_IDS") or "").strip()
     if not raw:
+        return frozenset()
+    return frozenset(s.strip() for s in raw.replace(" ", ",").split(",") if s.strip())
+
+
+def _discord_guild_chat_channel_rules() -> dict[int, frozenset[int]]:
+    """Parse LUNA_DISCORD_GUILD_CHAT_CHANNELS → {guild_id: {channel_id, …}}."""
+    raw = (os.environ.get("LUNA_DISCORD_GUILD_CHAT_CHANNELS") or "").strip()
+    if not raw:
+        return {}
+    rules: dict[int, set[int]] = {}
+    for entry in raw.replace(";", " ").split():
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        guild_s, ch_part = entry.split(":", 1)
+        try:
+            guild_id = int(guild_s.strip())
+        except ValueError:
+            continue
+        ch_ids: set[int] = set()
+        for part in ch_part.replace(" ", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ch_ids.add(int(part))
+            except ValueError:
+                continue
+        if ch_ids:
+            rules[guild_id] = rules.get(guild_id, set()) | ch_ids
+    return {gid: frozenset(cids) for gid, cids in rules.items()}
+
+
+def _channel_id_candidates(channel: Any) -> list[int]:
+    ids = [int(channel.id)]
+    parent = getattr(channel, "parent", None)
+    if parent is not None:
+        ids.append(int(parent.id))
+    return ids
+
+
+def _channel_allowed_for_chat(channel: Any, guild: Any | None) -> bool:
+    """Guild-specific allowlist wins; else optional global allowlist; else all channels."""
+    candidates = _channel_id_candidates(channel)
+    if guild is not None:
+        guild_rules = _discord_guild_chat_channel_rules()
+        allowed = guild_rules.get(int(guild.id))
+        if allowed is not None:
+            return any(cid in allowed for cid in candidates)
+
+    global_allowed = _discord_chat_allowed_channel_ids()
+    if not global_allowed:
         return True
-    allowed = {s.strip() for s in raw.split(",") if s.strip()}
-    return str(channel_id) in allowed
+    return any(str(cid) in global_allowed for cid in candidates)
+
+
+def _discord_chat_debug() -> bool:
+    return _env_truthy("LUNA_DISCORD_CHAT_DEBUG", default=False)
+
+
+def _discord_chat_log(msg: str) -> None:
+    print(f"(discord chat) {msg}", flush=True)
+
+
+def _discord_message_text(message: Any) -> str:
+    """Plain text plus embed title/description (common for bot messages)."""
+    text = (getattr(message, "content", None) or "").strip()
+    if text:
+        return text
+    embeds = getattr(message, "embeds", None) or []
+    parts: list[str] = []
+    for emb in embeds:
+        for bit in (
+            getattr(emb, "title", None),
+            getattr(emb, "description", None),
+            getattr(getattr(emb, "author", None), "name", None),
+        ):
+            if bit and str(bit).strip():
+                parts.append(str(bit).strip())
+    return "\n".join(parts).strip()
+
+
+def _env_id_set(key: str) -> frozenset[int]:
+    raw = (os.environ.get(key) or "").strip()
+    if not raw:
+        return frozenset()
+    out: set[int] = set()
+    for part in raw.replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
+def _voice_tts_allowed(channel_id: int) -> bool:
+    allowed = _env_id_set("LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS")
+    if not allowed:
+        return True
+    return channel_id in allowed
+
+
+def _discord_read_bots_enabled() -> bool:
+    return _env_truthy("LUNA_DISCORD_CHAT_READ_BOTS", default=False)
+
+
+def _discord_bot_allowed(author_id: int) -> bool:
+    allowed = _env_id_set("LUNA_DISCORD_CHAT_BOT_IDS")
+    if not allowed:
+        return True
+    return author_id in allowed
+
+
+def _discord_luna_triggered(content: str, message: Any, bot_user: Any | None) -> bool:
+    """True when the message @-mentions Luna or contains the word luna."""
+    if bot_user is not None and bot_user in (getattr(message, "mentions", None) or []):
+        return True
+    lowered = (content or "").lower()
+    if "luna" in lowered:
+        return True
+    if bot_user is not None:
+        bid = bot_user.id
+        if f"<@{bid}>" in content or f"<@!{bid}>" in content:
+            return True
+    ref = getattr(message, "reference", None)
+    if ref and bot_user is not None:
+        ref_msg = getattr(ref, "resolved", None)
+        ref_author = getattr(ref_msg, "author", None) if ref_msg is not None else None
+        if ref_author is not None and getattr(ref_author, "id", None) == bot_user.id:
+            return True
+    return False
 
 
 def _chunk_discord(text: str, limit: int = _DISCORD_MSG_CHUNK) -> list[str]:
@@ -133,6 +276,7 @@ class Track:
     duration_sec: int | None
     requested_by: str
     uploader: str = ""
+    local_path: str | None = None  # TTS / local file — same FFmpeg path as stream tracks
 
 
 class _GuildPlayer:
@@ -214,67 +358,116 @@ class _GuildPlayer:
                 return
             track = self.queue.popleft()
             self.current = track
-            source = discord.FFmpegPCMAudio(
-                track.stream_url,
-                before_options=_FFMPEG_BEFORE_OPTS,
-                options=_FFMPEG_OPTS,
-            )
+            audio_src = (track.local_path or track.stream_url or "").strip()
+            if not audio_src:
+                asyncio.run_coroutine_threadsafe(self.play_next(), asyncio.get_running_loop())
+                return
+
+            if track.local_path:
+                # Local MP3/WAV from Luna's reply — no stream reconnect flags.
+                source = discord.FFmpegPCMAudio(audio_src, options=_FFMPEG_OPTS)
+            else:
+                source = discord.FFmpegPCMAudio(
+                    audio_src,
+                    before_options=_FFMPEG_BEFORE_OPTS,
+                    options=_FFMPEG_OPTS,
+                )
 
             loop = asyncio.get_running_loop()
+            cleanup_path = track.local_path
 
             def _after(error: BaseException | None) -> None:
                 if error is not None:
                     print(f"(discord) FFmpeg playback error: {error}", flush=True)
+                if cleanup_path:
+                    try:
+                        Path(cleanup_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 asyncio.run_coroutine_threadsafe(self.play_next(), loop)
 
             try:
                 self.voice.play(source, after=_after)  # type: ignore[union-attr]
             except Exception as exc:
                 print(f"(discord) play() failed: {exc}", flush=True)
-                # Try the next track instead of stalling forever.
+                if cleanup_path:
+                    try:
+                        Path(cleanup_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 asyncio.run_coroutine_threadsafe(self.play_next(), loop)
                 return
 
-            await self.bot.announce_now_playing(self.guild_id, track)
+            if track.local_path:
+                print(f"(discord voice) playing TTS: {track.title}", flush=True)
+            else:
+                await self.bot.announce_now_playing(self.guild_id, track)
 
-    async def play_tts_file(self, path: Path) -> bool:
-        """Play a local WAV/MP3 in the connected voice channel when not playing music."""
-        if not _DISCORD_AVAILABLE:
-            return False
-        import discord  # noqa: PLC0415
+    def enqueue_voice_clip(
+        self,
+        path: Path,
+        *,
+        title: str = "Luna (TTS)",
+        own_file: bool = False,
+    ) -> bool:
+        """Queue the reply MP3 on the same FFmpeg path as !play.
 
-        if not self.is_connected or self.voice is None:
-            return False
-        vc = self.voice
-        if vc.is_playing() or vc.is_paused():
-            print("(discord voice tts) skipped — music or audio already playing", flush=True)
-            return False
+        When ``own_file`` is True, the queue deletes ``path`` after playback
+        (the Discord chat attachment uses the same file until then).
+        """
         if not path.is_file() or path.stat().st_size < 32:
             return False
-        loop = asyncio.get_running_loop()
-        done = asyncio.Event()
-
-        def _after(_error: BaseException | None) -> None:
-            loop.call_soon_threadsafe(done.set)
-
-        try:
-            source = discord.FFmpegPCMAudio(
-                str(path),
-                before_options=_FFMPEG_BEFORE_OPTS,
-                options=_FFMPEG_OPTS,
-            )
-            vc.play(source, after=_after)
-        except Exception as exc:  # noqa: BLE001
-            print(f"(discord voice tts) play() failed: {exc}", flush=True)
-            return False
-        try:
-            await asyncio.wait_for(done.wait(), timeout=600.0)
-        except asyncio.TimeoutError:
+        if own_file:
+            dest = str(path.resolve())
+        else:
+            suffix = path.suffix if path.suffix else ".mp3"
+            fd, tmp = tempfile.mkstemp(suffix=suffix, prefix="luna_discord_vc_")
+            os.close(fd)
+            dest_path = Path(tmp)
             try:
-                vc.stop()
-            except Exception:
-                pass
+                shutil.copy2(path, dest_path)
+            except OSError as exc:
+                print(f"(discord voice tts) copy failed: {exc}", flush=True)
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return False
+            dest = str(dest_path)
+        self.add(
+            Track(
+                query=title,
+                title=title,
+                web_url="",
+                stream_url="",
+                duration_sec=None,
+                requested_by="Luna",
+                uploader="TTS",
+                local_path=dest,
+            )
+        )
+        return True
+
+    async def play_voice_clip(
+        self,
+        path: Path,
+        *,
+        title: str = "Luna (TTS)",
+        own_file: bool = False,
+    ) -> bool:
+        """Join/play the reply MP3 via the music queue (waits behind current song if needed)."""
+        if not self.is_connected or self.voice is None:
             return False
+        was_busy = bool(
+            self.voice.is_playing() or self.voice.is_paused()  # type: ignore[union-attr]
+        )
+        if not self.enqueue_voice_clip(path, title=title, own_file=own_file):
+            return False
+        await self.play_next()
+        if was_busy:
+            print(f"(discord voice tts) queued behind current audio ({len(self.queue)} waiting)", flush=True)
+        else:
+            print(f"(discord voice tts) playing reply mp3: {path.name}", flush=True)
         return True
 
 
@@ -364,12 +557,75 @@ class LunaDiscordBot:
             self.players[guild_id] = _GuildPlayer(self, guild_id)
         return self.players[guild_id]
 
-    async def play_reply_tts_in_voice(self, guild_id: int, audio_path: Path) -> None:
-        """Speak a synthesized reply in VC (same file as Discord attachment)."""
-        if not _env_truthy("LUNA_DISCORD_VOICE_TTS", default=True):
-            return
+    def _voice_tts_target_channel(
+        self,
+        guild_id: int,
+        *,
+        member: Any | None = None,
+        guild: Any | None = None,
+    ) -> Any | None:
+        """Pick a voice channel to speak in: speaker's VC first, else bot VC, else configured homes."""
+        import discord  # noqa: PLC0415
+
         player = self._player(guild_id)
-        await player.play_tts_file(audio_path)
+
+        if member is not None:
+            av = getattr(member, "voice", None)
+            ch = getattr(av, "channel", None) if av is not None else None
+            if ch is not None and isinstance(ch, discord.VoiceChannel):
+                return ch
+
+        if player.is_connected and player.voice and player.voice.channel:
+            ch = player.voice.channel
+            if isinstance(ch, discord.VoiceChannel) and _voice_tts_allowed(ch.id):
+                return ch
+
+        allowed = _env_id_set("LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS")
+        if guild is not None and allowed:
+            for cid in allowed:
+                ch = guild.get_channel(cid)
+                if ch is not None and isinstance(ch, discord.VoiceChannel):
+                    return ch
+
+        return None
+
+    async def play_reply_tts_in_voice(
+        self,
+        guild_id: int,
+        audio_path: Path,
+        *,
+        member: Any | None = None,
+        guild: Any | None = None,
+    ) -> bool:
+        """Play the same reply MP3 in VC as !play (returns True if the file was queued)."""
+        if not _env_truthy("LUNA_DISCORD_VOICE_TTS", default=True):
+            return False
+        if not audio_path.is_file():
+            print(f"(discord voice tts) missing mp3: {audio_path}", flush=True)
+            return False
+
+        player = self._player(guild_id)
+        target = self._voice_tts_target_channel(guild_id, member=member, guild=guild)
+
+        if target is None:
+            allowed = _env_id_set("LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS")
+            if allowed:
+                print(
+                    "(discord voice tts) skipped — join a voice channel or set "
+                    "LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS to a channel Luna can join",
+                    flush=True,
+                )
+            return False
+
+        if not await player.ensure_voice(target):
+            print("(discord voice tts) could not join voice channel", flush=True)
+            return False
+        name = getattr(target, "name", target.id)
+        print(f"(discord voice tts) joining #{name} — playing message mp3 in VC", flush=True)
+        ok = await player.play_voice_clip(audio_path, own_file=True)
+        if not ok:
+            print("(discord voice tts) could not queue reply mp3", flush=True)
+        return ok
 
     def _announce_text_channel(self, guild: Any) -> Any | None:
         import discord  # noqa: PLC0415
@@ -529,43 +785,64 @@ class LunaDiscordBot:
 
         @bot.event
         async def on_message(message: "discord.Message") -> None:
-            # Ignore our own messages and other bots so we never loop on
-            # bot-to-bot chatter.
-            if message.author.bot:
+            me = bot.user
+            is_self_bot = bool(me) and message.author.id == me.id
+            if is_self_bot:
                 return
-            # Always let the command framework see the message first so
-            # !play / !join / !skip etc. keep working.
-            await bot.process_commands(message)
 
-            content = (message.content or "").strip()
+            from_other_bot = bool(message.author.bot)
+            if from_other_bot:
+                if not _discord_read_bots_enabled():
+                    return
+                if not _discord_bot_allowed(message.author.id):
+                    return
+            else:
+                # Let the command framework see human messages first (!play / !join / …).
+                await bot.process_commands(message)
+
+            content = _discord_message_text(message)
+            ch_name = getattr(message.channel, "name", message.channel.id)
             if not content:
+                if _discord_chat_debug():
+                    _discord_chat_log(f"skip #{ch_name}: empty message (no text/embed)")
                 return
             if content.startswith(outer._prefix):
                 return
             if outer._chat_handler is None:
+                _discord_chat_log("skip: chat handler not wired")
                 return
             if not _env_truthy("LUNA_DISCORD_CHAT", default=True):
                 return
 
             is_dm = message.guild is None
             if is_dm:
+                if from_other_bot:
+                    return
                 if not _env_truthy("LUNA_DISCORD_CHAT_DM", default=True):
                     return
                 channel_label = "DM"
             else:
-                if not _channel_allowed_for_chat(message.channel.id):
+                if not _channel_allowed_for_chat(message.channel, message.guild):
+                    if _discord_chat_debug():
+                        parent = getattr(message.channel, "parent", None)
+                        pid = f" (thread parent {parent.id})" if parent else ""
+                        gname = getattr(message.guild, "name", message.guild.id)
+                        _discord_chat_log(
+                            f"skip #{ch_name}{pid} in {gname!r}: channel id {message.channel.id} "
+                            "not allowed for this server (see LUNA_DISCORD_GUILD_CHAT_CHANNELS)"
+                        )
                     return
-                channel_label = f"#{getattr(message.channel, 'name', message.channel.id)}"
+                channel_label = f"#{ch_name}"
 
-            # Trigger gate: "all" answers everything, "mention" needs an explicit
-            # ping or the word "luna" in the message.
+            # Trigger: humans honor TRIGGER=all|mention; other bots always need @Luna / "luna".
             trigger = (os.environ.get("LUNA_DISCORD_CHAT_TRIGGER") or "mention").strip().lower()
-            if not is_dm and trigger != "all":
-                me = bot.user
-                mentioned = bool(me) and me in (message.mentions or [])
-                lowered = content.lower()
-                name_hit = "luna" in lowered
-                if not (mentioned or name_hit):
+            if from_other_bot or (not is_dm and trigger != "all"):
+                if not _discord_luna_triggered(content, message, me):
+                    if _discord_chat_debug():
+                        _discord_chat_log(
+                            f"skip #{ch_name}: need @Luna or 'luna' in text "
+                            f"(LUNA_DISCORD_CHAT_TRIGGER={trigger})"
+                        )
                     return
 
             # Per-channel cooldown.
@@ -576,14 +853,21 @@ class LunaDiscordBot:
             now = time.time()
             last = outer._chat_last_reply_ts.get(message.channel.id, 0.0)
             if cooldown > 0 and (now - last) < cooldown:
+                if _discord_chat_debug():
+                    _discord_chat_log(f"skip #{ch_name}: cooldown ({cooldown}s)")
                 return
 
             lock = outer._chat_lock(message.channel.id)
             if lock.locked():
+                if _discord_chat_debug():
+                    _discord_chat_log(f"skip #{ch_name}: already generating a reply")
                 return
             async with lock:
                 outer._chat_last_reply_ts[message.channel.id] = time.time()
                 author_name = getattr(message.author, "display_name", None) or str(message.author)
+                if from_other_bot:
+                    author_name = f"{author_name} (Discord bot)"
+                _discord_chat_log(f"replying in {channel_label} to {author_name}")
                 voice_channel_label: str | None = None
                 if not is_dm and message.author:
                     av = getattr(message.author, "voice", None)
@@ -597,6 +881,7 @@ class LunaDiscordBot:
                             discord_channel_label=channel_label,
                             is_dm=is_dm,
                             voice_channel_label=voice_channel_label,
+                            author_is_bot=from_other_bot,
                         )
                 except Exception as exc:  # noqa: BLE001
                     print(f"(discord chat) handler error: {exc}", flush=True)
@@ -614,8 +899,14 @@ class LunaDiscordBot:
                 else:
                     reply = result or ""
 
+                if not (reply or "").strip():
+                    _discord_chat_log(f"no reply generated for {author_name} (Ollama empty?)")
+                    return
+
+                vc_owns_mp3 = False
                 try:
                     await outer._send_reply_with_audio(message.channel, reply, audio_path)
+                    _discord_chat_log(f"sent reply in {channel_label} ({len(reply)} chars)")
                     if (
                         not is_dm
                         and message.guild is not None
@@ -623,11 +914,16 @@ class LunaDiscordBot:
                         and audio_path.exists()
                     ):
                         try:
-                            await outer.play_reply_tts_in_voice(message.guild.id, audio_path)
+                            vc_owns_mp3 = await outer.play_reply_tts_in_voice(
+                                message.guild.id,
+                                audio_path,
+                                member=message.author,
+                                guild=message.guild,
+                            )
                         except Exception as exc:  # noqa: BLE001
                             print(f"(discord voice tts) {exc}", flush=True)
                 finally:
-                    if audio_path is not None:
+                    if audio_path is not None and not vc_owns_mp3:
                         try:
                             audio_path.unlink(missing_ok=True)
                         except OSError:
@@ -649,6 +945,70 @@ class LunaDiscordBot:
                 print("(discord) servers visible:", flush=True)
                 for g in guilds:
                     print(f"(discord)   - {g.name!r} id={g.id}", flush=True)
+            global_allowed = _discord_chat_allowed_channel_ids()
+            guild_rules = _discord_guild_chat_channel_rules()
+            trigger = (os.environ.get("LUNA_DISCORD_CHAT_TRIGGER") or "mention").strip().lower()
+            read_bots = _discord_read_bots_enabled()
+            if not _env_truthy("LUNA_DISCORD_CHAT", default=True):
+                print("(discord chat) OFF (LUNA_DISCORD_CHAT=0)", flush=True)
+            else:
+                import discord as _discord  # noqa: PLC0415
+
+                if global_allowed:
+                    scope = f"global allowlist ({len(global_allowed)} channel id(s))"
+                elif guild_rules:
+                    scope = "all servers except per-guild rules below"
+                else:
+                    scope = "ALL readable text channels in every server"
+                print(
+                    f"(discord chat) {scope} | trigger={trigger} | read_bots={read_bots}",
+                    flush=True,
+                )
+
+                async def _log_channel(cid: int, label: str) -> None:
+                    ch = bot.get_channel(cid)
+                    if ch is None:
+                        try:
+                            ch = await bot.fetch_channel(cid)
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"(discord chat)   - {label} id={cid}: not visible ({exc})", flush=True)
+                            return
+                    name = getattr(ch, "name", cid)
+                    guild_name = getattr(getattr(ch, "guild", None), "name", "?")
+                    perms = None
+                    if getattr(ch, "guild", None) is not None:
+                        perms = ch.permissions_for(ch.guild.me)
+                    can_read = getattr(perms, "read_messages", True) if perms else True
+                    can_send = getattr(perms, "send_messages", True) if perms else True
+                    kind = "thread" if isinstance(ch, _discord.Thread) else type(ch).__name__
+                    print(
+                        f"(discord chat)   - {label} #{name} id={cid} ({guild_name}) "
+                        f"read={can_read} send={can_send} [{kind}]",
+                        flush=True,
+                    )
+
+                for cid_s in sorted(global_allowed):
+                    try:
+                        await _log_channel(int(cid_s), "global")
+                    except ValueError:
+                        print(f"(discord chat)   - invalid global id {cid_s!r}", flush=True)
+
+                for gid, ch_set in sorted(guild_rules.items()):
+                    g = bot.get_guild(gid)
+                    gname = g.name if g is not None else str(gid)
+                    print(
+                        f"(discord chat)   server {gname!r} id={gid}: "
+                        f"{len(ch_set)} channel(s) only",
+                        flush=True,
+                    )
+                    for cid in sorted(ch_set):
+                        await _log_channel(cid, f"{gname}")
+
+                print(
+                    "(discord chat) tip: @Luna or include 'luna' in each message; "
+                    "set LUNA_DISCORD_CHAT_DEBUG=1 to log skips",
+                    flush=True,
+                )
             guild_id = _int_env("DISCORD_VOICE_GUILD_ID")
             channel_id = _int_env("DISCORD_VOICE_CHANNEL_ID")
             if guild_id and channel_id:

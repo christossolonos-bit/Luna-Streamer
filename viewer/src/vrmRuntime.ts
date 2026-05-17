@@ -51,6 +51,8 @@ export class VrmRuntime {
   /** At dismiss: co-host root minus Luna root (world), so re-summon can place Viktor without moving Luna. */
   private readonly _savedCohostOffsetFromLuna = new THREE.Vector3();
   private _haveSavedCohostRelativePlacement = false;
+  /** Viktor answering Twitch/YouTube while Luna solo — temporary on-screen takeover. */
+  private _chatReplyTakeover = false;
   private static readonly CAMERA_ORBIT_PHI_PER_PX = 0.005;
   private static readonly CAMERA_ORBIT_PHI_MIN = 0.12;
   private static readonly CAMERA_ORBIT_PHI_MAX = Math.PI - 0.12;
@@ -908,6 +910,53 @@ export class VrmRuntime {
     this._lipJawSmoothed = 0;
     this.activeAvatar = speaker;
     this._captureJawRestPose();
+  }
+
+  /** Twitch/YouTube @Viktor reply — load his VRM and lip-sync even when dismissed from scene. */
+  async prepareCohostChatReply(vrmUrl?: string): Promise<void> {
+    const url = (vrmUrl || "").trim();
+    if (!this.cohostVrm && url) {
+      await this.loadCohostVrmFromUrl(url, "cohost.vrm", { enableLayout: false });
+    }
+    if (!this.cohostVrm) return;
+
+    if (getCohostSoloMode()) {
+      this._chatReplyTakeover = true;
+      if (this.vrm) this.vrm.scene.visible = false;
+      this.cohostVrm.scene.visible = true;
+      if (this.vrm) {
+        this.cohostVrm.scene.position.copy(this.vrm.scene.position);
+      }
+      this._orientAvatarTowardCamera(this.cohostVrm);
+      this.activeAvatar = "cohost";
+      this._captureJawRestPose();
+      this.cb.onSceneStatus("Viktor (Twitch/YouTube chat reply)");
+      return;
+    }
+
+    await this.enableDualCohostLayout(url || undefined);
+    this.setActiveSpeaker("cohost");
+  }
+
+  /** After Viktor chat TTS — hide temporary takeover or hand lip-sync back to Luna. */
+  finishCohostChatReply(): void {
+    if (this._chatReplyTakeover) {
+      this._chatReplyTakeover = false;
+      if (this.cohostVrm) {
+        this._resetMouth(this.cohostVrm);
+        this.cohostVrm.scene.visible = false;
+      }
+      if (this.vrm) {
+        this.vrm.scene.visible = true;
+        this.activeAvatar = "luna";
+        this._captureJawRestPose();
+        this.cb.onSceneStatus("Luna solo — summon co-host when you want them back");
+      }
+      return;
+    }
+    if (this.dualLayoutEnabled && this.activeAvatar === "cohost") {
+      this.setActiveSpeaker("luna");
+    }
   }
 
   /** @deprecated use enableDualCohostLayout + setActiveSpeaker */

@@ -6,15 +6,58 @@ import os
 
 
 def creator_display_name() -> str:
-    """Human name Luna/Viktor should use for the streamer."""
+    """Human name Luna/Viktor should use for the streamer / owner."""
     for key in ("LUNA_CREATOR_NAME", "LUNA_STREAMER_NAME", "STREAMER_NAME"):
         raw = (os.environ.get(key) or "").strip()
         if raw:
             return raw
+    owner_login = (os.environ.get("LUNA_OWNER_TWITCH_LOGIN") or "").strip()
+    if owner_login:
+        return owner_login
     ch = (os.environ.get("TWITCH_CHANNEL") or "").strip().lstrip("#")
     if ch:
         return ch
     return "Creator"
+
+
+def creator_twitch_logins() -> set[str]:
+    """Twitch logins that are the owner (channel + explicit owner login + aliases)."""
+    out: set[str] = set()
+    ch = (os.environ.get("TWITCH_CHANNEL") or "").strip().lstrip("#").lower()
+    if ch:
+        out.add(ch)
+    owner = (os.environ.get("LUNA_OWNER_TWITCH_LOGIN") or "").strip().lower()
+    if owner:
+        out.add(owner)
+    for key in ("LUNA_CREATOR_NAME", "LUNA_STREAMER_NAME", "STREAMER_NAME"):
+        raw = (os.environ.get(key) or "").strip().lower()
+        if raw:
+            out.add(raw)
+    extras = (os.environ.get("LUNA_CREATOR_ALIASES") or "").strip()
+    for part in extras.replace(",", " ").split():
+        p = part.strip().lower()
+        if p:
+            out.add(p)
+    bulk = (os.environ.get("LUNA_CREATOR_TWITCH_LOGINS") or "").strip()
+    for part in bulk.replace(",", " ").split():
+        p = part.strip().lower()
+        if p:
+            out.add(p)
+    return out
+
+
+def is_creator_twitch_login(login: str) -> bool:
+    h = (login or "").strip().lower()
+    return bool(h) and h in creator_twitch_logins()
+
+
+def is_creator_twitch_display(display_name: str) -> bool:
+    d = (display_name or "").strip().lower()
+    if not d:
+        return False
+    if d == creator_display_name().strip().lower():
+        return True
+    return d in creator_twitch_logins()
 
 
 def _creator_aliases() -> set[str]:
@@ -71,8 +114,8 @@ def creator_chat_system_block(*, name: str | None = None) -> str:
     """Injected into Luna/Viktor system prompts when the creator is speaking."""
     n = (name or creator_display_name()).strip() or "Creator"
     return (
-        "## Your creator is speaking\n"
-        f"**{n}** is your creator — the streamer who built and runs you. "
+        "## Your owner is speaking\n"
+        f"**{n}** is your **owner and creator** — the streamer who built and runs you. "
         "They are talking to you **directly** on the local viewer (typed chat or their enrolled mic), "
         "not anonymous Twitch/YouTube chat.\n"
         "- Acknowledge that it is them when it fits (use their name; warm and in-character, not cringe worship).\n"

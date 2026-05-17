@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 _DEFAULT_NAME = "Viktor"
@@ -28,8 +29,118 @@ def cohost_chat_personas_enabled() -> bool:
     """When True with :func:`cohost_enabled`, Twitch / YouTube chat auto-replies may be Luna or the co-host."""
     if not cohost_enabled():
         return False
-    raw = (os.environ.get("LUNA_COHOST_CHAT_PERSONAS") or "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    raw = (os.environ.get("LUNA_COHOST_CHAT_PERSONAS") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def cohost_name_aliases() -> list[str]:
+    """Lowercase names that count as addressing the co-host in chat."""
+    names: list[str] = []
+    primary = cohost_name().strip().lower()
+    if primary:
+        names.append(primary)
+    extras = (os.environ.get("LUNA_COHOST_CHAT_ALIASES") or "").strip()
+    for part in extras.replace(",", " ").split():
+        p = part.strip().lower()
+        if p and p not in names:
+            names.append(p)
+    return names
+
+
+def _name_mention_index(text: str, name: str) -> int | None:
+    """Start index of a whole-word / @mention hit, or None."""
+    n = (name or "").strip().lower()
+    if not n or not text:
+        return None
+    pat = rf"(?:^|(?<=[^a-z0-9_]))@?{re.escape(n)}(?=[^a-z0-9_]|$)"
+    m = re.search(pat, text.lower())
+    return m.start() if m else None
+
+
+def chat_directed_at_cohost(text: str) -> bool:
+    return any(_name_mention_index(text, n) is not None for n in cohost_name_aliases())
+
+
+def chat_directed_at_luna(text: str) -> bool:
+    return _name_mention_index(text, "luna") is not None
+
+
+def twitch_message_addressees(text: str, *, trigger_all: bool = False) -> list[str]:
+    """Who should each answer this Twitch line separately (may be both)."""
+    at_luna = chat_directed_at_luna(text)
+    at_cohost = cohost_enabled() and chat_directed_at_cohost(text)
+    if at_luna and at_cohost:
+        l_idx = _name_mention_index(text, "luna")
+        c_idx = min(
+            (i for n in cohost_name_aliases() if (i := _name_mention_index(text, n)) is not None),
+            default=10**9,
+        )
+        if l_idx is not None and (c_idx == 10**9 or l_idx <= c_idx):
+            return ["luna", "cohost"]
+        return ["cohost", "luna"]
+    if at_cohost:
+        return ["cohost"]
+    if at_luna:
+        return ["luna"]
+    if trigger_all:
+        return ["luna"]
+    return []
+
+
+def twitch_speaker_system_note(*, chatter: str, message: str, speaker: str) -> str:
+    """Context for who the Twitch line is for — not a fake chat user turn."""
+    from luna_twitch_user import profile_from_login, twitch_chatter_system_note
+
+    profile = profile_from_login(chatter)
+    return twitch_chatter_system_note(
+        profile=profile,
+        message=message,
+        speaker=speaker,
+        cohost_name=cohost_name(),
+    )
+
+
+def resolve_chat_reply_speaker(text: str, *, cohost_in_scene: bool = True) -> str:
+    """Return ``luna`` or ``cohost`` for who should answer this chat line.
+
+  Explicit @Viktor (or co-host aliases) always routes to the co-host, even when dismissed
+    from the VRM viewer or when ``LUNA_COHOST_CHAT_PERSONAS=0``. Random/alternate routing
+    only applies when neither name is clearly targeted.
+    """
+    import random
+
+    if not cohost_enabled():
+        return "luna"
+
+    at_cohost = chat_directed_at_cohost(text)
+    at_luna = chat_directed_at_luna(text)
+
+    if at_cohost and not at_luna:
+        return "cohost"
+    if at_luna and not at_cohost:
+        return "luna"
+
+    if at_cohost and at_luna:
+        c_idx = min(
+            (i for n in cohost_name_aliases() if (i := _name_mention_index(text, n)) is not None),
+            default=10**9,
+        )
+        l_idx = _name_mention_index(text, "luna")
+        if c_idx < (l_idx if l_idx is not None else 10**9):
+            return "cohost"
+        return "luna"
+
+    if not cohost_chat_personas_enabled() or not cohost_in_scene:
+        return "luna"
+
+    mode = (os.environ.get("LUNA_COHOST_CHAT_SPEAKER") or "random").strip().lower()
+    if mode in ("luna", "luna_only"):
+        return "luna"
+    if mode in ("cohost", "viktor", "cohost_only", "vampire"):
+        return "cohost"
+    if mode == "alternate":
+        return "cohost" if random.random() < 0.5 else "luna"
+    return "cohost" if random.random() < 0.5 else "luna"
 
 
 def cohost_name() -> str:
