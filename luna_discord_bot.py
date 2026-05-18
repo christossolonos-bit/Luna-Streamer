@@ -36,6 +36,13 @@ Env:
   LUNA_DISCORD_CHAT_BOT_IDS        Optional comma-separated bot user ids; empty = any bot (not self).
   LUNA_DISCORD_CHAT_DEBUG          1 to log skipped messages and reasons (default 0).
   LUNA_DISCORD_CHAT_DM             1 to also reply to DMs (default 1).
+  LUNA_DISCORD_WELCOME             1 to greet new members (default 1 when channel id set).
+  LUNA_DISCORD_WELCOME_CHANNEL_ID  Text channel id for join messages (requires Members intent).
+  LUNA_DISCORD_WELCOME_GUILD_ID    Optional server id; empty = infer from channel.
+  LUNA_DISCORD_WELCOME_MESSAGE     Template with {mention} {user} {server} {username}.
+  LUNA_DISCORD_WELCOME_CHECK_ON_READY  If 1 (default), scan for today's joins on startup.
+  LUNA_DISCORD_WELCOME_TODAY_SUMMARY   If 1 (default), post one daily list in the welcome channel.
+  LUNA_DISCORD_WELCOME_STATE_PATH      JSON file tracking who was already welcomed.
   LUNA_DISCORD_CHAT_COOLDOWN_SEC   Min seconds between Luna replies per channel. Default 4.
   LUNA_DISCORD_TTS                 1 to attach a TTS voice clip of Luna's reply under the
                                    text in Discord chat (default 1). The clip is generated
@@ -48,6 +55,7 @@ Env:
                                    to speak when you are not in VC (you are always followed
                                    into your current voice channel). Empty = only VCs she is
                                    already connected to.
+  LUNA_DISCORD_VOICE_TTS_PAD_SEC     Extra seconds after VC TTS ends (like viewer pad; default 1.5).
   Voice context                    When the author is in a voice channel, Luna's model
                                    prompt includes which VC they are in (so she can refer
                                    to it). !join replies also name that channel explicitly.
@@ -56,12 +64,15 @@ Env:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -78,6 +89,44 @@ from youtube_audio import resolve_track, short_status_line
 
 _FFMPEG_BEFORE_OPTS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 _FFMPEG_OPTS = "-vn"
+_FFMPEG_LOCAL_BEFORE = "-nostdin"
+_FFMPEG_LOCAL_OPTS = "-vn -loglevel quiet"
+
+
+def _probe_media_duration_sec(path: Path) -> float:
+    """Length of a local audio file (ffprobe), for full Discord VC playback."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not path.is_file():
+        return 0.0
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return max(0.0, float(proc.stdout.strip()))
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        pass
+    return 0.0
+
+
+def _discord_voice_tts_pad_sec() -> float:
+    try:
+        return max(0.0, float(os.environ.get("LUNA_DISCORD_VOICE_TTS_PAD_SEC", "1.5") or "1.5"))
+    except ValueError:
+        return 1.5
 
 # Discord hard cap is 2000 chars per message; leave a little headroom.
 _DISCORD_MSG_CHUNK = 1900
@@ -210,6 +259,114 @@ def _discord_bot_allowed(author_id: int) -> bool:
     if not allowed:
         return True
     return author_id in allowed
+
+
+def _discord_welcome_channel_id() -> int | None:
+    raw = (os.environ.get("LUNA_DISCORD_WELCOME_CHANNEL_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _discord_welcome_guild_id() -> int | None:
+    raw = (os.environ.get("LUNA_DISCORD_WELCOME_GUILD_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _discord_welcome_enabled() -> bool:
+    if not _discord_welcome_channel_id():
+        return False
+    return _env_truthy("LUNA_DISCORD_WELCOME", default=True)
+
+
+def _format_discord_welcome(member: Any) -> str:
+    guild = getattr(member, "guild", None)
+    server = getattr(guild, "name", "the server") if guild is not None else "the server"
+    template = (
+        os.environ.get("LUNA_DISCORD_WELCOME_MESSAGE")
+        or "Welcome to **{server}**, {mention}! I'm Luna — glad you made it. 🐺"
+    ).strip()
+    display = getattr(member, "display_name", None) or getattr(member, "name", "friend")
+    return template.format(
+        mention=getattr(member, "mention", display),
+        user=display,
+        server=server,
+        username=getattr(member, "name", display),
+    )
+
+
+_welcome_state_lock = asyncio.Lock()
+
+
+def _welcome_state_path() -> Path:
+    raw = (os.environ.get("LUNA_DISCORD_WELCOME_STATE_PATH") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parent / "data" / "discord_welcome_state.json"
+
+
+def _load_welcome_state() -> dict[str, Any]:
+    path = _welcome_state_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_welcome_state(state: dict[str, Any]) -> None:
+    path = _welcome_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _local_today() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _member_joined_local_today(member: Any) -> bool:
+    joined = getattr(member, "joined_at", None)
+    if joined is None:
+        return False
+    try:
+        return joined.astimezone().date().isoformat() == _local_today()
+    except (ValueError, OSError):
+        return False
+
+
+def _guild_welcome_bucket(state: dict[str, Any], guild_id: int) -> dict[str, Any]:
+    key = str(guild_id)
+    bucket = state.get(key)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        state[key] = bucket
+    welcomed = bucket.get("welcomed_user_ids")
+    if not isinstance(welcomed, list):
+        bucket["welcomed_user_ids"] = []
+    return bucket
+
+
+def _was_welcomed(state: dict[str, Any], guild_id: int, user_id: int) -> bool:
+    bucket = _guild_welcome_bucket(state, guild_id)
+    return str(user_id) in bucket.get("welcomed_user_ids", [])
+
+
+def _mark_welcomed_in_state(state: dict[str, Any], guild_id: int, user_id: int) -> None:
+    bucket = _guild_welcome_bucket(state, guild_id)
+    ids: list[str] = bucket["welcomed_user_ids"]  # type: ignore[assignment]
+    uid = str(user_id)
+    if uid not in ids:
+        ids.append(uid)
 
 
 def _discord_luna_triggered(content: str, message: Any, bot_user: Any | None) -> bool:
@@ -347,6 +504,63 @@ class _GuildPlayer:
         if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
             self.voice.stop()
 
+    async def _wait_local_clip_finished(
+        self,
+        *,
+        path: Path | None,
+        duration_sec: float,
+    ) -> None:
+        """Hold the queue until the reply MP3 has had time to finish (viewer-style pad)."""
+        pad = _discord_voice_tts_pad_sec()
+        probed = _probe_media_duration_sec(path) if path and path.is_file() else 0.0
+        min_play = max(duration_sec, probed, 0.5)
+        target = min(300.0, max(6.0, min_play + pad))
+        deadline = time.monotonic() + target + 8.0
+        seen_playing = False
+        play_start = 0.0
+
+        while time.monotonic() < deadline:
+            vc = self.voice
+            playing = bool(vc and (vc.is_playing() or vc.is_paused()))
+            if playing:
+                if not seen_playing:
+                    play_start = time.monotonic()
+                seen_playing = True
+            elif seen_playing:
+                elapsed = time.monotonic() - play_start
+                if elapsed >= min_play * 0.9:
+                    break
+            await asyncio.sleep(0.12)
+
+        if seen_playing and play_start > 0:
+            remaining = min_play - (time.monotonic() - play_start)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+        await asyncio.sleep(pad)
+
+    async def _finish_local_playback(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        track: Track,
+        cleanup_path: str | None,
+        error: BaseException | None,
+    ) -> None:
+        if error is not None:
+            print(f"(discord voice tts) FFmpeg ended: {error}", flush=True)
+        path = Path(cleanup_path) if cleanup_path else None
+        dur = float(track.duration_sec or 0)
+        try:
+            await self._wait_local_clip_finished(path=path, duration_sec=dur)
+        except Exception as exc:  # noqa: BLE001
+            print(f"(discord voice tts) wait failed: {exc}", flush=True)
+        if cleanup_path:
+            try:
+                Path(cleanup_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        asyncio.run_coroutine_threadsafe(self.play_next(), loop)
+
     async def play_next(self) -> None:
         async with self._advance_lock:
             if not self.is_connected:
@@ -364,8 +578,12 @@ class _GuildPlayer:
                 return
 
             if track.local_path:
-                # Local MP3/WAV from Luna's reply — no stream reconnect flags.
-                source = discord.FFmpegPCMAudio(audio_src, options=_FFMPEG_OPTS)
+                # Local MP3/WAV from Luna's reply — full file, no stream reconnect flags.
+                source = discord.FFmpegPCMAudio(
+                    audio_src,
+                    before_options=_FFMPEG_LOCAL_BEFORE,
+                    options=_FFMPEG_LOCAL_OPTS,
+                )
             else:
                 source = discord.FFmpegPCMAudio(
                     audio_src,
@@ -375,19 +593,28 @@ class _GuildPlayer:
 
             loop = asyncio.get_running_loop()
             cleanup_path = track.local_path
+            is_local_tts = bool(track.local_path)
 
-            def _after(error: BaseException | None) -> None:
-                if error is not None:
-                    print(f"(discord) FFmpeg playback error: {error}", flush=True)
-                if cleanup_path:
-                    try:
-                        Path(cleanup_path).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                asyncio.run_coroutine_threadsafe(self.play_next(), loop)
+            if is_local_tts:
+
+                def _after_local(error: BaseException | None) -> None:
+                    asyncio.run_coroutine_threadsafe(
+                        self._finish_local_playback(loop, track, cleanup_path, error),
+                        loop,
+                    )
+
+                after_cb = _after_local
+            else:
+
+                def _after_stream(error: BaseException | None) -> None:
+                    if error is not None:
+                        print(f"(discord) FFmpeg playback error: {error}", flush=True)
+                    asyncio.run_coroutine_threadsafe(self.play_next(), loop)
+
+                after_cb = _after_stream
 
             try:
-                self.voice.play(source, after=_after)  # type: ignore[union-attr]
+                self.voice.play(source, after=after_cb)  # type: ignore[union-attr]
             except Exception as exc:
                 print(f"(discord) play() failed: {exc}", flush=True)
                 if cleanup_path:
@@ -399,7 +626,14 @@ class _GuildPlayer:
                 return
 
             if track.local_path:
-                print(f"(discord voice) playing TTS: {track.title}", flush=True)
+                dur = float(track.duration_sec or 0) or _probe_media_duration_sec(
+                    Path(track.local_path)
+                )
+                print(
+                    f"(discord voice) playing TTS: {track.title}"
+                    + (f" (~{dur:.1f}s)" if dur > 0 else ""),
+                    flush=True,
+                )
             else:
                 await self.bot.announce_now_playing(self.guild_id, track)
 
@@ -434,13 +668,15 @@ class _GuildPlayer:
                     pass
                 return False
             dest = str(dest_path)
+        dur_sec = _probe_media_duration_sec(Path(dest))
+        dur_int = int(round(dur_sec)) if dur_sec > 0 else None
         self.add(
             Track(
                 query=title,
                 title=title,
                 web_url="",
                 stream_url="",
-                duration_sec=None,
+                duration_sec=dur_int,
                 requested_by="Luna",
                 uploader="TTS",
                 local_path=dest,
@@ -480,6 +716,7 @@ class LunaDiscordBot:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
+        intents.members = True  # on_member_join welcomes
         self.bot = dcommands.Bot(command_prefix=prefix, intents=intents)
         self.players: dict[int, _GuildPlayer] = {}
         self._prefix = prefix
@@ -508,6 +745,149 @@ class LunaDiscordBot:
             lock = asyncio.Lock()
             self._chat_locks[channel_id] = lock
         return lock
+
+    async def resolve_welcome_channel(self, guild: Any) -> Any | None:
+        import discord as _discord  # noqa: PLC0415
+
+        cid = _discord_welcome_channel_id()
+        if cid is None or guild is None:
+            return None
+        ch = guild.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await self.bot.fetch_channel(cid)
+            except Exception as exc:  # noqa: BLE001
+                print(f"(discord welcome) fetch_channel({cid}) failed: {exc}", flush=True)
+                return None
+        if not isinstance(ch, _discord.TextChannel):
+            print(f"(discord welcome) channel {cid} is not a text channel", flush=True)
+            return None
+        if int(ch.guild.id) != int(guild.id):
+            return None
+        if not ch.permissions_for(guild.me).send_messages:
+            print(
+                f"(discord welcome) no Send Messages in #{ch.name} ({guild.name})",
+                flush=True,
+            )
+            return None
+        return ch
+
+    async def welcome_member(self, member: Any, *, channel: Any | None = None) -> bool:
+        """Send the welcome line and remember this user was greeted."""
+        if not _discord_welcome_enabled() or getattr(member, "bot", False):
+            return False
+        guild = getattr(member, "guild", None)
+        if guild is None:
+            return False
+        want_guild = _discord_welcome_guild_id()
+        if want_guild is not None and int(guild.id) != want_guild:
+            return False
+        ch = channel or await self.resolve_welcome_channel(guild)
+        if ch is None:
+            return False
+        async with _welcome_state_lock:
+            state = _load_welcome_state()
+            if _was_welcomed(state, int(guild.id), int(member.id)):
+                return False
+        text = _format_discord_welcome(member)
+        try:
+            await ch.send(text[:1900])
+        except Exception as exc:  # noqa: BLE001
+            print(f"(discord welcome) send failed: {exc}", flush=True)
+            return False
+        async with _welcome_state_lock:
+            state = _load_welcome_state()
+            _mark_welcomed_in_state(state, int(guild.id), int(member.id))
+            _save_welcome_state(state)
+        print(
+            f"(discord welcome) greeted {member.display_name} in #{ch.name} ({guild.name})",
+            flush=True,
+        )
+        return True
+
+    async def members_joined_today(self, guild: Any) -> list[Any]:
+        """Return non-bot members whose joined_at is today (local timezone)."""
+        if guild is None:
+            return []
+        try:
+            if int(guild.member_count or 0) > len(guild.members):
+                await guild.chunk()
+        except Exception as exc:  # noqa: BLE001
+            print(f"(discord welcome) member chunk failed: {exc}", flush=True)
+        out: list[Any] = []
+        for member in guild.members:
+            if getattr(member, "bot", False):
+                continue
+            if _member_joined_local_today(member):
+                out.append(member)
+        out.sort(
+            key=lambda m: (
+                getattr(m, "joined_at").timestamp()
+                if getattr(m, "joined_at", None) is not None
+                else 0.0
+            )
+        )
+        return out
+
+    def format_today_joins_message(self, guild: Any, members: list[Any]) -> str:
+        today = _local_today()
+        gname = getattr(guild, "name", "server")
+        if not members:
+            return f"No new members joined **{gname}** today ({today}) — yet."
+        lines = [f"**Joined {gname} today** ({today}) — {len(members)} member(s):"]
+        for m in members:
+            joined = getattr(m, "joined_at", None)
+            at = joined.astimezone().strftime("%H:%M") if joined else "?"
+            lines.append(f"• {m.mention} ({m.display_name}) — {at}")
+        return "\n".join(lines)[:1900]
+
+    async def check_today_joins(
+        self,
+        *,
+        post_summary: bool = True,
+        send_welcomes: bool = True,
+    ) -> list[Any]:
+        """Find members who joined today; welcome any not yet greeted; optional daily list."""
+        if not _discord_welcome_enabled():
+            return []
+        gid = _discord_welcome_guild_id()
+        guild = self.bot.get_guild(gid) if gid else None
+        if guild is None:
+            cid = _discord_welcome_channel_id()
+            if cid:
+                for g in self.bot.guilds:
+                    if g.get_channel(cid) is not None:
+                        guild = g
+                        break
+        if guild is None:
+            print("(discord welcome) guild not found for today-join scan", flush=True)
+            return []
+
+        members = await self.members_joined_today(guild)
+        names = ", ".join(getattr(m, "display_name", str(m)) for m in members) or ["(none)"]
+        print(f"(discord welcome) joined today in {guild.name!r}: {names}", flush=True)
+
+        if send_welcomes:
+            ch = await self.resolve_welcome_channel(guild)
+            for member in members:
+                await self.welcome_member(member, channel=ch)
+
+        if post_summary and _env_truthy("LUNA_DISCORD_WELCOME_TODAY_SUMMARY", default=True):
+            ch = await self.resolve_welcome_channel(guild)
+            if ch is not None:
+                async with _welcome_state_lock:
+                    state = _load_welcome_state()
+                    bucket = _guild_welcome_bucket(state, int(guild.id))
+                    if bucket.get("last_summary_date") == _local_today():
+                        return members
+                    bucket["last_summary_date"] = _local_today()
+                    _save_welcome_state(state)
+                try:
+                    await ch.send(self.format_today_joins_message(guild, members))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"(discord welcome) today summary failed: {exc}", flush=True)
+
+        return members
 
     async def _send_reply_with_audio(
         self,
@@ -930,6 +1310,10 @@ class LunaDiscordBot:
                             pass
 
         @bot.event
+        async def on_member_join(member: "discord.Member") -> None:
+            await outer.welcome_member(member)
+
+        @bot.event
         async def on_ready() -> None:
             user = bot.user
             print(f"(discord) ready as {user} ({user.id if user else '?'})", flush=True)
@@ -1009,6 +1393,29 @@ class LunaDiscordBot:
                     "set LUNA_DISCORD_CHAT_DEBUG=1 to log skips",
                     flush=True,
                 )
+            if _discord_welcome_enabled():
+                cid = _discord_welcome_channel_id()
+                gid = _discord_welcome_guild_id()
+                print(
+                    f"(discord welcome) ON — channel id={cid}"
+                    + (f" guild id={gid}" if gid else " (any guild with that channel)"),
+                    flush=True,
+                )
+                print(
+                    "(discord welcome) requires Server Members Intent in the Developer Portal",
+                    flush=True,
+                )
+                if _env_truthy("LUNA_DISCORD_WELCOME_CHECK_ON_READY", default=True):
+
+                    async def _scan_today_joins() -> None:
+                        try:
+                            await bot.wait_until_ready()
+                            await asyncio.sleep(8.0)
+                            await outer.check_today_joins()
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"(discord welcome) today-join scan failed: {exc}", flush=True)
+
+                    asyncio.create_task(_scan_today_joins(), name="discord-welcome-today-scan")
             guild_id = _int_env("DISCORD_VOICE_GUILD_ID")
             channel_id = _int_env("DISCORD_VOICE_CHANNEL_ID")
             if guild_id and channel_id:
@@ -1042,6 +1449,20 @@ class LunaDiscordBot:
                     )
                 else:
                     print(f"(discord) auto-joined #{ch.name} in {guild.name!r}", flush=True)
+
+        @bot.command(name="joins_today", aliases=["joined_today", "joinstoday"])
+        async def cmd_joins_today(ctx: dcommands.Context) -> None:
+            if ctx.guild is None:
+                await ctx.reply("Use this in a server.")
+                return
+            gid = _discord_welcome_guild_id()
+            if gid is not None and int(ctx.guild.id) != gid:
+                await ctx.reply("Today-join check is only configured for another server.")
+                return
+            await ctx.reply("Checking who joined today…")
+            members = await outer.check_today_joins(post_summary=False, send_welcomes=True)
+            msg = outer.format_today_joins_message(ctx.guild, members)
+            await ctx.reply(msg[:1900])
 
         @bot.command(name="join")
         async def cmd_join(ctx: dcommands.Context) -> None:

@@ -86,9 +86,13 @@ Environment (or use CLI flags where noted):
   DISCORD_TEXT_CHANNEL_ID   Optional. Text channel for now-playing announcements (else first channel the bot can write in).
   LUNA_DISCORD_VOICE_TTS    If 1 (default), play Luna's Discord reply TTS in the connected VC when idle (see luna_discord_bot.py).
   LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS  Optional allowlist of voice channel ids for VC TTS (empty = any VC).
+  LUNA_DISCORD_VOICE_TTS_PAD_SEC     Extra seconds after VC reply audio (default 1.5; like viewer pad).
   LUNA_DISCORD_GUILD_CHAT_CHANNELS  Per-server text channel allowlists (guild_id:channel_id, …).
   LUNA_DISCORD_CHAT_READ_BOTS  If 1, reply to other bots (must @Luna / say luna).
   LUNA_DISCORD_CHAT_BOT_IDS    Optional allowlist of bot user ids (empty = any bot except Luna herself).
+  LUNA_DISCORD_WELCOME         If 1, post LUNA_DISCORD_WELCOME_MESSAGE when someone joins (Members intent).
+  LUNA_DISCORD_WELCOME_CHANNEL_ID  Text channel for join welcomes.
+  LUNA_DISCORD_WELCOME_GUILD_ID    Optional guild id filter.
   LUNA_COHOST_BANTER        If 1, idle Luna ↔ vampire co-host banter (vampire_cohost.py / luna_cohost_banter.py).
   LUNA_COHOST_NAME          Display name (default Viktor). LUNA_COHOST_VRM path (default aichris.vrm). LUNA_COHOST_EDGE_VOICE.
   LUNA_COHOST_CHAT_PERSONAS If 1 (with BANTER=1), auto-replies to Twitch / YouTube chat may be Luna or the co-host (see LUNA_COHOST_CHAT_SPEAKER).
