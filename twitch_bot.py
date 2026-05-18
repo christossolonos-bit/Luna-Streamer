@@ -12,7 +12,7 @@ Environment (or use CLI flags where noted):
   TWITCH_SEND_REPLIES  If "1", post model replies to chat (needs chat:write on token)
   TWITCH_AUTO_REPLY    If "1", generate replies from regular chat messages
   TWITCH_AUTO_TRIGGER  "mention" (default) or "all"
-  TWITCH_AUTO_COOLDOWN Seconds between auto replies (default 6)
+  TWITCH_AUTO_COOLDOWN Seconds between auto replies after TTS finishes (default 6)
   TWITCH_SYSTEM  Optional extra system prompt (in addition to --system). Can stay short if you use ``ollama create`` with a Modelfile (see ollama/Modelfile.luna) to bake persona into OLLAMA_MODEL.
   LUNA_PERSONA    Character depth (see luna_persona.py; merged with TWITCH_SYSTEM + LUNA_VOICE_RULES).
   LUNA_VOICE_RULES  Anti–stream-bot rules (default bans pack/tail-wag/stream filler unless user mentions them).
@@ -509,6 +509,8 @@ class LunaTwitchBot(commands.Bot):
         self._viewer_cohost_in_scene = load_cohost_in_scene(default=False)
         self._cohost_banter_task: asyncio.Task[None] | None = None
         self._public_chat_reply_depth = 0
+        # One public-chat reply (incl. viewer TTS) at a time — next message waits.
+        self._public_chat_serial_lock = asyncio.Lock()
         if _env_truthy("LUNA_CHAT_MEMORY_RESET", default=False):
             self._memory.clear()
             self._persist_memory_to_disk()
@@ -649,9 +651,18 @@ class LunaTwitchBot(commands.Bot):
             await asyncio.wait_for(self._viewer_tts_done.wait(), timeout=timeout_sec)
         except asyncio.TimeoutError:
             print(
-                f"(tts) viewer playback wait timed out after {timeout_sec:.1f}s — continuing",
+                f"(tts) viewer playback wait timed out after {timeout_sec:.1f}s — "
+                "still blocking next chat message until event or retry",
                 flush=True,
             )
+            # Give the viewer a little more time before releasing the serial lock.
+            try:
+                await asyncio.wait_for(self._viewer_tts_done.wait(), timeout=timeout_sec)
+            except asyncio.TimeoutError:
+                print(
+                    f"(tts) viewer playback still not finished after {timeout_sec * 2:.1f}s — continuing",
+                    flush=True,
+                )
             self._viewer_tts_done.set()
 
     async def _emit_viewer_tts_and_wait(
@@ -1271,23 +1282,24 @@ class LunaTwitchBot(commands.Bot):
                 f"{' then '.join(addressees)} reply separately",
                 flush=True,
             )
-        await self.begin_public_chat_reply_priority()
-        try:
-            for i, speaker in enumerate(addressees):
-                await self._generate_and_dispatch_reply(
-                    channel_name=channel,
-                    author=author,
-                    question=text,
-                    send_to_twitch=True,
-                    source="Twitch chat",
-                    allow_cohost_persona=True,
-                    force_speaker=speaker,
-                    record_user_memory=(i == 0),
-                    update_auto_reply_cooldown=(i == len(addressees) - 1),
-                    chatter_profile=profile,
-                )
-        finally:
-            self.end_public_chat_reply_priority()
+        async with self._public_chat_serial_lock:
+            await self.begin_public_chat_reply_priority()
+            try:
+                for i, speaker in enumerate(addressees):
+                    await self._generate_and_dispatch_reply(
+                        channel_name=channel,
+                        author=author,
+                        question=text,
+                        send_to_twitch=True,
+                        source="Twitch chat",
+                        allow_cohost_persona=True,
+                        force_speaker=speaker,
+                        record_user_memory=(i == 0),
+                        update_auto_reply_cooldown=(i == len(addressees) - 1),
+                        chatter_profile=profile,
+                    )
+            finally:
+                self.end_public_chat_reply_priority()
 
     def _should_auto_reply(self, message: Message) -> bool:
         if not self._auto_reply:
@@ -1510,24 +1522,25 @@ class LunaTwitchBot(commands.Bot):
         if not addressees:
             return
         yt_profile = profile_from_login(author)
-        await self.begin_public_chat_reply_priority()
-        try:
-            for i, speaker in enumerate(addressees):
-                await self._generate_and_dispatch_reply(
-                    channel_name=source,
-                    author=author,
-                    question=q,
-                    send_to_twitch=False,
-                    source=source,
-                    local_speak=True,
-                    allow_cohost_persona=True,
-                    force_speaker=speaker,
-                    record_user_memory=(i == 0),
-                    update_auto_reply_cooldown=(i == len(addressees) - 1),
-                    chatter_profile=yt_profile,
-                )
-        finally:
-            self.end_public_chat_reply_priority()
+        async with self._public_chat_serial_lock:
+            await self.begin_public_chat_reply_priority()
+            try:
+                for i, speaker in enumerate(addressees):
+                    await self._generate_and_dispatch_reply(
+                        channel_name=source,
+                        author=author,
+                        question=q,
+                        send_to_twitch=False,
+                        source=source,
+                        local_speak=True,
+                        allow_cohost_persona=True,
+                        force_speaker=speaker,
+                        record_user_memory=(i == 0),
+                        update_auto_reply_cooldown=(i == len(addressees) - 1),
+                        chatter_profile=yt_profile,
+                    )
+            finally:
+                self.end_public_chat_reply_priority()
 
     async def _ollama_stream_to_hub(
         self,
@@ -1900,9 +1913,6 @@ class LunaTwitchBot(commands.Bot):
                 self._maybe_refresh_cohost_dynamics(),
                 name="cohost-dynamics-refresh",
             )
-        if update_auto_reply_cooldown:
-            self._last_auto_reply_ts = time.time()
-
         twitch_out = reply_stripped
         if as_cohost and _env_truthy("LUNA_COHOST_CHAT_TWITCH_PREFIX", default=True):
             twitch_out = f"[{cohost_name()}] {reply_stripped}"
@@ -2029,6 +2039,8 @@ class LunaTwitchBot(commands.Bot):
                             }
                         )
                         self._schedule_mic_ready_after_tts(self._chat_hub)
+        if update_auto_reply_cooldown and is_public_chat:
+            self._last_auto_reply_ts = time.time()
         return reply_stripped
 
     async def handle_discord_chat(
