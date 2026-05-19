@@ -66,6 +66,9 @@ Environment (or use CLI flags where noted):
   LUNA_YOUTUBE_LIVE_AUTO_REPLY     If 1 (default), Luna replies in the viewer/TTS only (not YouTube chat).
   LUNA_YOUTUBE_LIVE_AUTO_TRIGGER   mention | all (default all for live chat).
   LUNA_YOUTUBE_LIVE_CHECK_URL      Single @handle/live or watch URL for manual “check YouTube live” (default @Solonaras1/live).
+  LUNA_YOUTUBE_LIVE_WATCH_POLL     If 1 (default when live chat on), probe CHECK_URL on an interval and auto-connect pytchat.
+  LUNA_YOUTUBE_LIVE_WATCH_POLL_SEC Probe interval in seconds (default 900 = 15 minutes).
+  LUNA_YOUTUBE_LIVE_RECONNECT      If 1 (default), restart pytchat when the session drops mid-stream.
   LUNA_SOCIAL_LIVE_SHARE           If 1, post to X/Facebook when you go live on YouTube or Twitch.
   LUNA_SOCIAL_LIVE_POLL_SEC        How often to check for live (default 90s).
   LUNA_SOCIAL_LIVE_TITLE_PREFIX    Prepended to stream title in social posts (default "Live now:").
@@ -162,12 +165,14 @@ from youtube_feed import (
 )
 from youtube_live_chat import (
     YouTubeLiveChatRunner,
+    run_youtube_live_watch_poller,
     set_youtube_live_url,
     youtube_live_auto_reply_enabled,
     youtube_live_auto_trigger,
     youtube_live_chat_requested,
     youtube_live_check_probe_url,
     youtube_live_video_id,
+    youtube_live_watch_poll_enabled,
 )
 from live_social_share import (
     live_social_share_enabled,
@@ -2416,6 +2421,52 @@ async def _run_async(
             }
         )
 
+    async def _connect_youtube_live_stream(
+        item: dict[str, str],
+        *,
+        close_prompt: bool = True,
+    ) -> bool:
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            return False
+        if yt_runner.is_running and yt_runner.active_video_id == sid:
+            return True
+        page_url = str(item.get("url") or "").strip()
+        if page_url:
+            set_youtube_live_url(page_url)
+        elif not youtube_live_video_id():
+            set_youtube_live_url(f"https://www.youtube.com/watch?v={sid}")
+        await yt_runner.start(
+            video_id=sid,
+            on_chat=_on_youtube_live_chat,
+            broadcast_status=_hub_status,
+            on_stopped=_on_yt_live_stopped,
+        )
+        prompted_yt_stream_ids.add(sid)
+        if close_prompt and hub is not None:
+            await hub.broadcast(
+                {
+                    "type": "control",
+                    "name": "youtube_live_prompt",
+                    "open": False,
+                }
+            )
+        await _hub_status(f"YouTube Live chat (pytchat): connected ({sid}).")
+        return True
+
+    async def _on_youtube_live_watch_detected(item: dict[str, str]) -> None:
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            return
+        if yt_runner.is_running and yt_runner.active_video_id == sid:
+            return
+        title = str(item.get("title") or "YouTube Live")
+        print(f"(youtube live watch) live: {title} ({sid})", flush=True)
+        await _hub_status(
+            f"YouTube live watch: live detected — connecting pytchat ({sid})…",
+        )
+        await _connect_youtube_live_stream(item)
+
     # Kick off STT + TTS warmups in the background. These cost a few seconds
     # of model load / DNS handshake the FIRST time they're called, so doing
     # them up front means the first user utterance / first reply is fast.
@@ -2779,26 +2830,7 @@ async def _run_async(
                         },
                     )
                     return
-                await yt_runner.start(
-                    video_id=vid,
-                    on_chat=_on_youtube_live_chat,
-                    broadcast_status=_hub_status,
-                    on_stopped=_on_yt_live_stopped,
-                )
-                prompted_yt_stream_ids.add(vid)
-                await hub.broadcast(
-                    {
-                        "type": "control",
-                        "name": "youtube_live_prompt",
-                        "open": False,
-                    }
-                )
-                await hub.broadcast(
-                    {
-                        "type": "status",
-                        "text": f"YouTube Live chat (pytchat): connected ({vid}).",
-                    }
-                )
+                await _connect_youtube_live_stream({"id": vid, "url": url})
                 return
 
             if msg_type == "viewer_youtube_live_dismiss":
@@ -2909,6 +2941,7 @@ async def _run_async(
         hub.set_client_message_handler(_on_client_message)
 
     feed_task: asyncio.Task | None = None
+    yt_watch_task: asyncio.Task | None = None
     live_social_task: asyncio.Task | None = None
     cohost_task: asyncio.Task | None = None
     if hub is not None:
@@ -2990,6 +3023,15 @@ async def _run_async(
                     broadcast_status=_hub_status,
                     on_stopped=_on_yt_live_stopped,
                 )
+            if youtube_live_watch_poll_enabled():
+                yt_watch_task = asyncio.create_task(
+                    run_youtube_live_watch_poller(
+                        probe_url=youtube_live_check_probe_url(),
+                        on_live=_on_youtube_live_watch_detected,
+                        broadcast_status=_hub_status,
+                    ),
+                    name="luna-youtube-live-watch",
+                )
 
         if live_watch_enabled():
 
@@ -3035,6 +3077,12 @@ async def _run_async(
             except (asyncio.CancelledError, Exception):
                 pass
         await yt_runner.stop()
+        if yt_watch_task is not None:
+            yt_watch_task.cancel()
+            try:
+                await yt_watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if live_social_task is not None:
             live_social_task.cancel()
             try:

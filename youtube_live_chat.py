@@ -77,6 +77,35 @@ def youtube_live_check_probe_url() -> str:
     return "https://www.youtube.com/@Solonaras1/live"
 
 
+def youtube_live_watch_poll_enabled() -> bool:
+    """Background /live probe (same as the viewer button) on an interval."""
+    if not youtube_live_chat_requested():
+        return False
+    return _env_truthy("LUNA_YOUTUBE_LIVE_WATCH_POLL", default=True)
+
+
+def youtube_live_watch_poll_sec() -> float:
+    raw = (os.environ.get("LUNA_YOUTUBE_LIVE_WATCH_POLL_SEC") or "900").strip() or "900"
+    try:
+        sec = float(raw)
+    except ValueError:
+        sec = 900.0
+    return max(60.0, min(sec, 86_400.0))
+
+
+def youtube_live_reconnect_enabled() -> bool:
+    return _env_truthy("LUNA_YOUTUBE_LIVE_RECONNECT", default=True)
+
+
+def youtube_live_reconnect_delay_sec() -> float:
+    raw = (os.environ.get("LUNA_YOUTUBE_LIVE_RECONNECT_DELAY_SEC") or "5").strip() or "5"
+    try:
+        sec = float(raw)
+    except ValueError:
+        sec = 5.0
+    return max(2.0, min(sec, 120.0))
+
+
 class YouTubeLiveChatRunner:
     """Start/stop the pytchat listener for a single live video id."""
 
@@ -123,12 +152,32 @@ class YouTubeLiveChatRunner:
         self._video_id = vid
 
         async def _run() -> None:
+            reconnect = youtube_live_reconnect_enabled()
+            delay = youtube_live_reconnect_delay_sec()
             try:
-                await run_youtube_live_chat_listener(
-                    video_id=vid,
-                    on_chat=on_chat,
-                    broadcast_status=broadcast_status,
-                )
+                while True:
+                    try:
+                        await run_youtube_live_chat_listener(
+                            video_id=vid,
+                            on_chat=on_chat,
+                            broadcast_status=broadcast_status,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    if not reconnect or self._video_id != vid:
+                        break
+                    print(
+                        f"(youtube live) pytchat session ended — reconnecting in {delay:.0f}s…",
+                        flush=True,
+                    )
+                    if broadcast_status:
+                        await broadcast_status(
+                            f"YouTube Live chat: disconnected — reconnecting in {int(delay)}s…"
+                        )
+                    try:
+                        await asyncio.sleep(delay)
+                    except asyncio.CancelledError:
+                        raise
             finally:
                 self._task = None
                 self._video_id = ""
@@ -140,6 +189,48 @@ class YouTubeLiveChatRunner:
 
         self._task = asyncio.create_task(_run(), name=f"luna-youtube-live-chat-{vid}")
         return self._task
+
+
+OnLiveDetected = Callable[[dict[str, str]], Awaitable[None]]
+
+
+async def run_youtube_live_watch_poller(
+    *,
+    probe_url: str,
+    on_live: OnLiveDetected,
+    broadcast_status: BroadcastStatus | None = None,
+    interval_sec: float | None = None,
+) -> None:
+    """Probe a channel /live URL on a timer (default every 15 minutes)."""
+    from live_social_share import probe_youtube_live
+
+    interval = interval_sec if interval_sec is not None else youtube_live_watch_poll_sec()
+    url = (probe_url or youtube_live_check_probe_url()).strip()
+    print(
+        f"(youtube live watch) probing {url} every {int(interval)}s",
+        flush=True,
+    )
+    if broadcast_status:
+        await broadcast_status(
+            f"YouTube live watch: checking {url} every {int(interval // 60)} min."
+        )
+
+    while True:
+        try:
+            item = await asyncio.to_thread(probe_youtube_live, url)
+            if item:
+                try:
+                    await on_live(item)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"(youtube live watch) on_live error: {exc}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"(youtube live watch) probe error: {exc}", flush=True)
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
 
 
 async def run_youtube_live_chat_listener(
