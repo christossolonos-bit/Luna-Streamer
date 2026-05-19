@@ -66,7 +66,11 @@ def chat_directed_at_luna(text: str) -> bool:
 
 
 def twitch_message_addressees(text: str, *, trigger_all: bool = False) -> list[str]:
-    """Who should each answer this Twitch line separately (may be both)."""
+    """Who should each answer this Twitch / YouTube line separately (may be both).
+
+    When ``trigger_all`` is True and no name is mentioned, only Luna replies.
+    Viktor is never chosen for unmentioned lines.
+    """
     at_luna = chat_directed_at_luna(text)
     at_cohost = cohost_enabled() and chat_directed_at_cohost(text)
     if at_luna and at_cohost:
@@ -172,7 +176,18 @@ def build_vampire_system_prompt() -> str:
     return raw if raw else _DEFAULT_VAMPIRE_PERSONA
 
 
+def cohost_after_chat_sec() -> float:
+    """Quiet time after any Twitch/YouTube chat (or reply) before idle banter resumes."""
+    raw = (os.environ.get("LUNA_COHOST_AFTER_CHAT_SEC") or "10").strip() or "10"
+    try:
+        sec = float(raw)
+    except ValueError:
+        sec = 10.0
+    return max(3.0, min(sec, 600.0))
+
+
 def cohost_idle_sec() -> float:
+    """Legacy / optional extra quiet before banter (max with :func:`cohost_after_chat_sec`)."""
     raw = (os.environ.get("LUNA_COHOST_IDLE_SEC") or "90").strip() or "90"
     try:
         sec = float(raw)

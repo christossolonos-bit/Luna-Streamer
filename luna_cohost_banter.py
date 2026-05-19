@@ -10,8 +10,8 @@ from luna_persona import build_luna_system_prompt
 from ollama_client import build_client, chat_request_kwargs, strip_think_blocks
 from vampire_cohost import (
     build_vampire_system_prompt,
+    cohost_after_chat_sec,
     cohost_enabled,
-    cohost_idle_sec,
     cohost_min_gap_sec,
     cohost_name,
     cohost_poll_sec,
@@ -134,7 +134,7 @@ async def run_cohost_banter_loop(bot: "LunaTwitchBot") -> None:
     poll = cohost_poll_sec()
     print(
         f"(cohost) banter enabled — {name} joins when idle "
-        f"({int(cohost_idle_sec())}s quiet, min gap {int(cohost_min_gap_sec())}s)",
+        f"({int(cohost_after_chat_sec())}s after chat, min gap {int(cohost_min_gap_sec())}s)",
         flush=True,
     )
     while True:

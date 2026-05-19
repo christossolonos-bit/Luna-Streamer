@@ -11,7 +11,7 @@ Environment (or use CLI flags where noted):
   OLLAMA_MODEL   Optional, default gemma4:e4b
   TWITCH_SEND_REPLIES  If "1", post model replies to chat (needs chat:write on token)
   TWITCH_AUTO_REPLY    If "1", generate replies from regular chat messages
-  TWITCH_AUTO_TRIGGER  "mention" (default) or "all"
+  TWITCH_AUTO_TRIGGER  "all" (default: Luna replies even without @; Viktor only when named) or "mention"
   TWITCH_AUTO_COOLDOWN Seconds between auto replies after TTS finishes (default 6)
   TWITCH_SYSTEM  Optional extra system prompt (in addition to --system). Can stay short if you use ``ollama create`` with a Modelfile (see ollama/Modelfile.luna) to bake persona into OLLAMA_MODEL.
   LUNA_PERSONA    Character depth (see luna_persona.py; merged with TWITCH_SYSTEM + LUNA_VOICE_RULES).
@@ -101,7 +101,9 @@ Environment (or use CLI flags where noted):
   LUNA_COHOST_CHAT_PERSONAS If 1 (with BANTER=1), auto-replies to Twitch / YouTube chat may be Luna or the co-host (see LUNA_COHOST_CHAT_SPEAKER).
   LUNA_COHOST_CHAT_SPEAKER  random (default) | luna | cohost | alternate — who speaks for chat auto-replies when CHAT_PERSONAS=1.
   LUNA_COHOST_CHAT_TWITCH_PREFIX  If 1 (default), Twitch chat replies from the co-host are prefixed [Name] when posting as the bot.
-  LUNA_COHOST_IDLE_SEC      Quiet time before banter (default 90). LUNA_COHOST_MIN_GAP_SEC between exchanges (default 10).
+  LUNA_COHOST_AFTER_CHAT_SEC  Quiet after Twitch/YouTube chat before banter resumes (default 10).
+  LUNA_COHOST_IDLE_SEC      Optional longer quiet before banter if set (default unused for resume; legacy 90).
+  LUNA_COHOST_MIN_GAP_SEC   Minimum gap between banter exchanges (default 10).
   LUNA_COHOST_DYNAMICS      If 1 (default with BANTER), evolving Luna↔Viktor relationship notes in prompts (data/cohost_dynamics.json).
   LUNA_COHOST_DYNAMICS_LLM_EVERY  Re-summarize relationship with Ollama every N exchanges (default 10; 0=heuristics only).
   LUNA_SESSION_MODE         auto (default) | live | local — whether to frame replies as public broadcast vs local VRM / off-air rehearsal.
@@ -603,17 +605,25 @@ class LunaTwitchBot(commands.Bot):
         return self._public_chat_reply_depth > 0
 
     async def _stop_cohost_banter_for_chat(self) -> None:
-        """End Luna↔Viktor banter when chat needs the floor (no resume)."""
+        """End Luna↔Viktor banter when chat needs the floor; never cut viewer TTS for a user reply."""
         task = self._cohost_banter_task
-        if task is None and not self._cohost_banter_active:
+        stopping_banter = self._cohost_banter_active or (
+            task is not None and not task.done()
+        )
+        if not stopping_banter:
             return
         if task is not None and not task.done():
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"(cohost) banter cancel: {exc}", flush=True)
+        self._cohost_banter_active = False
         if self._chat_hub is not None:
             await self._chat_hub.broadcast({"type": "control", "name": "stop_tts"})
-            self._viewer_tts_done.set()
-        if self._cohost_banter_active:
-            print("(cohost) banter stopped for chat", flush=True)
+        print("(cohost) banter stopped for chat", flush=True)
 
     async def begin_public_chat_reply_priority(self) -> None:
         """Public chat reply — banter must not run in parallel."""
@@ -626,7 +636,7 @@ class LunaTwitchBot(commands.Bot):
         self.touch_activity()
 
     def cohost_idle_ready(self) -> bool:
-        from vampire_cohost import cohost_enabled, cohost_idle_sec, cohost_min_gap_sec
+        from vampire_cohost import cohost_after_chat_sec, cohost_enabled, cohost_min_gap_sec
 
         if not cohost_enabled():
             return False
@@ -637,7 +647,7 @@ class LunaTwitchBot(commands.Bot):
         if not self._viewer_cohost_in_scene:
             return False
         now = time.monotonic()
-        if now - self._last_activity_ts < cohost_idle_sec():
+        if now - self._last_activity_ts < cohost_after_chat_sec():
             return False
         if self._last_cohost_banter_ts > 0 and now - self._last_cohost_banter_ts < cohost_min_gap_sec():
             return False
@@ -706,6 +716,8 @@ class LunaTwitchBot(commands.Bot):
         """Play one line of Luna ↔ co-host banter in the viewer (dual voice)."""
         from vampire_cohost import cohost_edge_voice
 
+        if self.public_chat_reply_priority_busy():
+            return
         line = (text or "").strip()
         if not line or self._chat_hub is None:
             return
@@ -839,9 +851,15 @@ class LunaTwitchBot(commands.Bot):
             for spk, line in script:
                 if not self._viewer_cohost_in_scene:
                     break
+                if self.public_chat_reply_priority_busy():
+                    print("(cohost) banter yielding — chat reply in progress", flush=True)
+                    break
                 if spk == "cohost" and not self._viewer_cohost_in_scene:
                     continue
                 await self._dispatch_banter_line(spk, line, cohost_display=name)
+                if self.public_chat_reply_priority_busy():
+                    print("(cohost) banter yielding — chat took priority", flush=True)
+                    break
                 played.append((spk, line))
             if played:
                 self._cohost_dynamics.observe_banter_script(played)
@@ -3163,9 +3181,9 @@ def main() -> None:
 
     send_replies = os.environ.get("TWITCH_SEND_REPLIES", "").strip() in ("1", "true", "yes")
     auto_reply = os.environ.get("TWITCH_AUTO_REPLY", "").strip() in ("1", "true", "yes")
-    auto_trigger = os.environ.get("TWITCH_AUTO_TRIGGER", "mention").strip().lower()
+    auto_trigger = os.environ.get("TWITCH_AUTO_TRIGGER", "all").strip().lower()
     if auto_trigger not in {"mention", "all"}:
-        auto_trigger = "mention"
+        auto_trigger = "all"
     auto_cooldown_sec = float(os.environ.get("TWITCH_AUTO_COOLDOWN", "6").strip() or "6")
 
     print(
