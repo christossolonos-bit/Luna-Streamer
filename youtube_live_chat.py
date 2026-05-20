@@ -60,6 +60,23 @@ def set_youtube_live_url(url: str) -> str:
     return vid
 
 
+def clear_youtube_live_stream() -> None:
+    """Drop the active live id/url so we do not reconnect to an ended broadcast."""
+    os.environ["LUNA_YOUTUBE_LIVE_URL"] = ""
+    os.environ["LUNA_YOUTUBE_LIVE_VIDEO_ID"] = ""
+
+
+def is_youtube_video_still_live(video_id: str) -> bool:
+    """True when yt-dlp still reports this watch id as live."""
+    from live_social_share import probe_youtube_live
+
+    vid = (video_id or "").strip()
+    if not vid:
+        return False
+    item = probe_youtube_live(f"https://www.youtube.com/watch?v={vid}")
+    return item is not None and str(item.get("id") or "").strip() == vid
+
+
 def youtube_live_auto_reply_enabled() -> bool:
     return _env_truthy("LUNA_YOUTUBE_LIVE_AUTO_REPLY", default=True)
 
@@ -157,14 +174,40 @@ class YouTubeLiveChatRunner:
             try:
                 while True:
                     try:
-                        await run_youtube_live_chat_listener(
+                        end_reason = await run_youtube_live_chat_listener(
                             video_id=vid,
                             on_chat=on_chat,
                             broadcast_status=broadcast_status,
                         )
                     except asyncio.CancelledError:
                         raise
-                    if not reconnect or self._video_id != vid:
+                    if self._video_id != vid:
+                        break
+                    if end_reason == "stream_ended":
+                        clear_youtube_live_stream()
+                        print(
+                            "(youtube live) stream ended — listener stopped "
+                            "(will reconnect when watch poll sees you live again)",
+                            flush=True,
+                        )
+                        if broadcast_status:
+                            await broadcast_status(
+                                "YouTube Live: stream ended — chat listener stopped."
+                            )
+                        break
+                    if not reconnect:
+                        break
+                    still_live = await asyncio.to_thread(is_youtube_video_still_live, vid)
+                    if not still_live:
+                        clear_youtube_live_stream()
+                        print(
+                            "(youtube live) broadcast no longer live — stopping reconnect loop",
+                            flush=True,
+                        )
+                        if broadcast_status:
+                            await broadcast_status(
+                                "YouTube Live: not live — chat listener stopped."
+                            )
                         break
                     print(
                         f"(youtube live) pytchat session ended — reconnecting in {delay:.0f}s…",
@@ -192,12 +235,14 @@ class YouTubeLiveChatRunner:
 
 
 OnLiveDetected = Callable[[dict[str, str]], Awaitable[None]]
+OnOffline = Callable[[], Awaitable[None]]
 
 
 async def run_youtube_live_watch_poller(
     *,
     probe_url: str,
     on_live: OnLiveDetected,
+    on_offline: OnOffline | None = None,
     broadcast_status: BroadcastStatus | None = None,
     interval_sec: float | None = None,
 ) -> None:
@@ -223,6 +268,11 @@ async def run_youtube_live_watch_poller(
                     await on_live(item)
                 except Exception as exc:  # noqa: BLE001
                     print(f"(youtube live watch) on_live error: {exc}", flush=True)
+            elif on_offline is not None:
+                try:
+                    await on_offline()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"(youtube live watch) on_offline error: {exc}", flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -238,8 +288,11 @@ async def run_youtube_live_chat_listener(
     video_id: str,
     on_chat: OnChat,
     broadcast_status: BroadcastStatus | None = None,
-) -> None:
-    """Poll YouTube Live chat and call ``on_chat(author, text, ts_ms)`` for each new message."""
+) -> str:
+    """Poll YouTube Live chat and call ``on_chat(author, text, ts_ms)`` for each new message.
+
+    Returns ``stream_ended`` when the broadcast/chat closed, or ``create_failed``.
+    """
     try:
         import pytchat
     except ImportError:
@@ -247,7 +300,7 @@ async def run_youtube_live_chat_listener(
         print(f"(youtube live) {msg}", flush=True)
         if broadcast_status:
             await broadcast_status(msg)
-        return
+        return "create_failed"
 
     poll = float((os.environ.get("LUNA_YOUTUBE_LIVE_POLL_SEC") or "0.5").strip() or "0.5")
     poll = max(0.2, min(poll, 5.0))
@@ -266,7 +319,7 @@ async def run_youtube_live_chat_listener(
         print(f"(youtube live) pytchat.create failed: {exc}", flush=True)
         if broadcast_status:
             await broadcast_status(f"YouTube Live chat: could not start pytchat ({exc}).")
-        return
+        return "create_failed"
 
     def _pull_sync() -> list[tuple[str, str, str]]:
         out: list[tuple[str, str, str]] = []
@@ -289,7 +342,7 @@ async def run_youtube_live_chat_listener(
                 print("(youtube live) chat ended or stream offline", flush=True)
                 if broadcast_status:
                     await broadcast_status("YouTube Live chat: stream ended or chat closed.")
-                break
+                return "stream_ended"
 
             try:
                 batch = _pull_sync()

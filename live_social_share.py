@@ -1,4 +1,4 @@
-"""Detect YouTube / Twitch go-live; announce on Discord + post to X / Facebook."""
+"""Detect YouTube / Twitch / TikTok go-live; announce on Discord + post to X / Facebook."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ from youtube_feed import (
     observe_channel_entries,
     resolve_channel_id,
 )
-from youtube_live_chat import youtube_live_video_id
+from tiktok_live_chat import tiktok_live_username
+from youtube_live_chat import youtube_live_check_probe_url, youtube_live_video_id
 
 SocialShareSend = Callable[[str, str], Awaitable[None]]
 BroadcastStatus = Callable[[str], Awaitable[None]]
@@ -132,6 +133,10 @@ def youtube_live_probe_targets() -> list[str]:
     if vid:
         add(f"https://www.youtube.com/watch?v={vid}")
 
+    check = (youtube_live_check_probe_url() or "").strip()
+    if check:
+        add(_youtube_live_page_url(check) or check)
+
     extra = (os.environ.get("LUNA_SOCIAL_LIVE_YOUTUBE_URLS") or "").strip()
     if extra:
         for part in re.split(r"[\s,]+", extra):
@@ -199,6 +204,51 @@ def _probe_youtube_live_sync(url: str) -> dict[str, str] | None:
     return {"id": vid, "title": title, "url": page, "platform": "youtube"}
 
 
+async def probe_tiktok_live(unique_id: str) -> dict[str, str] | None:
+    """Return live metadata when ``unique_id`` is live on TikTok (TikTokLive)."""
+    uid = (unique_id or "").strip()
+    if not uid:
+        return None
+    try:
+        from TikTokLive import TikTokLiveClient
+    except ImportError:
+        return None
+    if not uid.startswith("@"):
+        uid = f"@{uid}"
+    client = TikTokLiveClient(unique_id=uid)
+    try:
+        if not await client.is_live():
+            return None
+        room_id = int(await client._web.fetch_room_id_from_api(client.unique_id))
+        title = "TikTok live"
+        try:
+            info = await client._web.fetch_room_info(room_id=room_id)
+            if isinstance(info, dict):
+                for k in ("title", "room_title", "stream_title", "live_title"):
+                    raw = info.get(k)
+                    if isinstance(raw, str) and raw.strip():
+                        title = raw.strip()
+                        break
+        except Exception:
+            pass
+        handle = (client.unique_id or uid).lstrip("@")
+        url = f"https://www.tiktok.com/@{handle}/live"
+        return {
+            "id": str(room_id),
+            "title": title,
+            "url": url,
+            "platform": "tiktok",
+        }
+    except Exception as exc:
+        print(f"(live social) TikTok probe failed: {exc}", flush=True)
+        return None
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
 async def probe_twitch_live(bot: object, login: str) -> dict[str, str] | None:
     login = (login or "").strip().lower().lstrip("#")
     if not login:
@@ -242,6 +292,8 @@ def format_twitch_live_discord_message(title: str, url: str) -> str:
 def _should_social_share(platform: str) -> bool:
     if platform == "twitch":
         return live_social_share_enabled() or twitch_live_social_enabled()
+    if platform == "tiktok":
+        return live_social_share_enabled()
     return live_social_share_enabled()
 
 
@@ -265,7 +317,12 @@ async def _announce_live(
         return
 
     announced: dict[str, list[str]] = state.setdefault("announced", {})
-    key = "youtube" if platform == "youtube" else "twitch"
+    if platform == "youtube":
+        key = "youtube"
+    elif platform == "tiktok":
+        key = "tiktok"
+    else:
+        key = "twitch"
     ids: list[str] = list(announced.get(key) or [])
     if sid in ids:
         return
@@ -302,19 +359,23 @@ async def run_live_social_poller(
     twitch_bot: object | None = None,
     twitch_login: str = "",
 ) -> None:
-    """Poll YouTube / Twitch; on new live session announce Discord + X/Facebook once per id."""
+    """Poll YouTube / Twitch / TikTok; on new live session announce Discord + X/Facebook once per id."""
     if not live_watch_enabled():
         return
 
     interval = live_social_poll_sec()
     yt_targets = youtube_live_probe_targets() if live_social_share_enabled() else []
+    tiktok_uid = (tiktok_live_username() or "").strip() if live_social_share_enabled() else ""
     twitch_login = (twitch_login or os.environ.get("TWITCH_CHANNEL") or "").strip().lower().lstrip("#")
     watch_twitch = bool(twitch_login) and (
         twitch_live_announce_enabled() or live_social_share_enabled()
     )
 
-    if not yt_targets and not watch_twitch:
-        msg = "Live announce: set TWITCH_CHANNEL and/or LUNA_YOUTUBE_OBSERVE_CHANNELS."
+    if not yt_targets and not watch_twitch and not tiktok_uid:
+        msg = (
+            "Live announce: set TWITCH_CHANNEL, LUNA_TIKTOK_LIVE_USERNAME, "
+            "and/or YouTube targets (LUNA_YOUTUBE_LIVE_CHECK_URL, LUNA_SOCIAL_LIVE_YOUTUBE_URLS, observe channels)."
+        )
         print(f"(live announce) {msg}", flush=True)
         if broadcast_status:
             await broadcast_status(msg)
@@ -324,6 +385,8 @@ async def run_live_social_poller(
     parts = []
     if yt_targets:
         parts.append(f"{len(yt_targets)} YouTube target(s)")
+    if tiktok_uid:
+        parts.append(f"TikTok {tiktok_uid}")
     if watch_twitch:
         parts.append(f"Twitch #{twitch_login}")
     actions = []
@@ -357,6 +420,17 @@ async def run_live_social_poller(
                 if t_item:
                     await _announce_live(
                         t_item,
+                        state=state,
+                        social_share_send=social_share_send,
+                        discord_live_send=discord_live_send,
+                        broadcast_status=broadcast_status,
+                    )
+
+            if tiktok_uid:
+                tt_item = await probe_tiktok_live(tiktok_uid)
+                if tt_item:
+                    await _announce_live(
+                        tt_item,
                         state=state,
                         social_share_send=social_share_send,
                         discord_live_send=discord_live_send,

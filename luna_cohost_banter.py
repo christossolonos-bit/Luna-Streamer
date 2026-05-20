@@ -34,9 +34,18 @@ def _generate_banter_script_sync(
     luna_persona = build_luna_system_prompt()
     vampire = build_vampire_system_prompt()
     extra = f"\n\n{presence_block.strip()}" if (presence_block or "").strip() else ""
+    chat_debrief = "Recent YouTube Live chat" in (presence_block or "")
+    if chat_debrief:
+        debrief_hint = (
+            "The streamer's YouTube Live chatters are in the context below — "
+            "your job is to talk **about them**, not to the chat.\n\n"
+        )
+    else:
+        debrief_hint = ""
     if full_conversation:
         system = (
-            "You write a full, natural back-and-forth conversation between two co-hosts while the stream is quiet. "
+            debrief_hint
+            + "You write a full, natural back-and-forth conversation between two co-hosts while the stream is quiet. "
             "No audience callouts, no 'the pack', no generic streamer hype. "
             f"Luna is a wolf-girl: {luna_persona}\n\n"
             f"{cohost} is the vampire co-host: {vampire}\n\n"
@@ -52,7 +61,8 @@ def _generate_banter_script_sync(
         ) + extra
     else:
         system = (
-            "You write short, natural back-and-forth banter between two co-hosts on a quiet stream moment. "
+            debrief_hint
+            + "You write short, natural back-and-forth banter between two co-hosts on a quiet stream moment. "
             "No audience callouts, no 'the pack', no generic streamer hype. "
             f"Luna is a wolf-girl: {luna_persona}\n\n"
             f"{cohost} is the vampire co-host: {vampire}\n\n"
@@ -63,14 +73,25 @@ def _generate_banter_script_sync(
             "Keep each line under 220 characters. No stage directions, no markdown."
         ) + extra
     client = build_client()
-    user_prompt = (
-        "They have time on a dead chat: write one sustained conversation until it naturally winds down."
-        if full_conversation
-        else (
+    if chat_debrief:
+        user_prompt = (
+            f"YouTube Live chat was active and is quiet now. Luna and {cohost} debrief on mic: "
+            "specific viewers, what they said, running jokes, mild disagreement — stay in character. "
+            "Do not invent viewers not in the log."
+        )
+        if full_conversation:
+            user_prompt += " Let the conversation run until it naturally winds down."
+        else:
+            user_prompt += f" About {max_lines} alternating lines."
+    elif full_conversation:
+        user_prompt = (
+            "They have time on a dead chat: write one sustained conversation until it naturally winds down."
+        )
+    else:
+        user_prompt = (
             f"Luna decides to ping {cohost} because chat is quiet. "
             "Write their exchange now."
         )
-    )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_prompt},

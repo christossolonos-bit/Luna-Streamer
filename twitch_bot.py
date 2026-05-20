@@ -53,6 +53,11 @@ Environment (or use CLI flags where noted):
   LUNA_OLLAMA_KEEP_ALIVE  e.g. -1 to keep models loaded between calls (optional)
   LUNA_OLLAMA_TEMPERATURE  Sampling temperature (optional)
   LUNA_SCREEN_YIELD_TO_CHAT  If 0, may run vision while a reply generates (default 1 = skip frames while chat uses Ollama)
+  LUNA_LOL_CONTEXT           If 1, poll local Riot/League Client (LCU + live game port) for match stats (solo play).
+  LUNA_LOL_LEAGUE_LNK        Windows shortcut to launch League (optional; used with LUNA_LOL_LAUNCH_ON_START).
+  LUNA_LOL_RIOT_CLIENT_LNK   Windows shortcut to launch Riot Client (optional).
+  LUNA_LOL_POLL_SEC          How often to refresh LoL stats (default 8).
+  LUNA_LOL_LAUNCH_ON_START   If 1, open the .lnk paths once when Luna starts (Windows).
   LUNA_STREAM_ASSISTANT_WS  If 1 (default), stream tokens to the viewer over WS as they arrive (faster perceived replies)
   LUNA_OLLAMA_PRINT_STREAM  If 1, also print streamed tokens to the console (default 0; reduces overhead on Windows)
   LUNA_YOUTUBE_CHANNEL_ID   UC… id for legacy single-feed poller (ignored if LUNA_YOUTUBE_OBSERVE_CHANNELS is set).
@@ -65,11 +70,24 @@ Environment (or use CLI flags where noted):
   LUNA_YOUTUBE_LIVE_URL            watch URL for the live stream (alternative to VIDEO_ID).
   LUNA_YOUTUBE_LIVE_AUTO_REPLY     If 1 (default), Luna replies in the viewer/TTS only (not YouTube chat).
   LUNA_YOUTUBE_LIVE_AUTO_TRIGGER   mention | all (default all for live chat).
+  LUNA_YOUTUBE_LIVE_CONVERSATIONAL If 1 (default), Luna/Viktor discuss with viewers; use thread context.
+  LUNA_YOUTUBE_LIVE_BANTER_FROM_CHAT  If 1 (default), idle banter debriefs recent YouTube chat.
+  LUNA_YOUTUBE_LIVE_SESSION_LINES  Rolling log size for YouTube context (default 48).
   LUNA_YOUTUBE_LIVE_CHECK_URL      Single @handle/live or watch URL for manual “check YouTube live” (default @Solonaras1/live).
   LUNA_YOUTUBE_LIVE_WATCH_POLL     If 1 (default when live chat on), probe CHECK_URL on an interval and auto-connect pytchat.
   LUNA_YOUTUBE_LIVE_WATCH_POLL_SEC Probe interval in seconds (default 900 = 15 minutes).
   LUNA_YOUTUBE_LIVE_RECONNECT      If 1 (default), restart pytchat when the session drops mid-stream.
-  LUNA_SOCIAL_LIVE_SHARE           If 1, post to X/Facebook when you go live on YouTube or Twitch.
+  LUNA_TIKTOK_LIVE_CHAT            If 1, read TikTok Live chat into the viewer (requires TikTokLive).
+  LUNA_TIKTOK_LIVE_USERNAME        TikTok @handle to listen to (e.g. @solonaras).
+  LUNA_TIKTOK_LIVE_AUTO_REPLY      If 1 (default), Luna/Viktor reply in viewer/TTS only.
+  LUNA_TIKTOK_LIVE_AUTO_TRIGGER    mention | all (default all).
+  LUNA_TIKTOK_LIVE_CONVERSATIONAL  If 1 (default), Luna/Viktor discuss with viewers; use thread context.
+  LUNA_TIKTOK_LIVE_BANTER_FROM_CHAT  If 1 (default), idle banter debriefs recent TikTok chat.
+  LUNA_TIKTOK_LIVE_SESSION_LINES   Rolling log size for TikTok context (default 48).
+  LUNA_TIKTOK_LIVE_WATCH_POLL      If 1 (default when chat on), probe @handle and auto-connect when live.
+  LUNA_TIKTOK_LIVE_WATCH_POLL_SEC  Probe interval in seconds (default 900).
+  LUNA_TIKTOK_LIVE_RECONNECT       If 1 (default), reconnect after disconnects mid-stream (not when offline).
+  LUNA_SOCIAL_LIVE_SHARE           If 1, post to X/Facebook when you go live on YouTube, TikTok, or Twitch (needs Playwright + storage).
   LUNA_SOCIAL_LIVE_POLL_SEC        How often to check for live (default 90s).
   LUNA_SOCIAL_LIVE_TITLE_PREFIX    Prepended to stream title in social posts (default "Live now:").
   LUNA_SOCIAL_LIVE_YOUTUBE_URLS    Extra YouTube channel/live URLs to watch (optional).
@@ -167,6 +185,7 @@ from youtube_feed import (
 )
 from youtube_live_chat import (
     YouTubeLiveChatRunner,
+    clear_youtube_live_stream,
     run_youtube_live_watch_poller,
     set_youtube_live_url,
     youtube_live_auto_reply_enabled,
@@ -175,6 +194,15 @@ from youtube_live_chat import (
     youtube_live_check_probe_url,
     youtube_live_video_id,
     youtube_live_watch_poll_enabled,
+)
+from tiktok_live_chat import (
+    TikTokLiveChatRunner,
+    run_tiktok_live_watch_poller,
+    tiktok_live_auto_reply_enabled,
+    tiktok_live_auto_trigger,
+    tiktok_live_chat_requested,
+    tiktok_live_username,
+    tiktok_live_watch_poll_enabled,
 )
 from live_social_share import (
     live_social_share_enabled,
@@ -225,6 +253,18 @@ from luna_chat_safety import (
 )
 from luna_persona import build_luna_system_prompt
 from luna_session_context import format_dual_presence_block
+from luna_youtube_live_session import (
+    TikTokLiveSessionLog,
+    YouTubeLiveSessionLog,
+    tiktok_live_reply_style_block,
+    youtube_live_reply_style_block,
+)
+from riot_lol_context import (
+    build_lol_context_snapshot,
+    lol_context_enabled,
+    maybe_launch_riot_clients,
+    run_lol_context_poller,
+)
 from ollama_client import (
     ThinkStripper,
     build_client,
@@ -453,6 +493,7 @@ class LunaTwitchBot(commands.Bot):
         self._system = system_prompt.strip()
         self._twitch_channel_login = (channel or "").strip().lstrip("#").lower()
         self._youtube_live_active_cb: Callable[[], bool] | None = None
+        self._tiktok_live_active_cb: Callable[[], bool] | None = None
         self._send_replies = send_replies
         self._auto_reply = auto_reply
         self._auto_trigger = auto_trigger
@@ -487,7 +528,10 @@ class LunaTwitchBot(commands.Bot):
         )
         self._user_facts: dict[str, list[str]] = {}
         self._chatter_session_counts: dict[str, int] = {}
+        self._youtube_live_session = YouTubeLiveSessionLog()
+        self._tiktok_live_session = TikTokLiveSessionLog()
         self._screen_context_summary = ""
+        self._lol_context_summary = ""
         self._screen_context_lock = asyncio.Lock()
         self._last_screen_summarize_ts = 0.0
         self._latest_screen_frame_b64 = ""
@@ -810,7 +854,11 @@ class LunaTwitchBot(commands.Bot):
             async with self._ollama_lock:
                 presence = self._dual_presence_context_block()
                 dynamics = self._cohost_dynamics.block_for_banter()
-                extra_ctx = "\n\n".join(x for x in (presence, dynamics) if x).strip()
+                yt_banter = self._youtube_live_session.block_for_banter(cohost_name=name)
+                tt_banter = self._tiktok_live_session.block_for_banter(cohost_name=name)
+                extra_ctx = "\n\n".join(
+                    x for x in (presence, dynamics, yt_banter, tt_banter) if x
+                ).strip()
                 script = await asyncio.to_thread(
                     _generate_banter_script_sync,
                     model=self._chat_model,
@@ -1093,6 +1141,36 @@ class LunaTwitchBot(commands.Bot):
         returning = count > 1 or bool(self._user_facts.get(key))
         return count, returning
 
+    def _register_youtube_chatter(self, profile: TwitchChatterProfile) -> None:
+        login = (profile.login or "").strip().lower()
+        if not login or login == "unknown":
+            return
+        key = f"yt:{login}"
+        self._chatter_session_counts[key] = self._chatter_session_counts.get(key, 0) + 1
+
+    def _youtube_session_stats(self, profile: TwitchChatterProfile) -> tuple[int, bool]:
+        login = (profile.login or "").strip().lower()
+        key = f"yt:{login}"
+        count = max(1, self._chatter_session_counts.get(key, 1))
+        mem_key = self._user_memory_key(profile.login, "YouTube Live")
+        returning = count > 1 or bool(self._user_facts.get(mem_key))
+        return count, returning
+
+    def _register_tiktok_chatter(self, profile: TwitchChatterProfile) -> None:
+        login = (profile.login or "").strip().lower()
+        if not login or login == "unknown":
+            return
+        key = f"tt:{login}"
+        self._chatter_session_counts[key] = self._chatter_session_counts.get(key, 0) + 1
+
+    def _tiktok_session_stats(self, profile: TwitchChatterProfile) -> tuple[int, bool]:
+        login = (profile.login or "").strip().lower()
+        key = f"tt:{login}"
+        count = max(1, self._chatter_session_counts.get(key, 1))
+        mem_key = self._user_memory_key(profile.login, "TikTok Live")
+        returning = count > 1 or bool(self._user_facts.get(mem_key))
+        return count, returning
+
     def _remember_user_facts(self, author: str, source: str, text: str) -> None:
         key = self._user_memory_key(author, source)
         if not key:
@@ -1205,6 +1283,12 @@ class LunaTwitchBot(commands.Bot):
             return
         if len(summary) > max_chars:
             summary = summary[: max_chars - 1] + "…"
+        lol = (self._lol_context_summary or "").strip()
+        if lol:
+            merged = f"{summary}\n\n[League client stats — use with what you see on screen]\n{lol}"
+            if len(merged) > max_chars:
+                merged = merged[: max_chars - 1] + "…"
+            summary = merged
         self._screen_context_summary = summary
         print(f"(viewer_screen) context updated ({len(summary)} chars)", flush=True)
         if self._chat_hub and os.environ.get("LUNA_SCREEN_CONTEXT_STATUS", "").strip() == "1":
@@ -1366,6 +1450,23 @@ class LunaTwitchBot(commands.Bot):
             )
         )
 
+    def _should_auto_reply_tiktok(self, text: str) -> bool:
+        if not tiktok_live_auto_reply_enabled():
+            return False
+        cleaned = (text or "").strip()
+        if not cleaned or cleaned.startswith("!"):
+            return False
+        now = time.time()
+        if now - self._last_auto_reply_ts < self._auto_cooldown_sec:
+            return False
+        if tiktok_live_auto_trigger() == "all":
+            return True
+        return bool(
+            twitch_message_addressees(
+                cleaned, trigger_all=tiktok_live_auto_trigger() == "all"
+            )
+        )
+
     async def _broadcast_cohost_chat_reply_viewer(self) -> None:
         """Show Viktor VRM + route lip-sync before Twitch/YouTube live chat TTS."""
         from vampire_cohost import cohost_vrm_viewer_url
@@ -1435,7 +1536,7 @@ class LunaTwitchBot(commands.Bot):
             f"You are {vn}, the vampire co-host on stream with Luna.\n\n",
             build_vampire_system_prompt(),
             f"\n\nLuna (your co-host — context only; never reply as Luna):\n{luna_ctx}\n\n",
-            "A viewer sent a Twitch or YouTube Live chat message. If they used your name, they want "
+            "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, they want "
             "**you** — not Luna. Reply in your voice only, as plain text for TTS. "
             "Keep it to one short paragraph or a few sentences unless they asked for more. "
             "Do not prefix with your name or a role tag.",
@@ -1516,9 +1617,17 @@ class LunaTwitchBot(commands.Bot):
                 yt = bool(cb())
             except Exception:
                 yt = False
+        tt = False
+        tt_cb = self._tiktok_live_active_cb
+        if tt_cb is not None:
+            try:
+                tt = bool(tt_cb())
+            except Exception:
+                tt = False
         return format_dual_presence_block(
             twitch_channel=self._twitch_channel_login,
             youtube_live_listening=yt,
+            tiktok_live_listening=tt,
         )
 
     async def handle_youtube_live_chat(self, author: str, question: str, ts_ms: int) -> None:
@@ -1526,6 +1635,7 @@ class LunaTwitchBot(commands.Bot):
         self.touch_activity()
         await self._stop_cohost_banter_for_chat()
         source = "YouTube Live"
+        self._youtube_live_session.note_viewer(author, question)
         if self._chat_hub:
             await self._chat_hub.broadcast(
                 {
@@ -1545,11 +1655,12 @@ class LunaTwitchBot(commands.Bot):
         if not addressees:
             return
         yt_profile = profile_from_login(author)
+        self._register_youtube_chatter(yt_profile)
         async with self._public_chat_serial_lock:
             await self.begin_public_chat_reply_priority()
             try:
                 for i, speaker in enumerate(addressees):
-                    await self._generate_and_dispatch_reply(
+                    reply = await self._generate_and_dispatch_reply(
                         channel_name=source,
                         author=author,
                         question=q,
@@ -1562,6 +1673,68 @@ class LunaTwitchBot(commands.Bot):
                         update_auto_reply_cooldown=(i == len(addressees) - 1),
                         chatter_profile=yt_profile,
                     )
+                    if reply:
+                        self._youtube_live_session.note_reply(
+                            speaker=speaker,
+                            author=author,
+                            user_text=q,
+                            reply=reply,
+                            cohost_display=cohost_name(),
+                        )
+            finally:
+                self.end_public_chat_reply_priority()
+
+    async def handle_tiktok_live_chat(self, author: str, question: str, ts_ms: int) -> None:
+        """TikTok Live chat → viewer panel + optional Luna reply (never posted to TikTok)."""
+        self.touch_activity()
+        await self._stop_cohost_banter_for_chat()
+        source = "TikTok Live"
+        self._tiktok_live_session.note_viewer(author, question)
+        if self._chat_hub:
+            await self._chat_hub.broadcast(
+                {
+                    "type": "chat",
+                    "user": author,
+                    "text": question,
+                    "channel": source,
+                    "ts": ts_ms,
+                }
+            )
+        if not self._should_auto_reply_tiktok(question):
+            return
+        q = question.strip()
+        addressees = twitch_message_addressees(
+            q, trigger_all=tiktok_live_auto_trigger() == "all"
+        )
+        if not addressees:
+            return
+        tt_profile = profile_from_login(author, display_name=author)
+        self._register_tiktok_chatter(tt_profile)
+        async with self._public_chat_serial_lock:
+            await self.begin_public_chat_reply_priority()
+            try:
+                for i, speaker in enumerate(addressees):
+                    reply = await self._generate_and_dispatch_reply(
+                        channel_name=source,
+                        author=author,
+                        question=q,
+                        send_to_twitch=False,
+                        source=source,
+                        local_speak=True,
+                        allow_cohost_persona=True,
+                        force_speaker=speaker,
+                        record_user_memory=(i == 0),
+                        update_auto_reply_cooldown=(i == len(addressees) - 1),
+                        chatter_profile=tt_profile,
+                    )
+                    if reply:
+                        self._tiktok_live_session.note_reply(
+                            speaker=speaker,
+                            author=author,
+                            user_text=q,
+                            reply=reply,
+                            cohost_display=cohost_name(),
+                        )
             finally:
                 self.end_public_chat_reply_priority()
 
@@ -1710,11 +1883,12 @@ class LunaTwitchBot(commands.Bot):
         """
         is_twitch = source.strip().lower() == "twitch chat"
         is_youtube_live = source.strip().lower() == "youtube live"
-        is_public_chat = is_twitch or is_youtube_live
+        is_tiktok_live = source.strip().lower() == "tiktok live"
+        is_public_chat = is_twitch or is_youtube_live or is_tiktok_live
 
         if chatter_profile is None and is_twitch:
             chatter_profile = profile_from_login(author)
-        if chatter_profile is None and is_youtube_live:
+        if chatter_profile is None and (is_youtube_live or is_tiktok_live):
             chatter_profile = profile_from_login(author)
 
         is_creator = from_creator or is_creator_viewer_turn(source=source, author=author)
@@ -1794,10 +1968,14 @@ class LunaTwitchBot(commands.Bot):
                 else creator_block
             )
         if is_public_chat and not is_creator and chatter_profile is not None:
-            platform = "Twitch" if is_twitch else "YouTube Live"
+            platform = "Twitch" if is_twitch else "YouTube Live" if is_youtube_live else "TikTok Live"
             session_msgs, returning = (1, False)
             if is_twitch:
                 session_msgs, returning = self._chatter_session_stats(chatter_profile)
+            elif is_youtube_live:
+                session_msgs, returning = self._youtube_session_stats(chatter_profile)
+            elif is_tiktok_live:
+                session_msgs, returning = self._tiktok_session_stats(chatter_profile)
             chat_note = live_chatter_system_note(
                 profile=chatter_profile,
                 message=question,
@@ -1812,6 +1990,28 @@ class LunaTwitchBot(commands.Bot):
                 if system_content
                 else chat_note
             )
+        if is_youtube_live:
+            for yt_extra in (
+                self._youtube_live_session.block_for_chat_reply(),
+                youtube_live_reply_style_block(),
+            ):
+                if yt_extra:
+                    system_content = (
+                        f"{system_content}\n\n{yt_extra}".strip()
+                        if system_content
+                        else yt_extra
+                    )
+        if is_tiktok_live:
+            for tt_extra in (
+                self._tiktok_live_session.block_for_chat_reply(),
+                tiktok_live_reply_style_block(),
+            ):
+                if tt_extra:
+                    system_content = (
+                        f"{system_content}\n\n{tt_extra}".strip()
+                        if system_content
+                        else tt_extra
+                    )
         if (
             (is_public_chat or author_is_bot)
             and not is_creator
@@ -1823,6 +2023,8 @@ class LunaTwitchBot(commands.Bot):
                     plat = "Discord bot"
                 elif is_twitch:
                     plat = "Twitch"
+                elif is_tiktok_live:
+                    plat = "TikTok Live"
                 else:
                     plat = "YouTube Live"
                 chatter_label = (
@@ -1855,6 +2057,22 @@ class LunaTwitchBot(commands.Bot):
         )
         if user_memory:
             system_content = f"{system_content}{user_memory}" if system_content else user_memory.lstrip()
+        if self._lol_context_summary.strip():
+            lol_block = os.environ.get(
+                "LUNA_LOL_CONTEXT_INJECTION",
+                (
+                    "\n\n## League of Legends (Riot Client — local stats)\n"
+                    "The streamer is playing solo. Trust these numbers for KDA, gold, phase, rank; "
+                    "combine with screen context when they share the game:\n{summary}"
+                ),
+            ).strip()
+            if "{summary}" in lol_block:
+                lol_extra = lol_block.format(summary=self._lol_context_summary.strip())
+            else:
+                lol_extra = f"{lol_block}\n{self._lol_context_summary.strip()}"
+            system_content = (
+                f"{system_content}{lol_extra}" if system_content else lol_extra.lstrip()
+            )
         if self._screen_context_summary:
             block = os.environ.get(
                 "LUNA_SCREEN_CONTEXT_INJECTION",
@@ -2398,7 +2616,9 @@ async def _run_async(
 
     prompted_yt_stream_ids: set[str] = set()
     yt_runner = YouTubeLiveChatRunner()
+    tt_runner = TikTokLiveChatRunner()
     bot._youtube_live_active_cb = lambda: yt_runner.is_running
+    bot._tiktok_live_active_cb = lambda: tt_runner.is_running
 
     async def _hub_status(text: str) -> None:
         if hub is not None:
@@ -2407,8 +2627,60 @@ async def _run_async(
     async def _on_youtube_live_chat(author: str, text: str, ts_ms: int) -> None:
         await bot.handle_youtube_live_chat(author, text, ts_ms)
 
+    async def _on_tiktok_live_chat(author: str, text: str, ts_ms: int) -> None:
+        await bot.handle_tiktok_live_chat(author, text, ts_ms)
+
     async def _on_yt_live_stopped() -> None:
         pass
+
+    async def _on_tt_live_stopped() -> None:
+        bot._tiktok_live_session.clear()
+
+    async def _connect_tiktok_live_stream(
+        item: dict[str, str] | None = None,
+    ) -> bool:
+        uid = tiktok_live_username()
+        if not uid:
+            return False
+        if tt_runner.is_running and tt_runner.active_username.lower() == uid.lower():
+            return True
+        bot._tiktok_live_session.clear()
+        title = ""
+        if item:
+            title = str(item.get("title") or "").strip()
+        await tt_runner.start(
+            username=uid,
+            on_chat=_on_tiktok_live_chat,
+            broadcast_status=_hub_status,
+            on_stopped=_on_tt_live_stopped,
+        )
+        label = f" ({title})" if title else ""
+        await _hub_status(f"TikTok Live chat: connected ({uid}){label}.")
+        return True
+
+    async def _disconnect_tiktok_live_stream(*, reason: str = "") -> None:
+        if tt_runner.is_running:
+            if reason:
+                print(f"(tiktok live) stopping listener — {reason}", flush=True)
+            await tt_runner.stop()
+        bot._tiktok_live_session.clear()
+
+    async def _on_tiktok_live_watch_detected(item: dict[str, str]) -> None:
+        uid = tiktok_live_username()
+        if not uid:
+            return
+        if tt_runner.is_running:
+            return
+        title = str(item.get("title") or "TikTok Live")
+        print(f"(tiktok live watch) live: {title} ({uid})", flush=True)
+        await _hub_status(f"TikTok live watch: live detected — connecting chat ({uid})…")
+        await _connect_tiktok_live_stream(item)
+
+    async def _on_tiktok_live_watch_offline() -> None:
+        if not tt_runner.is_running:
+            return
+        await _disconnect_tiktok_live_stream(reason="not live (watch poll)")
+        await _hub_status("TikTok live watch: not live — chat listener idle.")
 
     async def _prompt_youtube_live_url(item: dict[str, str], *, force: bool = False) -> None:
         sid = str(item.get("id") or "").strip()
@@ -2449,6 +2721,7 @@ async def _run_async(
             return False
         if yt_runner.is_running and yt_runner.active_video_id == sid:
             return True
+        bot._youtube_live_session.clear()
         page_url = str(item.get("url") or "").strip()
         if page_url:
             set_youtube_live_url(page_url)
@@ -2472,6 +2745,22 @@ async def _run_async(
         await _hub_status(f"YouTube Live chat (pytchat): connected ({sid}).")
         return True
 
+    async def _disconnect_youtube_live_stream(*, reason: str = "") -> None:
+        if yt_runner.is_running:
+            if reason:
+                print(f"(youtube live) stopping listener — {reason}", flush=True)
+            await yt_runner.stop()
+        clear_youtube_live_stream()
+        bot._youtube_live_session.clear()
+        if reason and hub is not None:
+            await hub.broadcast(
+                {
+                    "type": "control",
+                    "name": "youtube_live_prompt",
+                    "open": False,
+                }
+            )
+
     async def _on_youtube_live_watch_detected(item: dict[str, str]) -> None:
         sid = str(item.get("id") or "").strip()
         if not sid:
@@ -2484,6 +2773,12 @@ async def _run_async(
             f"YouTube live watch: live detected — connecting pytchat ({sid})…",
         )
         await _connect_youtube_live_stream(item)
+
+    async def _on_youtube_live_watch_offline() -> None:
+        if not yt_runner.is_running and not youtube_live_video_id():
+            return
+        await _disconnect_youtube_live_stream(reason="channel not live (watch poll)")
+        await _hub_status("YouTube live watch: not live — chat listener idle.")
 
     # Kick off STT + TTS warmups in the background. These cost a few seconds
     # of model load / DNS handshake the FIRST time they're called, so doing
@@ -2555,6 +2850,33 @@ async def _run_async(
                 if not isinstance(raw_b64, str) or not raw_b64.strip():
                     return
                 await bot.ingest_viewer_screen_frame(raw_b64.strip())
+                return
+
+            if msg_type == "viewer_lol_refresh":
+                if not lol_context_enabled():
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "League context off — set LUNA_LOL_CONTEXT=1 in .env.",
+                        },
+                    )
+                    return
+                snap = await asyncio.to_thread(build_lol_context_snapshot)
+                bot._lol_context_summary = (snap or "").strip()
+                if bot._lol_context_summary:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": f"League context updated ({len(bot._lol_context_summary)} chars).",
+                        },
+                    )
+                else:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "League: open Riot Client / be in a match (lockfile not found).",
+                        },
+                    )
                 return
 
             if msg_type == "viewer_play":
@@ -2960,6 +3282,9 @@ async def _run_async(
 
     feed_task: asyncio.Task | None = None
     yt_watch_task: asyncio.Task | None = None
+    tt_watch_task: asyncio.Task | None = None
+    tt_task: asyncio.Task | None = None
+    lol_task: asyncio.Task | None = None
     live_social_task: asyncio.Task | None = None
     cohost_task: asyncio.Task | None = None
     if hub is not None:
@@ -3046,9 +3371,34 @@ async def _run_async(
                     run_youtube_live_watch_poller(
                         probe_url=youtube_live_check_probe_url(),
                         on_live=_on_youtube_live_watch_detected,
+                        on_offline=_on_youtube_live_watch_offline,
                         broadcast_status=_hub_status,
                     ),
                     name="luna-youtube-live-watch",
+                )
+
+        if tiktok_live_chat_requested():
+            uid = tiktok_live_username()
+            if not uid:
+                await _hub_status(
+                    "TikTok Live chat: set LUNA_TIKTOK_LIVE_USERNAME (e.g. @yourhandle)."
+                )
+            elif tiktok_live_watch_poll_enabled():
+                tt_watch_task = asyncio.create_task(
+                    run_tiktok_live_watch_poller(
+                        username=uid,
+                        on_live=_on_tiktok_live_watch_detected,
+                        on_offline=_on_tiktok_live_watch_offline,
+                        broadcast_status=_hub_status,
+                    ),
+                    name="luna-tiktok-live-watch",
+                )
+            else:
+                tt_task = await tt_runner.start(
+                    username=uid,
+                    on_chat=_on_tiktok_live_chat,
+                    broadcast_status=_hub_status,
+                    on_stopped=_on_tt_live_stopped,
                 )
 
         if live_watch_enabled():
@@ -3085,6 +3435,21 @@ async def _run_async(
                 name="luna-cohost-banter",
             )
 
+        async def _on_lol_context_update(snap: str) -> None:
+            bot._lol_context_summary = (snap or "").strip()
+            if snap:
+                print(f"(lol) context updated ({len(snap)} chars)", flush=True)
+
+        if lol_context_enabled():
+            maybe_launch_riot_clients()
+            lol_task = asyncio.create_task(
+                run_lol_context_poller(
+                    _on_lol_context_update,
+                    broadcast_status=_hub_status,
+                ),
+                name="luna-lol-context",
+            )
+
     try:
         await bot.start()
     finally:
@@ -3095,10 +3460,23 @@ async def _run_async(
             except (asyncio.CancelledError, Exception):
                 pass
         await yt_runner.stop()
+        await tt_runner.stop()
         if yt_watch_task is not None:
             yt_watch_task.cancel()
             try:
                 await yt_watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if tt_watch_task is not None:
+            tt_watch_task.cancel()
+            try:
+                await tt_watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if tt_task is not None:
+            tt_task.cancel()
+            try:
+                await tt_task
             except (asyncio.CancelledError, Exception):
                 pass
         if live_social_task is not None:
@@ -3111,6 +3489,12 @@ async def _run_async(
             cohost_task.cancel()
             try:
                 await cohost_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if lol_task is not None:
+            lol_task.cancel()
+            try:
+                await lol_task
             except (asyncio.CancelledError, Exception):
                 pass
         if discord_bot_obj is not None:

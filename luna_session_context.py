@@ -23,6 +23,7 @@ def format_dual_presence_block(
     *,
     twitch_channel: str = "",
     youtube_live_listening: bool = False,
+    tiktok_live_listening: bool = False,
 ) -> str:
     """Text appended to system prompts so both personas know each other and the current setup.
 
@@ -75,6 +76,14 @@ def format_dual_presence_block(
         else:
             parts.append(
                 "YouTube Live chat ingestion is **not** active in this process unless the streamer turned it on."
+            )
+        if tiktok_live_listening:
+            parts.append(
+                "**Right now:** TikTok Live chat is **connected** — some messages may be from the **live TikTok** chat."
+            )
+        else:
+            parts.append(
+                "TikTok Live chat ingestion is **not** active unless the streamer turned it on."
             )
         parts.append(
             "If Twitch is connected, Twitch chat is real channel chat—viewers can chat whether the channel is live or not."

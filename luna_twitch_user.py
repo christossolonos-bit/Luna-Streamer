@@ -126,7 +126,12 @@ def chatter_reply_system_note(
         f"- Role: {roles}\n"
         f"- {visit}\n"
         f"Open by using **{chat_name}** when it fits. Do not confuse them with anyone else in chat.\n"
-        f"What they said:\n{message.strip()}"
+        + (
+            "Engage like a co-host in conversation — react, joke, ask a brief follow-up when natural.\n"
+            if platform.strip().lower() == "youtube live"
+            else ""
+        )
+        + f"What they said:\n{message.strip()}"
     )
 
 
