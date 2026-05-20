@@ -321,15 +321,15 @@ def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
         " ",
         text,
     )
-    song_mode = _is_song_style_text(text)
-
     def _star_replace(m: re.Match[str]) -> str:
         inner = m.group(1).strip()
         if not inner:
             return " "
-        if song_mode and _is_action_phrase(inner):
+        # Long *narration* (e.g. *ears perk up, tail wagging*) — drop entirely, no TTS.
+        if len(inner) > 48 or inner.count(" ") >= 3:
             return " "
-        return f" {inner} "
+        # Short *cues* (*laugh*, *gasp*) → interjection sound or silence.
+        return _action_sound(inner)
 
     text = re.sub(r"\*([^*]+)\*", _star_replace, text)
     text = re.sub(r"\(([^()]+)\)", lambda m: _action_sound(m.group(1)), text)

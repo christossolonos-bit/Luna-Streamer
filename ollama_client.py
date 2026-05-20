@@ -174,9 +174,410 @@ def encode_image(path: Path) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def build_client() -> Client:
+def llm_provider() -> str:
+    """``ollama`` (default) or ``openrouter`` for cloud chat (see OPENROUTER_API_KEY)."""
+    raw = (os.environ.get("LUNA_LLM_PROVIDER") or "ollama").strip().lower()
+    if raw in ("openrouter", "or", "cloud"):
+        return "openrouter"
+    return "ollama"
+
+
+def openrouter_configured() -> bool:
+    return bool((os.environ.get("OPENROUTER_API_KEY") or "").strip())
+
+
+def openrouter_streaming_enabled() -> bool:
+    """SSE streaming to the viewer is off by default (more reliable on Windows + free tier)."""
+    raw = (os.environ.get("LUNA_OPENROUTER_STREAM") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parse_model_list(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in raw.replace(",", " ").split():
+        m = part.strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def openrouter_model_candidates(primary: str, *, vision: bool = False) -> list[str]:
+    """Primary model first, then fallbacks (used on HTTP 429)."""
+    main = (primary or "").strip()
+    if not main:
+        main = resolve_vision_model() if vision else resolve_chat_model()
+    fb_key = (
+        "LUNA_OPENROUTER_VISION_MODEL_FALLBACKS"
+        if vision
+        else "LUNA_OPENROUTER_MODEL_FALLBACKS"
+    )
+    fb_default = (
+        "openrouter/free,nvidia/nemotron-nano-12b-v2-vl:free,meta-llama/llama-3.2-3b-instruct:free"
+        if vision
+        else (
+            "openrouter/free,meta-llama/llama-3.3-70b-instruct:free,"
+            "qwen/qwen3-next-80b-a3b-instruct:free,meta-llama/llama-3.2-3b-instruct:free"
+        )
+    )
+    fallbacks = _parse_model_list((os.environ.get(fb_key) or fb_default).strip())
+    ordered: list[str] = []
+    for m in [main, *fallbacks]:
+        if m and m not in ordered:
+            ordered.append(m)
+    return ordered or ["openrouter/free"]
+
+
+def _openrouter_is_rate_limited(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "rate-limit" in msg or "rate limited" in msg
+
+
+def _openrouter_should_try_fallback(exc: BaseException) -> bool:
+    """Retry next model on provider throttle or missing/invalid model id."""
+    if _openrouter_is_rate_limited(exc):
+        return True
+    msg = str(exc).lower()
+    return (
+        "404" in msg
+        or "not found" in msg
+        or "no endpoints" in msg
+        or "invalid model" in msg
+        or "does not exist" in msg
+    )
+
+
+def resolve_chat_model() -> str:
+    if llm_provider() == "openrouter":
+        return (
+            (os.environ.get("LUNA_OPENROUTER_MODEL") or "").strip()
+            or (os.environ.get("LUNA_CHAT_MODEL") or "").strip()
+            or (os.environ.get("OPENROUTER_MODEL") or "").strip()
+            or "openrouter/free"
+        )
+    return (
+        (os.environ.get("LUNA_CHAT_MODEL") or "").strip()
+        or (os.environ.get("OLLAMA_MODEL") or "").strip()
+        or (os.environ.get("OLLAMA_CHAT_MODEL") or "").strip()
+        or "gemma4:e4b"
+    )
+
+
+def vision_provider() -> str:
+    """``ollama`` or ``openrouter``. Defaults to match chat when ``LUNA_LLM_PROVIDER=openrouter``."""
+    raw = (os.environ.get("LUNA_VISION_PROVIDER") or "").strip().lower()
+    if raw == "ollama":
+        return "ollama"
+    if raw in ("openrouter", "or", "cloud"):
+        return "openrouter"
+    if llm_provider() == "openrouter":
+        return "openrouter"
+    return "ollama"
+
+
+def resolve_vision_model() -> str:
+    if vision_provider() == "openrouter":
+        return (
+            (os.environ.get("LUNA_OPENROUTER_VISION_MODEL") or "").strip()
+            or "nvidia/nemotron-nano-12b-v2-vl:free"
+        )
+    return (
+        (os.environ.get("LUNA_SCREEN_VISION_MODEL") or "").strip()
+        or (os.environ.get("OLLAMA_VISION_MODEL") or "").strip()
+        or (os.environ.get("OLLAMA_MODEL") or "").strip()
+        or "gemma4:e4b"
+    )
+
+
+def _openrouter_timeout_sec(*, vision: bool = False) -> int:
+    key = "LUNA_OPENROUTER_VISION_TIMEOUT_SEC" if vision else "LUNA_OPENROUTER_TIMEOUT_SEC"
+    default = "180" if vision else "120"
+    raw = (os.environ.get(key) or default).strip() or default
+    try:
+        return max(30, min(int(raw), 600))
+    except ValueError:
+        return 180 if vision else 120
+
+
+def build_ollama_client() -> Client:
     host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
     return Client(host=host)
+
+
+class _CompatMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _CompatChunk:
+    def __init__(self, content: str) -> None:
+        self.message = _CompatMessage(content)
+
+
+class _CompatResponse:
+    def __init__(self, content: str) -> None:
+        self.message = _CompatMessage(content)
+
+
+class OpenRouterChatClient:
+    """OpenAI-compatible chat client for OpenRouter (free models use ``:free`` suffix or ``openrouter/free``)."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str | None = None,
+        http_referer: str = "",
+        app_title: str = "Luna Streamer",
+    ) -> None:
+        self._api_key = api_key.strip()
+        self._base_url = (
+            (base_url or os.environ.get("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1")
+            .strip()
+            .rstrip("/")
+        )
+        self._http_referer = (http_referer or os.environ.get("OPENROUTER_HTTP_REFERER") or "").strip()
+        self._app_title = (app_title or os.environ.get("OPENROUTER_APP_TITLE") or "Luna Streamer").strip()
+
+    def _headers(self) -> dict[str, str]:
+        h = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        if self._http_referer:
+            h["HTTP-Referer"] = self._http_referer
+        if self._app_title:
+            h["X-OpenRouter-Title"] = self._app_title
+        return h
+
+    @staticmethod
+    def _b64_image_data_url(b64: str) -> str:
+        raw = (b64 or "").strip()
+        if raw.startswith("data:"):
+            return raw
+        mime = "image/jpeg"
+        try:
+            pad = "=" * ((4 - len(raw) % 4) % 4)
+            head = base64.b64decode(raw[:48] + pad)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                mime = "image/png"
+            elif head[:3] == b"GIF":
+                mime = "image/gif"
+            elif head[:4] == b"RIFF" and len(head) >= 12 and head[8:12] == b"WEBP":
+                mime = "image/webp"
+        except Exception:
+            pass
+        return f"data:{mime};base64,{raw}"
+
+    @staticmethod
+    def _message_images(message: dict) -> list[str]:
+        images = message.get("images")
+        if not images:
+            return []
+        if isinstance(images, str):
+            return [images] if images.strip() else []
+        return [str(i) for i in images if i]
+
+    @staticmethod
+    def _messages_have_images(messages: list[dict]) -> bool:
+        return any(OpenRouterChatClient._message_images(m) for m in messages)
+
+    @staticmethod
+    def _normalize_messages(messages: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for m in messages:
+            role = str(m.get("role") or "user").strip()
+            if role not in ("system", "user", "assistant"):
+                role = "user"
+            content = m.get("content")
+            if content is None:
+                text = ""
+            elif isinstance(content, str):
+                text = content
+            else:
+                text = str(content)
+            images = OpenRouterChatClient._message_images(m)
+            if images:
+                parts: list[dict] = []
+                if text.strip():
+                    parts.append({"type": "text", "text": text.strip()})
+                for img in images:
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": OpenRouterChatClient._b64_image_data_url(img),
+                            },
+                        }
+                    )
+                if not parts:
+                    parts.append({"type": "text", "text": "Describe the image."})
+                out.append({"role": role, "content": parts})
+            else:
+                out.append({"role": role, "content": text})
+        return out
+
+    def _max_tokens_from_options(self, options: dict | None) -> int | None:
+        opts = options or {}
+        raw = opts.get("num_predict")
+        if raw is None:
+            raw = (os.environ.get("LUNA_OPENROUTER_MAX_TOKENS") or os.environ.get("LUNA_OLLAMA_NUM_PREDICT") or "400").strip()
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            n = 400
+        return max(32, n) if n > 0 else None
+
+    def _temperature_from_options(self, options: dict | None) -> float | None:
+        opts = options or {}
+        raw = opts.get("temperature")
+        if raw is None:
+            raw = (os.environ.get("LUNA_OLLAMA_TEMPERATURE") or "").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def _post_json(self, payload: dict, *, timeout_sec: int | None = None) -> dict:
+        import json
+        import urllib.error
+        import urllib.request
+
+        url = f"{self._base_url}/chat/completions"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
+        timeout = timeout_sec if timeout_sec is not None else _openrouter_timeout_sec(vision=False)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            hint = ""
+            if exc.code == 401:
+                hint = " Check OPENROUTER_API_KEY at https://openrouter.ai/keys"
+            raise RuntimeError(
+                f"OpenRouter HTTP {exc.code}: {err_body[:500] or exc.reason}{hint}"
+            ) from exc
+        return json.loads(body)
+
+    def _stream_chunks(self, payload: dict, *, timeout_sec: int | None = None):
+        import json
+        import urllib.error
+        import urllib.request
+
+        payload = dict(payload)
+        payload["stream"] = True
+        url = f"{self._base_url}/chat/completions"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
+        timeout = timeout_sec if timeout_sec is not None else _openrouter_timeout_sec(vision=False)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    piece = line[5:].strip()
+                    if piece == "[DONE]":
+                        break
+                    try:
+                        evt = json.loads(piece)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = evt.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content")
+                    if content:
+                        yield _CompatChunk(content)
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(f"OpenRouter HTTP {exc.code}: {err_body[:500] or exc.reason}") from exc
+        except (ConnectionResetError, BrokenPipeError, TimeoutError) as exc:
+            raise RuntimeError(f"OpenRouter stream disconnected: {exc}") from exc
+
+    def chat(self, **kwargs):  # noqa: ANN003
+        raw_messages = list(kwargs.get("messages") or [])
+        model = str(kwargs.get("model") or resolve_chat_model())
+        messages = self._normalize_messages(raw_messages)
+        stream = bool(kwargs.get("stream", False))
+        options = kwargs.get("options")
+        vision = self._messages_have_images(raw_messages)
+        timeout = _openrouter_timeout_sec(vision=vision)
+        body: dict = {"messages": messages}
+        max_tokens = self._max_tokens_from_options(options if isinstance(options, dict) else None)
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        temp = self._temperature_from_options(options if isinstance(options, dict) else None)
+        if temp is not None:
+            body["temperature"] = temp
+
+        candidates = openrouter_model_candidates(model, vision=vision)
+        last_err: BaseException | None = None
+        for idx, try_model in enumerate(candidates):
+            body["model"] = try_model
+            try:
+                if stream:
+                    if idx > 0:
+                        print(f"(openrouter) streaming via fallback {try_model!r}", flush=True)
+                    return self._stream_chunks(body, timeout_sec=timeout)
+                data = self._post_json(body, timeout_sec=timeout)
+                choices = data.get("choices") or []
+                if not choices:
+                    return _CompatResponse("")
+                msg = choices[0].get("message") or {}
+                text = (msg.get("content") or "").strip()
+                if idx > 0:
+                    print(f"(openrouter) ok on fallback {try_model!r}", flush=True)
+                return _CompatResponse(text)
+            except RuntimeError as exc:
+                last_err = exc
+                if _openrouter_should_try_fallback(exc) and idx < len(candidates) - 1:
+                    nxt = candidates[idx + 1]
+                    why = "rate-limited" if _openrouter_is_rate_limited(exc) else "unavailable"
+                    print(
+                        f"(openrouter) {try_model!r} {why} — trying {nxt!r}",
+                        flush=True,
+                    )
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        return _CompatResponse("")
+
+
+def build_client() -> Client | OpenRouterChatClient:
+    if llm_provider() == "openrouter":
+        key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError(
+                "LUNA_LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY "
+                "(create one at https://openrouter.ai/keys)"
+            )
+        return OpenRouterChatClient(api_key=key)
+    return build_ollama_client()
+
+
+def build_vision_client() -> Client | OpenRouterChatClient:
+    """Chat + vision client (OpenRouter multimodal when ``LUNA_LLM_PROVIDER=openrouter``)."""
+    if vision_provider() == "openrouter":
+        if not openrouter_configured():
+            raise RuntimeError(
+                "OpenRouter vision requires OPENROUTER_API_KEY "
+                "(https://openrouter.ai/keys)"
+            )
+        return build_client()
+    return build_ollama_client()
 
 
 def _apply_think_directive(messages: list[dict], think: bool) -> list[dict]:
@@ -201,6 +602,21 @@ def _apply_think_directive(messages: list[dict], think: bool) -> list[dict]:
     return out
 
 
+def _openrouter_chat_kwargs(
+    model: str,
+    messages: list[dict],
+    *,
+    stream: bool,
+) -> dict:
+    opts = build_ollama_options(for_screen=False)
+    return {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "options": opts,
+    }
+
+
 def chat_request_kwargs(
     model: str,
     messages: list[dict],
@@ -208,6 +624,8 @@ def chat_request_kwargs(
     stream: bool,
 ) -> dict:
     """Shared kwargs for client.chat (options, keep_alive, think)."""
+    if llm_provider() == "openrouter":
+        return _openrouter_chat_kwargs(model, messages, stream=stream)
     ka = ollama_keep_alive()
     opts = build_ollama_options(for_screen=False)
     think = ollama_think_mode()
@@ -226,7 +644,7 @@ def chat_request_kwargs(
     return kwargs
 
 
-def summarize_viewer_screen(client: Client, model: str, image_b64: str) -> str:
+def summarize_viewer_screen(client: Client | OpenRouterChatClient, model: str, image_b64: str) -> str:
     """Run a single vision chat turn on a base64 JPEG/PNG (no stream, no stdout)."""
     prompt = os.environ.get(
         "LUNA_SCREEN_SUMMARY_PROMPT",
@@ -236,9 +654,6 @@ def summarize_viewer_screen(client: Client, model: str, image_b64: str) -> str:
             "If unreadable or empty, say (screen unclear). No markdown, plain text only."
         ),
     ).strip()
-    ka = ollama_keep_alive()
-    opts = build_ollama_options(for_screen=True)
-    think = ollama_think_mode()
     base_messages = [
         {
             "role": "user",
@@ -246,10 +661,23 @@ def summarize_viewer_screen(client: Client, model: str, image_b64: str) -> str:
             "images": [image_b64],
         }
     ]
+    if isinstance(client, OpenRouterChatClient):
+        opts = build_ollama_options(for_screen=True) or {}
+        kwargs: dict = {
+            "model": model or resolve_vision_model(),
+            "messages": base_messages,
+            "stream": False,
+            "options": opts,
+        }
+        response = client.chat(**kwargs)
+        return (response.message.content or "").strip()
+    ka = ollama_keep_alive()
+    opts = build_ollama_options(for_screen=True)
+    think = ollama_think_mode()
     final_messages = base_messages
     if think is not None and not _THINK_KWARG_SUPPORTED:
         final_messages = _apply_think_directive(base_messages, think)
-    kwargs: dict = {
+    kwargs = {
         "model": model,
         "messages": final_messages,
         "stream": False,
@@ -265,13 +693,13 @@ def summarize_viewer_screen(client: Client, model: str, image_b64: str) -> str:
 
 
 def describe_youtube_video(
-    client: Client,
+    client: Client | OpenRouterChatClient,
     model: str,
     images_b64: list[str],
     *,
     title: str = "",
 ) -> str:
-    """Describe a YouTube video from evenly spaced JPEG frames (Qwen / other vision models)."""
+    """Describe a YouTube video from evenly spaced JPEG frames."""
     if not images_b64:
         return ""
     title_line = f'Video title: {(title or "").strip() or "(unknown)"}\n'
@@ -290,11 +718,6 @@ def describe_youtube_video(
         predict = max(64, int(predict_raw))
     except ValueError:
         predict = 320
-    ka = ollama_keep_alive()
-    opts = build_ollama_options(for_screen=True) or {}
-    opts = dict(opts)
-    opts["num_predict"] = predict
-    think = ollama_think_mode()
     base_messages = [
         {
             "role": "user",
@@ -302,10 +725,26 @@ def describe_youtube_video(
             "images": images_b64,
         }
     ]
+    if isinstance(client, OpenRouterChatClient):
+        opts = build_ollama_options(for_screen=True) or {}
+        opts = dict(opts)
+        opts["num_predict"] = predict
+        response = client.chat(
+            model=model or resolve_vision_model(),
+            messages=base_messages,
+            stream=False,
+            options=opts,
+        )
+        return (response.message.content or "").strip()
+    ka = ollama_keep_alive()
+    opts = build_ollama_options(for_screen=True) or {}
+    opts = dict(opts)
+    opts["num_predict"] = predict
+    think = ollama_think_mode()
     final_messages = base_messages
     if think is not None and not _THINK_KWARG_SUPPORTED:
         final_messages = _apply_think_directive(base_messages, think)
-    kwargs: dict = {
+    kwargs = {
         "model": model,
         "messages": final_messages,
         "stream": False,
@@ -320,7 +759,7 @@ def describe_youtube_video(
 
 
 def chat_once(
-    client: Client,
+    client: Client | OpenRouterChatClient,
     model: str,
     messages: list[dict],
     *,

@@ -205,6 +205,9 @@ def _discord_chat_debug() -> bool:
     return _env_truthy("LUNA_DISCORD_CHAT_DEBUG", default=False)
 
 
+_discord_skip_logged: set[tuple[int, int]] = set()
+
+
 def _discord_chat_log(msg: str) -> None:
     print(f"(discord chat) {msg}", flush=True)
 
@@ -1204,13 +1207,18 @@ class LunaDiscordBot:
             else:
                 if not _channel_allowed_for_chat(message.channel, message.guild):
                     if _discord_chat_debug():
-                        parent = getattr(message.channel, "parent", None)
-                        pid = f" (thread parent {parent.id})" if parent else ""
-                        gname = getattr(message.guild, "name", message.guild.id)
-                        _discord_chat_log(
-                            f"skip #{ch_name}{pid} in {gname!r}: channel id {message.channel.id} "
-                            "not allowed for this server (see LUNA_DISCORD_GUILD_CHAT_CHANNELS)"
-                        )
+                        gid = int(message.guild.id)
+                        cid = int(message.channel.id)
+                        key = (gid, cid)
+                        if key not in _discord_skip_logged:
+                            _discord_skip_logged.add(key)
+                            parent = getattr(message.channel, "parent", None)
+                            pid = f" (thread parent {parent.id})" if parent else ""
+                            gname = getattr(message.guild, "name", message.guild.id)
+                            _discord_chat_log(
+                                f"skip #{ch_name}{pid} in {gname!r}: channel id {cid} "
+                                "not allowed for this server (see LUNA_DISCORD_GUILD_CHAT_CHANNELS)"
+                            )
                     return
                 channel_label = f"#{ch_name}"
 

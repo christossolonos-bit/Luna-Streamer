@@ -8,7 +8,14 @@ Environment (or use CLI flags where noted):
   TWITCH_TOKEN   OAuth token, usually starting with oauth:
   TWITCH_CHANNEL Channel login to join (no #), e.g. mychannel
   OLLAMA_HOST    Optional, default http://127.0.0.1:11434
-  OLLAMA_MODEL   Optional, default gemma4:e4b
+  OLLAMA_MODEL   Optional, default gemma4:e4b (also used for screen/YouTube vision)
+  LUNA_LLM_PROVIDER  ollama (default) | openrouter — cloud chat via OpenRouter API
+  OPENROUTER_API_KEY Required when LUNA_LLM_PROVIDER=openrouter (https://openrouter.ai/keys)
+  LUNA_OPENROUTER_MODEL  e.g. qwen/qwen3-4b:free (chat; like local qwen3.5:4b)
+  LUNA_OPENROUTER_MODEL_FALLBACKS  Comma list tried on 429 (default includes openrouter/free)
+  LUNA_OPENROUTER_VISION_MODEL  e.g. qwen/qwen2.5-vl-3b-instruct:free for screen/YouTube
+  OPENROUTER_HTTP_REFERER  Optional site URL (OpenRouter attribution)
+  OPENROUTER_APP_TITLE     Optional app name header (default Luna Streamer)
   TWITCH_SEND_REPLIES  If "1", post model replies to chat (needs chat:write on token)
   TWITCH_AUTO_REPLY    If "1", generate replies from regular chat messages
   TWITCH_AUTO_TRIGGER  "all" (default: Luna replies even without @; Viktor only when named) or "mention"
@@ -268,9 +275,16 @@ from riot_lol_context import (
 from ollama_client import (
     ThinkStripper,
     build_client,
+    build_vision_client,
     chat_once,
     chat_request_kwargs,
     configure_stdio_utf8,
+    llm_provider,
+    openrouter_configured,
+    openrouter_streaming_enabled,
+    resolve_chat_model,
+    resolve_vision_model,
+    vision_provider,
     strip_think_blocks,
     summarize_viewer_screen,
 )
@@ -480,6 +494,7 @@ class LunaTwitchBot(commands.Bot):
         ollama_client: Client,
         chat_hub: ChatHub | None,
         discord_bot: LunaDiscordBot | None = None,
+        vision_ollama_client: Client | None = None,
     ) -> None:
         super().__init__(
             token=token,
@@ -488,8 +503,9 @@ class LunaTwitchBot(commands.Bot):
         )
         self._discord = discord_bot
         self._ollama = ollama_client
+        self._vision_ollama = vision_ollama_client or ollama_client
         self._model = model
-        self._chat_model = (os.environ.get("LUNA_CHAT_MODEL") or "").strip() or self._model
+        self._chat_model = resolve_chat_model()
         self._system = system_prompt.strip()
         self._twitch_channel_login = (channel or "").strip().lstrip("#").lower()
         self._youtube_live_active_cb: Callable[[], bool] | None = None
@@ -576,7 +592,20 @@ class LunaTwitchBot(commands.Bot):
                 f"| display name: {creator_display_name()!r}",
                 flush=True,
             )
-        if self._chat_model != self._model:
+        if llm_provider() == "openrouter":
+            vp = vision_provider()
+            if vp == "openrouter":
+                print(
+                    f"(llm) OpenRouter chat+vision={self._chat_model!r}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"(llm) OpenRouter chat={self._chat_model!r} | "
+                    f"Ollama vision={self._model!r} @ {os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')}",
+                    flush=True,
+                )
+        elif self._chat_model != self._model:
             print(
                 f"(ollama) LUNA_CHAT_MODEL={self._chat_model!r} (text chat) | "
                 f"OLLAMA_MODEL / vision={self._model!r}",
@@ -1261,11 +1290,11 @@ class LunaTwitchBot(commands.Bot):
         )
 
     async def _summarize_latest_screen_frame(self, image_b64: str) -> None:
-        vision_model = (os.environ.get("LUNA_SCREEN_VISION_MODEL") or "").strip() or self._model
+        vision_model = resolve_vision_model() or self._model
         try:
             summary = await asyncio.to_thread(
                 summarize_viewer_screen,
-                self._ollama,
+                self._vision_ollama,
                 vision_model,
                 image_b64,
             )
@@ -2105,13 +2134,14 @@ class LunaTwitchBot(commands.Bot):
             "LUNA_STREAM_ASSISTANT_WS",
             default=True,
         )
-        if stream_ws:
+        use_or_buffer = llm_provider() == "openrouter" and not openrouter_streaming_enabled()
+        if stream_ws and not use_or_buffer:
             print("Assistant: (streaming to viewer…)", flush=True)
         else:
             print("Assistant: ", end="", flush=True)
 
         async with self._ollama_lock:
-            if stream_ws:
+            if stream_ws and not use_or_buffer:
                 reply = await self._ollama_stream_to_hub(
                     channel_name,
                     messages,
@@ -2123,7 +2153,7 @@ class LunaTwitchBot(commands.Bot):
                     self._ollama,
                     self._chat_model,
                     messages,
-                    stream=True,
+                    stream=False,
                 )
         reply_stripped = strip_think_blocks(reply).strip()
         self._last_assistant_reply = reply_stripped
@@ -2520,6 +2550,19 @@ class LunaTwitchBot(commands.Bot):
         asyncio.create_task(_post_public_yt_comment(), name="luna-youtube-comment-post")
 
 
+def _quiet_asyncio_connection_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Suppress noisy WinError 10054 when Discord/HTTP peers close sockets abruptly."""
+    exc = context.get("exception")
+    if isinstance(exc, ConnectionResetError):
+        return
+    msg = str(context.get("message") or "")
+    if "connection_lost" in msg.lower() and isinstance(
+        exc, (ConnectionResetError, BrokenPipeError, OSError)
+    ):
+        return
+    loop.default_exception_handler(context)
+
+
 async def _run_async(
     *,
     token: str,
@@ -2531,6 +2574,9 @@ async def _run_async(
     auto_trigger: str,
     auto_cooldown_sec: float,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_quiet_asyncio_connection_reset)
+
     ws_host = os.environ.get("LUNA_CHAT_WS_HOST", "127.0.0.1").strip()
     ws_port = int(os.environ.get("LUNA_CHAT_WS_PORT", "8765"))
 
@@ -2554,7 +2600,15 @@ async def _run_async(
             flush=True,
         )
 
+    if llm_provider() == "openrouter" and not openrouter_configured():
+        print(
+            "LUNA_LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY in .env "
+            "(https://openrouter.ai/keys)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     client = build_client()
+    vision_client = build_vision_client()
 
     discord_bot_obj: LunaDiscordBot | None = None
     discord_task: asyncio.Task | None = None
@@ -2609,6 +2663,7 @@ async def _run_async(
         ollama_client=client,
         chat_hub=hub,
         discord_bot=discord_bot_obj,
+        vision_ollama_client=vision_client,
     )
     # Wire Discord free-text chat into LunaTwitchBot's shared memory pipeline.
     if discord_bot_obj is not None:
@@ -3536,8 +3591,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("OLLAMA_MODEL", "gemma4:e4b"),
-        help="Ollama model name.",
+        default=resolve_vision_model(),
+        help="Ollama vision model (screen/YouTube frames). Chat model: LUNA_CHAT_MODEL or OpenRouter env.",
     )
     parser.add_argument(
         "--system",
@@ -3570,9 +3625,21 @@ def main() -> None:
         auto_trigger = "all"
     auto_cooldown_sec = float(os.environ.get("TWITCH_AUTO_COOLDOWN", "6").strip() or "6")
 
+    chat_model = resolve_chat_model()
+    provider = llm_provider()
+    vision_model = resolve_vision_model()
+    if provider == "openrouter" and vision_provider() == "openrouter":
+        llm_line = f"openrouter chat+vision {chat_model}"
+    elif provider == "openrouter":
+        llm_line = f"openrouter chat {chat_model} | ollama vision {vision_model}"
+    else:
+        llm_line = (
+            f"ollama {os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')} "
+            f"chat={chat_model} vision={vision_model}"
+        )
     print(
-        f"Starting Twitch bot | channel #{channel} | model {args.model} | "
-        f"ollama {os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')} | "
+        f"Starting Twitch bot | channel #{channel} | "
+        f"{llm_line} | "
         f"send_replies={send_replies} | auto_reply={auto_reply} ({auto_trigger}) | "
         f"LUNA_TTS={tts_enabled()} | LUNA_TTS_PLAY={tts_playback_enabled()} | "
         f"LUNA_TTS_PLAY_TARGET={tts_play_target()}",

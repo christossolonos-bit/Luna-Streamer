@@ -201,17 +201,12 @@ def _yt_vision_fallback_enabled() -> bool:
 
 
 def _yt_vision_model() -> str:
-    for key in (
-        "LUNA_YT_VISION_MODEL",
-        "OLLAMA_VISION_MODEL",
-        "LUNA_SCREEN_VISION_MODEL",
-        "OLLAMA_MODEL",
-        "LUNA_CHAT_MODEL",
-    ):
-        m = (os.environ.get(key) or "").strip()
-        if m:
-            return m
-    return ""
+    from ollama_client import resolve_vision_model
+
+    override = (os.environ.get("LUNA_YT_VISION_MODEL") or "").strip()
+    if override:
+        return override
+    return resolve_vision_model()
 
 
 def _yt_vision_max_sec() -> int:
@@ -424,7 +419,7 @@ def _vision_from_clip(clip: Path, *, title: str) -> str:
         flush=True,
     )
     try:
-        from ollama_client import build_client, describe_youtube_video
+        from ollama_client import build_vision_client, describe_youtube_video
     except ImportError:
         return ""
     try:
@@ -440,7 +435,7 @@ def _vision_from_clip(clip: Path, *, title: str) -> str:
     if not images_b64:
         return ""
     try:
-        client = build_client()
+        client = build_vision_client()
         description = describe_youtube_video(client, model, images_b64, title=title)
     except Exception as exc:  # noqa: BLE001
         print(f"(youtube) vision describe failed: {exc}", flush=True)
