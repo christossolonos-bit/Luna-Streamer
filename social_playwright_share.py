@@ -617,6 +617,147 @@ async def generate_and_post_youtube_video_comment(
     return await post_youtube_video_comment(video_url=video_url, comment=comment)
 
 
+def live_announce_image_path() -> Path | None:
+    from live_social_share import live_announce_image_path as _path
+
+    return _path()
+
+
+async def _playwright_attach_image(scope: object, image_path: Path) -> bool:
+    """Attach a local image to an open X/Facebook composer via ``input[type=file]``."""
+    if not image_path.is_file():
+        return False
+    try:
+        inputs = scope.locator('input[type="file"]')  # type: ignore[union-attr]
+        n = await inputs.count()
+        for i in range(n):
+            inp = inputs.nth(i)
+            try:
+                await inp.set_input_files(str(image_path), timeout=30_000)
+                return True
+            except Exception:
+                continue
+    except Exception as exc:
+        print(f"(social playwright) image attach failed: {exc}", flush=True)
+    return False
+
+
+async def _attach_image_x_composer(page: object, image_path: Path | None) -> None:
+    if image_path is None:
+        return
+    root = await _x_composer_root(page)
+    if await _playwright_attach_image(root, image_path):
+        await page.wait_for_timeout(1500)  # type: ignore[union-attr]
+        print("(social playwright) X: image attached.", flush=True)
+
+
+async def _attach_image_fb_dialog(dialog: object, page: object, image_path: Path | None) -> None:
+    if image_path is None:
+        return
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    for label in ("Photo/video", "Photo/Video", "Add photos"):
+        btn = dialog.get_by_role("button", name=re.compile(re.escape(label), re.I)).first  # type: ignore[union-attr]
+        try:
+            if await btn.count() > 0:
+                await btn.click(timeout=10_000)
+                break
+        except PWTimeout:
+            continue
+    await page.wait_for_timeout(600)  # type: ignore[union-attr]
+    if await _playwright_attach_image(dialog, image_path) or await _playwright_attach_image(page, image_path):
+        await page.wait_for_timeout(2000)  # type: ignore[union-attr]
+        print("(social playwright) Facebook: image attached.", flush=True)
+
+
+def _live_invite_uses_explicit_template() -> bool:
+    return bool((os.environ.get("LUNA_SOCIAL_LIVE_INVITE_TEMPLATE") or "").strip())
+
+
+def _live_invite_llm_enabled() -> bool:
+    if _live_invite_uses_explicit_template():
+        return False
+    return _env_truthy("LUNA_SOCIAL_LIVE_INVITE_LLM", default=True)
+
+
+def _live_invite_llm_user_prompt(platform: str, title: str, stream_url: str) -> str:
+    custom = (os.environ.get("LUNA_SOCIAL_LIVE_INVITE_PROMPT") or "").strip()
+    plat = (platform or "live").strip()
+    title_clean = (title or "").strip() or "Live stream"
+    url_clean = (stream_url or "").strip()
+    if custom:
+        return (
+            custom.replace("{platform}", plat)
+            .replace("{title}", title_clean)
+            .replace("{url}", url_clean)
+        )
+    return (
+        "Write a short, cute go-live invitation (1–3 sentences) for social media.\n"
+        f"Platform: {plat}\n"
+        f"Stream title: {title_clean}\n"
+        "Voice: Luna, a playful wolf-girl VTuber — warm, bubbly, a little mischievous; "
+        "mention Viktor (vampire co-host) if it fits naturally.\n"
+        "Invite people to join live. Do NOT include the URL, hashtags, or markdown.\n"
+        "Output only the post text."
+    )
+
+
+def _generate_live_invite_comment_llm_sync(platform: str, title: str, stream_url: str) -> str | None:
+    from ollama_client import build_client, chat_request_kwargs, strip_think_blocks
+
+    model = (os.environ.get("LUNA_CHAT_MODEL") or os.environ.get("OLLAMA_MODEL") or "").strip()
+    if not model:
+        return None
+    messages = [
+        {"role": "system", "content": _fb_llm_comment_system_prompt()},
+        {"role": "user", "content": _live_invite_llm_user_prompt(platform, title, stream_url)},
+    ]
+    kwargs = chat_request_kwargs(model, messages, stream=False)
+    predict_raw = (os.environ.get("LUNA_SOCIAL_LIVE_INVITE_NUM_PREDICT") or "100").strip() or "100"
+    try:
+        predict = max(32, int(predict_raw))
+    except ValueError:
+        predict = 100
+    opts = dict(kwargs.get("options") or {})
+    opts["num_predict"] = predict
+    kwargs["options"] = opts
+    client = build_client()
+    response = client.chat(**kwargs)
+    comment = _sanitize_fb_llm_comment(response.message.content or "", stream_url)
+    return strip_think_blocks(comment).strip() or None
+
+
+async def compose_live_share_text_async(platform: str, title: str, stream_url: str) -> str:
+    """Cute invitation body + stream URL on its own line (for X / Facebook live posts)."""
+    if _live_invite_uses_explicit_template():
+        tmpl = (os.environ.get("LUNA_SOCIAL_LIVE_INVITE_TEMPLATE") or "").strip()
+        plat = (platform or "live").strip()
+        body = (
+            tmpl.replace("{platform}", plat)
+            .replace("{title}", (title or "").strip())
+            .replace("{url}", (stream_url or "").strip())
+        )
+        return _clamp_fb_share_body(body)
+    comment: str | None = None
+    if _live_invite_llm_enabled():
+        try:
+            comment = await asyncio.to_thread(
+                _generate_live_invite_comment_llm_sync, platform, title, stream_url
+            )
+        except Exception as exc:
+            print(f"(social playwright) live invite LLM failed ({exc}); using fallback.", flush=True)
+    if not comment:
+        plat = (platform or "live").strip().title()
+        title_clean = (title or "").strip()
+        comment = (
+            f"We're live on {plat}! Luna & Viktor would love to see you — "
+            f"{title_clean}." if title_clean else f"We're live on {plat}! Come say hi to Luna & Viktor 💫"
+        )
+    url_clean = (stream_url or "").strip()
+    body = f"{comment}\n\n{url_clean}".strip() if url_clean else comment
+    return _clamp_fb_share_body(body)
+
+
 def _compose_x_text(title: str, video_url: str) -> str:
     t = f"{title.strip()}\n{video_url.strip()}".strip()
     # X free-tier length; long-form X can exceed this — trim safely.
@@ -705,11 +846,18 @@ async def _post_x_via_intent_url(page: object, title: str, video_url: str) -> No
     print("(social playwright) X: intent flow — no Post/Tweet button in composer (UI changed?).", flush=True)
 
 
-async def _post_x_via_compose_ui(page: object, title: str, video_url: str) -> None:
+async def _post_x_via_compose_ui(
+    page: object,
+    title: str,
+    video_url: str,
+    *,
+    image_path: Path | None = None,
+    compose_text: str | None = None,
+) -> None:
     """Logged-in X: sidebar Post → composer (often ``role=dialog``) → type → Post."""
     from playwright.async_api import TimeoutError as PWTimeout
 
-    text = _compose_x_text(title, video_url)
+    text = (compose_text or "").strip() or _compose_x_text(title, video_url)
     start = (os.environ.get("LUNA_SOCIAL_X_POST_START_URL") or "https://x.com/home").strip() or "https://x.com/home"
     step_timeout = int((os.environ.get("LUNA_SOCIAL_X_POST_UI_STEP_MS") or "25000").strip() or "25000")
 
@@ -734,6 +882,8 @@ async def _post_x_via_compose_ui(page: object, title: str, video_url: str) -> No
         await editor.click(timeout=10_000)
         await editor.press_sequentially(text, delay=5, timeout=120_000)
 
+    await _attach_image_x_composer(page, image_path)
+
     for _ in range(90):
         if await _x_click_post_in_composer(page):
             await page.wait_for_timeout(int((os.environ.get("LUNA_SOCIAL_X_POST_WAIT_MS") or "2500").strip() or "2500"))  # type: ignore[union-attr]
@@ -743,15 +893,39 @@ async def _post_x_via_compose_ui(page: object, title: str, video_url: str) -> No
     raise TimeoutError("X compose: Post button stayed disabled or not found (modal composer?).")
 
 
-async def _post_x(context: object, title: str, video_url: str) -> None:
+async def _post_x(
+    context: object,
+    title: str,
+    video_url: str,
+    *,
+    image_path: Path | None = None,
+    compose_text: str | None = None,
+) -> None:
     page = await context.new_page()  # type: ignore[union-attr]
     try:
-        if _env_truthy("LUNA_SOCIAL_X_POST_LEGACY_INTENT", default=False):
+        if image_path is not None and _env_truthy("LUNA_SOCIAL_X_POST_LEGACY_INTENT", default=False):
+            print(
+                "(social playwright) X: intent URL cannot attach images — using compose UI.",
+                flush=True,
+            )
+        if (
+            _env_truthy("LUNA_SOCIAL_X_POST_LEGACY_INTENT", default=False)
+            and image_path is None
+            and not compose_text
+        ):
             await _post_x_via_intent_url(page, title, video_url)
             return
         try:
-            await _post_x_via_compose_ui(page, title, video_url)
+            await _post_x_via_compose_ui(
+                page,
+                title,
+                video_url,
+                image_path=image_path,
+                compose_text=compose_text,
+            )
         except Exception as exc:
+            if image_path is not None or compose_text:
+                raise
             print(f"(social playwright) X: compose UI failed ({exc}); trying intent URL.", flush=True)
             await _post_x_via_intent_url(page, title, video_url)
     finally:
@@ -1200,7 +1374,14 @@ async def _fb_click_post_settings_publish(post_sheet: object, page: object, step
     await post_btn.click(timeout=20_000)
 
 
-async def _post_facebook_via_composer_ui(page: object, title: str, video_url: str) -> None:
+async def _post_facebook_via_composer_ui(
+    page: object,
+    title: str,
+    video_url: str,
+    *,
+    image_path: Path | None = None,
+    compose_text: str | None = None,
+) -> None:
     """Facebook *Create post* → **Next** → *Post settings* blue **Post** only (never *Add to your post*)."""
 
     async def _fb_story_composer(dlg: object) -> object:
@@ -1233,7 +1414,7 @@ async def _post_facebook_via_composer_ui(page: object, title: str, video_url: st
 
     from playwright.async_api import TimeoutError as PWTimeout
 
-    text = await _compose_fb_share_text_async(title, video_url)
+    text = (compose_text or "").strip() or await _compose_fb_share_text_async(title, video_url)
     comment, url_for_compose = _split_fb_comment_body(text, video_url)
     start = _facebook_compose_start_url()
     step_timeout = int((os.environ.get("LUNA_SOCIAL_FB_POST_UI_STEP_MS") or "25000").strip() or "25000")
@@ -1271,6 +1452,7 @@ async def _post_facebook_via_composer_ui(page: object, title: str, video_url: st
     await _fb_wait_story_ready(dialog, editor, page, comment, url_for_compose, step_timeout)
 
     await _fb_dismiss_add_to_post_dialog(page)
+    await _attach_image_fb_dialog(dialog, page, image_path)
 
     # Step 2 — blue **Next** (enabled when composer has content).
     await _fb_wait_and_click_next(dialog, page, step_timeout)
@@ -1290,19 +1472,109 @@ async def _post_facebook_via_composer_ui(page: object, title: str, video_url: st
     print("(social playwright) Facebook: posted (steps: textbox → Next → Post settings → Post).", flush=True)
 
 
-async def _post_facebook(context: object, title: str, video_url: str) -> None:
+async def _post_facebook(
+    context: object,
+    title: str,
+    video_url: str,
+    *,
+    image_path: Path | None = None,
+    compose_text: str | None = None,
+) -> None:
     page = await context.new_page()  # type: ignore[union-attr]
     try:
         if _env_truthy("LUNA_SOCIAL_FACEBOOK_POST_LEGACY_SHARER", default=False):
-            await _post_facebook_via_sharer(page, title, video_url)
-            return
+            if image_path is not None or compose_text:
+                print(
+                    "(social playwright) Facebook: legacy sharer cannot attach images — using composer.",
+                    flush=True,
+                )
+            else:
+                await _post_facebook_via_sharer(page, title, video_url)
+                return
         try:
-            await _post_facebook_via_composer_ui(page, title, video_url)
+            await _post_facebook_via_composer_ui(
+                page,
+                title,
+                video_url,
+                image_path=image_path,
+                compose_text=compose_text,
+            )
         except Exception as exc:
+            if image_path is not None or compose_text:
+                raise
             print(f"(social playwright) Facebook: composer UI failed ({exc}); trying sharer.", flush=True)
             await _post_facebook_via_sharer(page, title, video_url)
     finally:
         await page.close()
+
+
+async def share_live_stream(
+    *,
+    platform: str,
+    title: str,
+    stream_url: str,
+    image_path: Path | None = None,
+) -> None:
+    """Go-live post to X and Facebook with optional promo image + cute LLM invitation."""
+    img = image_path if image_path is not None else live_announce_image_path()
+    body = await compose_live_share_text_async(platform, title, stream_url)
+    x_path = _resolve_storage_path("LUNA_SOCIAL_X_STORAGE_STATE", warn=True)
+    fb_path = _resolve_storage_path("LUNA_SOCIAL_FACEBOOK_STORAGE_STATE", warn=True)
+    if x_path is None and fb_path is None:
+        return
+
+    async with _share_lock:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            print(
+                "(social playwright) Install: pip install playwright && python -m playwright install chrome",
+                flush=True,
+            )
+            return
+
+        headless = social_playwright_share_headless()
+        slow_mo = int((os.environ.get("LUNA_SOCIAL_PLAYWRIGHT_SLOW_MO") or "0").strip() or "0")
+
+        try:
+            async with async_playwright() as p:
+                launch_kw = stealth_browser_launch_kwargs(headless=headless, slow_mo=slow_mo)
+                browser = await p.chromium.launch(**launch_kw)
+                try:
+                    if x_path is not None:
+                        ctx = await browser.new_context(
+                            **stealth_browser_context_kwargs(storage_state=x_path)
+                        )
+                        await ctx.add_init_script(STEALTH_INIT_SCRIPT)
+                        try:
+                            await _post_x(
+                                ctx,
+                                title,
+                                stream_url,
+                                image_path=img,
+                                compose_text=body,
+                            )
+                        finally:
+                            await ctx.close()
+                    if fb_path is not None:
+                        ctx = await browser.new_context(
+                            **stealth_browser_context_kwargs(storage_state=fb_path)
+                        )
+                        await ctx.add_init_script(STEALTH_INIT_SCRIPT)
+                        try:
+                            await _post_facebook(
+                                ctx,
+                                title,
+                                stream_url,
+                                image_path=img,
+                                compose_text=body,
+                            )
+                        finally:
+                            await ctx.close()
+                finally:
+                    await browser.close()
+        except Exception as exc:
+            print(f"(social playwright) live share failed: {exc}", flush=True)
 
 
 async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
@@ -1336,7 +1608,7 @@ async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
                         )
                         await ctx.add_init_script(STEALTH_INIT_SCRIPT)
                         try:
-                            await _post_x(ctx, title, video_url)
+                            await _post_x(ctx, title, video_url, image_path=None)
                         finally:
                             await ctx.close()
                     if fb_path is not None:
@@ -1345,7 +1617,7 @@ async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
                         )
                         await ctx.add_init_script(STEALTH_INIT_SCRIPT)
                         try:
-                            await _post_facebook(ctx, title, video_url)
+                            await _post_facebook(ctx, title, video_url, image_path=None)
                         finally:
                             await ctx.close()
                 finally:

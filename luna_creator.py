@@ -101,13 +101,14 @@ def is_creator_viewer_turn(
 
 
 def cohost_replies_to_creator_enabled() -> bool:
-    """When True, creator panel/voice may route to Viktor as well as Luna (if co-host chat personas on)."""
+    """When True, creator panel/voice may route to co-hosts (Viktor and/or Himari), not only Luna."""
+    raw = (os.environ.get("LUNA_COHOST_CREATOR_CHAT") or "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    from himari_cohost import himari_enabled
     from vampire_cohost import cohost_chat_personas_enabled
 
-    if not cohost_chat_personas_enabled():
-        return False
-    raw = (os.environ.get("LUNA_COHOST_CREATOR_CHAT") or "1").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    return cohost_chat_personas_enabled() or himari_enabled()
 
 
 def creator_chat_system_block(*, name: str | None = None) -> str:

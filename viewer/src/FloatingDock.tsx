@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, type MouseEventHandler } from "react";
+import { type MouseEventHandler } from "react";
 import {
   ChatIcon,
-  CohostOptionsIcon,
   CohostSummonIcon,
+  HimariSummonIcon,
   MicIcon,
   ScreenIcon,
   SettingsIcon,
@@ -37,19 +37,18 @@ type Props = {
   /** Luna reacts to a YouTube video (transcript + TTS). */
   ytCommentDisabled?: boolean;
   onYoutubeComment?: () => void;
-  /** Co-host VRM configured (URL in page query); button summons/dismisses. */
+  /** Viktor VRM configured (URL in page query). */
   cohostAvailable?: boolean;
   cohostInScene?: boolean;
   cohostName?: string;
   cohostBusy?: boolean;
   onToggleCohost?: () => void;
-  /** Banter triggers need an open WS to the bot. */
-  banterWsDisabled?: boolean;
-  /** When true, idle + manual use open-ended full banter (short mode uses ``LUNA_COHOST_EXCHANGE_LINES``). */
-  cohostFullConversation?: boolean;
-  onCohostFullConversationChange?: (enabled: boolean) => void;
-  /** Fire server-side Luna↔cohost banter; ``full`` matches the long-script checkbox. */
-  onCohostBanterNow?: (fullConversation: boolean) => void;
+  /** Himari VRM configured. */
+  himariAvailable?: boolean;
+  himariInScene?: boolean;
+  himariName?: string;
+  himariBusy?: boolean;
+  onToggleHimari?: () => void;
 };
 
 type DockBtnProps = {
@@ -57,7 +56,6 @@ type DockBtnProps = {
   active?: boolean;
   disabled?: boolean;
   className?: string;
-  ariaExpanded?: boolean;
   onClick: MouseEventHandler<HTMLButtonElement>;
   children: React.ReactNode;
 };
@@ -67,7 +65,6 @@ function DockBtn({
   active,
   disabled,
   className = "",
-  ariaExpanded,
   onClick,
   children,
 }: DockBtnProps) {
@@ -76,7 +73,6 @@ function DockBtn({
       type="button"
       className={`dock-btn ${active ? "dock-btn--active" : ""} ${className}`}
       aria-pressed={active ? true : undefined}
-      aria-expanded={ariaExpanded}
       aria-label={label}
       title={label}
       disabled={disabled}
@@ -89,10 +85,6 @@ function DockBtn({
 
 /**
  * Always-visible icon dock pinned to the bottom-center of the viewport.
- *
- * Each button either toggles an overlay panel (upload / screen / settings),
- * toggles continuous mic listening, or toggles the chat overlay. The mic
- * button gets a teal glow while listening so it's obvious on stream.
  */
 export function FloatingDock({
   activeOverlay,
@@ -116,39 +108,14 @@ export function FloatingDock({
   cohostName = "Co-host",
   cohostBusy = false,
   onToggleCohost,
-  banterWsDisabled = true,
-  cohostFullConversation = false,
-  onCohostFullConversationChange,
-  onCohostBanterNow,
+  himariAvailable = false,
+  himariInScene = false,
+  himariName = "Himari",
+  himariBusy = false,
+  onToggleHimari,
 }: Props) {
-  const [cohostPanelOpen, setCohostPanelOpen] = useState(false);
-  const cohostClusterRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!cohostPanelOpen) return;
-    const handler = (e: PointerEvent) => {
-      if (
-        cohostClusterRef.current &&
-        !cohostClusterRef.current.contains(e.target as Node)
-      ) {
-        setCohostPanelOpen(false);
-      }
-    };
-    const id = window.setTimeout(
-      () => document.addEventListener("pointerdown", handler, true),
-      0,
-    );
-    return () => {
-      window.clearTimeout(id);
-      document.removeEventListener("pointerdown", handler, true);
-    };
-  }, [cohostPanelOpen]);
-
-  const showBanterControls =
-    cohostAvailable &&
-    Boolean(onToggleCohost) &&
-    Boolean(onCohostBanterNow) &&
-    Boolean(onCohostFullConversationChange);
+  const showCohostRow =
+    (cohostAvailable && onToggleCohost) || (himariAvailable && onToggleHimari);
 
   return (
     <div className="dock" role="toolbar" aria-label="Luna controls">
@@ -161,7 +128,7 @@ export function FloatingDock({
       </DockBtn>
       {onYoutubeLiveCheck ? (
         <DockBtn
-          label="Check YouTube live (one channel URL from server; opens pytchat URL prompt if live)"
+          label="Check YouTube + TikTok live (YouTube opens pytchat URL prompt; TikTok connects chat when live)"
           disabled={ytLiveCheckDisabled}
           onClick={onYoutubeLiveCheck}
         >
@@ -196,12 +163,9 @@ export function FloatingDock({
           <YoutubeCommentIcon />
         </DockBtn>
       ) : null}
-      {showBanterControls ? (
-        <div
-          className={`dock-cohost-cluster ${cohostPanelOpen ? "dock-cohost-cluster--open" : ""}`}
-          ref={cohostClusterRef}
-        >
-          <div className="dock-cohost-cluster-row">
+      {showCohostRow ? (
+        <div className="dock-cohost-cluster-row">
+          {cohostAvailable && onToggleCohost ? (
             <DockBtn
               label={
                 cohostBusy
@@ -213,75 +177,29 @@ export function FloatingDock({
               active={cohostInScene}
               disabled={cohostBusy}
               className="dock-btn--cohost"
-              onClick={() => {
-                setCohostPanelOpen(false);
-                onToggleCohost?.();
-              }}
+              onClick={onToggleCohost}
             >
               <CohostSummonIcon />
             </DockBtn>
+          ) : null}
+          {himariAvailable && onToggleHimari ? (
             <DockBtn
-              label={`${cohostName} banter options`}
-              ariaExpanded={cohostPanelOpen}
-              disabled={cohostBusy}
-              className="dock-btn--cohost-opts"
-              onClick={(e) => {
-                e.stopPropagation();
-                setCohostPanelOpen((v) => !v);
-              }}
+              label={
+                himariBusy
+                  ? `Loading ${himariName}…`
+                  : himariInScene
+                    ? `Dismiss ${himariName} from scene`
+                    : `Summon ${himariName} into scene`
+              }
+              active={himariInScene}
+              disabled={himariBusy}
+              className="dock-btn--himari"
+              onClick={onToggleHimari}
             >
-              <CohostOptionsIcon />
+              <HimariSummonIcon />
             </DockBtn>
-          </div>
-          {cohostPanelOpen ? (
-            <div
-              className="dock-cohost-panel"
-              role="dialog"
-              aria-label={`${cohostName} banter`}
-              onPointerDown={(e) => e.stopPropagation()}
-            >
-              <div className="dock-cohost-panel-title">{cohostName} banter</div>
-              <label className="dock-cohost-check">
-                <input
-                  type="checkbox"
-                  checked={cohostFullConversation}
-                  onChange={(e) => onCohostFullConversationChange?.(e.target.checked)}
-                />
-                <span>
-                  Open-ended full conversation (idle + manual; not the short exchange cap)
-                </span>
-              </label>
-              <button
-                type="button"
-                className="dock-cohost-run"
-                disabled={banterWsDisabled || cohostBusy}
-                onClick={() => {
-                  onCohostBanterNow?.(cohostFullConversation);
-                  setCohostPanelOpen(false);
-                }}
-              >
-                Run banter now
-              </button>
-            </div>
           ) : null}
         </div>
-      ) : null}
-      {!showBanterControls && cohostAvailable && onToggleCohost ? (
-        <DockBtn
-          label={
-            cohostBusy
-              ? `Loading ${cohostName}…`
-              : cohostInScene
-                ? `Dismiss ${cohostName} from scene`
-                : `Summon ${cohostName} into scene`
-          }
-          active={cohostInScene}
-          disabled={cohostBusy}
-          className="dock-btn--cohost"
-          onClick={onToggleCohost}
-        >
-          <CohostSummonIcon />
-        </DockBtn>
       ) : null}
       <DockBtn
         label="Share screen"

@@ -66,29 +66,14 @@ def chat_directed_at_luna(text: str) -> bool:
 
 
 def twitch_message_addressees(text: str, *, trigger_all: bool = False) -> list[str]:
-    """Who should each answer this Twitch / YouTube line separately (may be both).
+    """Who should answer this Twitch / YouTube / TikTok line (``luna`` | ``viktor`` | ``himari``).
 
-    When ``trigger_all`` is True and no name is mentioned, only Luna replies.
-    Viktor is never chosen for unmentioned lines.
+    Delegates to :func:`luna_cast.public_chat_addressees`. Legacy ``cohost`` is normalized to
+    ``viktor`` for callers that still expect the old token.
     """
-    at_luna = chat_directed_at_luna(text)
-    at_cohost = cohost_enabled() and chat_directed_at_cohost(text)
-    if at_luna and at_cohost:
-        l_idx = _name_mention_index(text, "luna")
-        c_idx = min(
-            (i for n in cohost_name_aliases() if (i := _name_mention_index(text, n)) is not None),
-            default=10**9,
-        )
-        if l_idx is not None and (c_idx == 10**9 or l_idx <= c_idx):
-            return ["luna", "cohost"]
-        return ["cohost", "luna"]
-    if at_cohost:
-        return ["cohost"]
-    if at_luna:
-        return ["luna"]
-    if trigger_all:
-        return ["luna"]
-    return []
+    from luna_cast import public_chat_addressees
+
+    return public_chat_addressees(text, trigger_all=trigger_all)
 
 
 def twitch_speaker_system_note(*, chatter: str, message: str, speaker: str) -> str:
@@ -203,6 +188,16 @@ def cohost_min_gap_sec() -> float:
     except ValueError:
         sec = 10.0
     return max(5.0, min(sec, 1800.0))
+
+
+def cohost_banter_fail_backoff_sec() -> float:
+    """Quiet period after a banter script fails to parse (stops rapid retry spam)."""
+    raw = (os.environ.get("LUNA_COHOST_BANTER_FAIL_BACKOFF_SEC") or "45").strip() or "45"
+    try:
+        sec = float(raw)
+    except ValueError:
+        sec = 45.0
+    return max(15.0, min(sec, 600.0))
 
 
 def cohost_poll_sec() -> float:

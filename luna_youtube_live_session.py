@@ -48,13 +48,22 @@ def live_platform_reply_style_block(platform: LivePlatform) -> str:
     label = _PLATFORM[platform]["label"]
     if not live_platform_conversational_enabled(platform):
         return ""
-    return (
-        f"## {label} — how to talk with chat\n"
-        "- **Conversation, not Q&A:** react to what they meant; ask a short follow-up when it fits.\n"
-        "- **Use their name** and, when you remember it, **what they or others said earlier this stream**.\n"
-        "- **2–5 sentences** is fine when the topic needs it; one line is enough for a simple hi.\n"
-        "- You are on stream with Luna — sound present and interested, not like a help desk."
-    )
+    lines = [
+        f"## {label} — how to talk with chat",
+        "- **Conversation, not Q&A:** react to what they meant; ask a short follow-up when it fits.",
+        "- **Use their name** and, when you remember it, **what they or others said earlier this stream**.",
+        "- **2–5 sentences** is fine when the topic needs it; one line is enough for a simple hi.",
+        "- You are on stream with Luna — sound present and interested, not like a help desk.",
+    ]
+    if platform == "tiktok":
+        lines.extend(
+            [
+                "- **TikTok live:** every reply must feel **live and original** — do not repeat your own "
+                "recent lines from this stream (same wording, same joke, same opener).",
+                "- Vary phrasing and angle; no canned loops that sound pre-recorded.",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def live_platform_banter_from_chat_enabled(platform: LivePlatform) -> bool:
@@ -88,7 +97,12 @@ class LivePlatformSessionLog:
         reply: str,
         cohost_display: str = "Viktor",
     ) -> None:
-        tag = "luna" if speaker == "luna" else cohost_display.strip().lower() or "cohost"
+        if speaker == "luna":
+            tag = "luna"
+        elif speaker in ("viktor", "himari"):
+            tag = speaker
+        else:
+            tag = cohost_display.strip().lower() or "cohost"
         who = (author or "viewer").strip()
         ref = (user_text or "").strip().replace("\n", " ")
         if len(ref) > 100:
@@ -124,6 +138,7 @@ class LivePlatformSessionLog:
             f"## Recent {self._label} chat — debrief together now\n"
             f"Luna and {cohost_name} are quiet on mic; chat was active. Discuss **specific** viewers "
             "and what they said — jokes, takes, who surprised you, what you might say when they return. "
+            "Use a **fresh debrief angle** (not the same summary you used last idle banter). "
             "Do not read the log line-by-line; talk like co-hosts after a segment.\n"
             f"{body}"
         )

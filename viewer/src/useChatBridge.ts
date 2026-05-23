@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
-import { type BridgeMessage, type BridgeTtsVoice, parseBridgeMessage } from "./chatTypes";
+import {
+  type BridgeMessage,
+  type BridgeTtsVoice,
+  type ViewerAvatarId,
+  parseBridgeMessage,
+} from "./chatTypes";
 import { getCohostSoloMode, readCohostSoloModeStored } from "./cohostScenePrefs";
 import { playViewerTts, stopViewerTts } from "./viewerTtsPlayer";
 
@@ -10,12 +15,45 @@ const CHAT_STORAGE_KEY = "luna.chat.lines.v1";
 const TTS_SPEAKER_STORAGE_KEY = "luna.tts.speaker.v1";
 /** Matches App.tsx: “full conversation” = open-ended script (`LUNA_COHOST_FULL_BANTER_MAX_LINES` caps parse). */
 const COHOST_FULL_SCRIPT_STORAGE_KEY = "luna.cohostFullConversation.v1";
+const REPLY_TO_STORAGE_KEY = "luna.replyTo.v1";
+
+function readReplyToStored(): ViewerAvatarId {
+  try {
+    const raw = window.localStorage.getItem(REPLY_TO_STORAGE_KEY);
+    if (raw === "luna" || raw === "himari" || raw === "cohost") return raw;
+  } catch {
+    /* ignore */
+  }
+  return "luna";
+}
+
+function replyToWireId(target: ViewerAvatarId): string {
+  return target === "cohost" ? "viktor" : target;
+}
+
+function normalizeViewerAvatar(avatar?: string): ViewerAvatarId | undefined {
+  const a = (avatar || "").trim().toLowerCase();
+  if (a === "luna") return "luna";
+  if (a === "himari") return "himari";
+  if (a === "cohost" || a === "viktor") return "cohost";
+  return undefined;
+}
+
+function dispatchAvatarRoute(avatar?: string) {
+  const target = normalizeViewerAvatar(avatar);
+  if (!target) return;
+  window.dispatchEvent(
+    new CustomEvent("luna-active-avatar", { detail: { avatar: target } }),
+  );
+}
 
 function readCohostFullScriptStored(): boolean {
   try {
-    return window.localStorage.getItem(COHOST_FULL_SCRIPT_STORAGE_KEY) === "1";
+    const raw = window.localStorage.getItem(COHOST_FULL_SCRIPT_STORAGE_KEY);
+    if (raw === "0") return false;
+    return true;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -133,10 +171,20 @@ export type YoutubeLivePromptState = {
   streamId: string;
 };
 
+export type LiveSocialTitlePromptState = {
+  open: boolean;
+  platform: string;
+  suggestedTitle: string;
+  url: string;
+  streamId: string;
+};
+
 export function useChatBridge(enabled: boolean) {
   const [lines, setLines] = useState<ChatLine[]>(() => loadPersistedLines());
   const [conn, setConn] = useState<"connecting" | "open" | "closed">("closed");
   const [speakEnabled, setSpeakEnabled] = useState(true);
+  const replyToRef = useRef<ViewerAvatarId>(readReplyToStored());
+  const [replyTo, setReplyToState] = useState<ViewerAvatarId>(() => replyToRef.current);
   const [ttsVoices, setTtsVoices] = useState<BridgeTtsVoice[]>([]);
   const [ttsSpeakerId, setTtsSpeakerId] = useState("");
   const [ttsEnabled, setTtsEnabled] = useState(false);
@@ -153,6 +201,14 @@ export function useChatBridge(enabled: boolean) {
     hintUrl: "",
     streamId: "",
   });
+  const [liveSocialTitlePrompt, setLiveSocialTitlePrompt] =
+    useState<LiveSocialTitlePromptState>({
+      open: false,
+      platform: "twitch",
+      suggestedTitle: "",
+      url: "",
+      streamId: "",
+    });
   /** True while Luna is synthesising / playing TTS locally (viewer path). */
   const [avatarSpeaking, setAvatarSpeaking] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -244,32 +300,64 @@ export function useChatBridge(enabled: boolean) {
         return;
       }
       if (msg.name === "avatar_emotion") {
+        dispatchAvatarRoute(msg.avatar);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-emotion", {
             detail: {
               emotion: msg.value,
               durationMs: msg.duration_ms,
+              avatar: msg.avatar,
             },
           }),
         );
         return;
       }
       if (msg.name === "avatar_speaking") {
+        dispatchAvatarRoute(msg.avatar);
         setAvatarSpeaking(msg.value);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-speaking", {
-            detail: msg.value,
+            detail: { value: msg.value, avatar: msg.avatar },
+          }),
+        );
+        return;
+      }
+      if (
+        msg.name === "avatar_thinking" &&
+        (msg.avatar === "luna" ||
+          msg.avatar === "cohost" ||
+          msg.avatar === "himari")
+      ) {
+        window.dispatchEvent(
+          new CustomEvent("luna-avatar-thinking", {
+            detail: { avatar: msg.avatar, active: msg.value },
           }),
         );
         return;
       }
       if (msg.name === "avatar_viseme") {
+        dispatchAvatarRoute(msg.avatar);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-viseme", {
             detail: {
               vowel: msg.value,
               intensity: msg.intensity ?? 1,
               holdMs: msg.hold_ms ?? 120,
+              avatar: msg.avatar,
+            },
+          }),
+        );
+        return;
+      }
+      if (msg.name === "perf_config") {
+        window.dispatchEvent(
+          new CustomEvent("luna-perf-config", {
+            detail: {
+              screenCaptureIntervalMs: msg.screen_capture_interval_ms,
+              screenContextIntervalSec: msg.screen_context_interval_sec,
+              screenCaptureMaxWidth: msg.screen_capture_max_width,
+              screenCaptureJpegQuality: msg.screen_capture_jpeg_quality,
+              rendererMaxDpr: msg.renderer_max_dpr,
             },
           }),
         );
@@ -278,15 +366,25 @@ export function useChatBridge(enabled: boolean) {
       if (msg.name === "cohost_avatar") {
         const chatReply = msg.chat_reply === true;
         const solo = getCohostSoloMode();
+        const activeSpeaker =
+          !chatReply && solo && msg.active_speaker === "cohost"
+            ? "luna"
+            : msg.active_speaker;
+        if (
+          activeSpeaker === "luna" ||
+          activeSpeaker === "cohost" ||
+          activeSpeaker === "himari"
+        ) {
+          dispatchAvatarRoute(activeSpeaker);
+        }
         window.dispatchEvent(
           new CustomEvent("luna-cohost-avatar", {
             detail: {
               dualLayout: chatReply ? msg.dual_layout === true : !solo && msg.dual_layout === true,
+              trioLayout: msg.trio_layout === true,
               vrmUrl: msg.vrm_url?.trim() || "",
-              activeSpeaker:
-                !chatReply && solo && msg.active_speaker === "cohost"
-                  ? "luna"
-                  : msg.active_speaker,
+              himariVrmUrl: msg.himari_vrm_url?.trim() || "",
+              activeSpeaker,
               chatReply,
             },
           }),
@@ -307,7 +405,7 @@ export function useChatBridge(enabled: boolean) {
       if (msg.name === "tts_audio") {
         const chatReply = msg.chat_reply === true;
         const solo = getCohostSoloMode();
-        const speaker = msg.avatar === "cohost" ? "cohost" : "luna";
+        const speaker: ViewerAvatarId = normalizeViewerAvatar(msg.avatar) ?? "luna";
         if (solo && speaker === "cohost" && !chatReply) {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
@@ -316,11 +414,12 @@ export function useChatBridge(enabled: boolean) {
           return;
         }
         const driveAvatar = msg.drive_avatar !== false;
-        if (speaker === "cohost") {
+        dispatchAvatarRoute(speaker);
+        if (speaker === "cohost" || speaker === "himari") {
           window.dispatchEvent(
             new CustomEvent("luna-cohost-avatar", {
               detail: {
-                activeSpeaker: "cohost",
+                activeSpeaker: speaker,
                 vrmUrl: "",
                 chatReply,
               },
@@ -330,7 +429,9 @@ export function useChatBridge(enabled: boolean) {
         if (driveAvatar) {
           setAvatarSpeaking(true);
           window.dispatchEvent(
-            new CustomEvent("luna-avatar-speaking", { detail: true }),
+            new CustomEvent("luna-avatar-speaking", {
+              detail: { value: true, avatar: speaker },
+            }),
           );
         }
         playViewerTts(
@@ -340,6 +441,7 @@ export function useChatBridge(enabled: boolean) {
             duration_ms: msg.duration_ms,
             visemes: msg.visemes,
             driveAvatar,
+            avatar: speaker,
           },
           () => {
             const ws = wsRef.current;
@@ -349,11 +451,17 @@ export function useChatBridge(enabled: boolean) {
             if (driveAvatar) {
               setAvatarSpeaking(false);
               window.dispatchEvent(
-                new CustomEvent("luna-avatar-speaking", { detail: false }),
+                new CustomEvent("luna-avatar-speaking", {
+                  detail: { value: false, avatar: speaker },
+                }),
               );
             }
-            if (chatReply && speaker === "cohost") {
-              window.dispatchEvent(new CustomEvent("luna-cohost-chat-reply-end"));
+            if (chatReply && (speaker === "cohost" || speaker === "himari")) {
+              window.dispatchEvent(
+                new CustomEvent("luna-cohost-chat-reply-end", {
+                  detail: { avatar: speaker },
+                }),
+              );
             }
           },
         );
@@ -393,6 +501,20 @@ export function useChatBridge(enabled: boolean) {
           open: true,
           title: msg.title?.trim() || "YouTube Live",
           hintUrl: msg.url?.trim() || "",
+          streamId: msg.stream_id?.trim() || "",
+        });
+        return;
+      }
+      if (msg.name === "live_social_title_prompt") {
+        if (!msg.open) {
+          setLiveSocialTitlePrompt((p) => ({ ...p, open: false }));
+          return;
+        }
+        setLiveSocialTitlePrompt({
+          open: true,
+          platform: msg.platform?.trim() || "twitch",
+          suggestedTitle: msg.suggested_title?.trim() || "",
+          url: msg.url?.trim() || "",
           streamId: msg.stream_id?.trim() || "",
         });
         return;
@@ -546,6 +668,16 @@ export function useChatBridge(enabled: boolean) {
     setLines((p) => append(p, { id: nextId(), kind: "status", text, ts }));
   }, []);
 
+  const setReplyTo = useCallback((target: ViewerAvatarId) => {
+    replyToRef.current = target;
+    setReplyToState(target);
+    try {
+      window.localStorage.setItem(REPLY_TO_STORAGE_KEY, target);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const setSpeak = useCallback((enabledValue: boolean) => {
     setSpeakEnabled(enabledValue);
     const ws = wsRef.current;
@@ -571,6 +703,7 @@ export function useChatBridge(enabled: boolean) {
       JSON.stringify({
         type: "viewer_prompt",
         text: message,
+        reply_to: replyToWireId(replyToRef.current),
       }),
     );
     return true;
@@ -609,6 +742,7 @@ export function useChatBridge(enabled: boolean) {
         type: "viewer_voice",
         mime: mime || blob.type || "audio/webm",
         data: b64,
+        reply_to: replyToWireId(replyToRef.current),
       });
       ws.send(payload);
       return { ok: true as const };
@@ -705,7 +839,7 @@ export function useChatBridge(enabled: boolean) {
       ws = await waitForOpenWebSocket(wsRef, 4000);
     }
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    addStatusLine("YouTube live: checking channel…");
+    addStatusLine("YouTube + TikTok live: checking…");
     ws.send(JSON.stringify({ type: "viewer_youtube_live_check" }));
     return true;
   }, [addStatusLine]);
@@ -760,6 +894,48 @@ export function useChatBridge(enabled: boolean) {
     );
   }, []);
 
+  const sendLiveSocialTitle = useCallback(
+    async (payload: {
+      title: string;
+      platform: string;
+      streamId: string;
+      url: string;
+    }) => {
+      const t = payload.title.trim();
+      if (!t) return false;
+      let ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        ws = await waitForOpenWebSocket(wsRef, 5000);
+      }
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      ws.send(
+        JSON.stringify({
+          type: "viewer_live_social_title",
+          title: t,
+          platform: payload.platform,
+          stream_id: payload.streamId,
+          url: payload.url,
+        }),
+      );
+      setLiveSocialTitlePrompt((p) => ({ ...p, open: false }));
+      return true;
+    },
+    [],
+  );
+
+  const dismissLiveSocialTitlePrompt = useCallback((platform: string, streamId: string) => {
+    setLiveSocialTitlePrompt((p) => ({ ...p, open: false }));
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(
+      JSON.stringify({
+        type: "viewer_live_social_title_dismiss",
+        platform,
+        stream_id: streamId || undefined,
+      }),
+    );
+  }, []);
+
   const sendCohostBanterNow = useCallback(async (fullConversation: boolean) => {
     let ws: WebSocket | null = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -770,15 +946,23 @@ export function useChatBridge(enabled: boolean) {
     return true;
   }, []);
 
-  const sendViewerCohostScene = useCallback(async (inScene: boolean) => {
-    let ws: WebSocket | null = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      ws = await waitForOpenWebSocket(wsRef, 4000);
-    }
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify({ type: "viewer_cohost_scene", in_scene: inScene }));
-    return true;
-  }, []);
+  const sendViewerCohostScene = useCallback(
+    async (inScene: boolean, partner?: "viktor" | "himari") => {
+      let ws: WebSocket | null = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        ws = await waitForOpenWebSocket(wsRef, 4000);
+      }
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      const payload: { type: string; in_scene: boolean; partner?: string } = {
+        type: "viewer_cohost_scene",
+        in_scene: inScene,
+      };
+      if (partner) payload.partner = partner;
+      ws.send(JSON.stringify(payload));
+      return true;
+    },
+    [],
+  );
 
   const sendCohostIdleFullScriptPreference = useCallback(async (full: boolean) => {
     let ws: WebSocket | null = wsRef.current;
@@ -817,6 +1001,8 @@ export function useChatBridge(enabled: boolean) {
     clear,
     speakEnabled,
     setSpeak,
+    replyTo,
+    setReplyTo,
     sendPrompt,
     sendVoiceBlob,
     addStatusLine,
@@ -837,6 +1023,9 @@ export function useChatBridge(enabled: boolean) {
     sendYouTubeLiveUrl,
     dismissYouTubeLivePrompt,
     youtubeLivePrompt,
+    liveSocialTitlePrompt,
+    sendLiveSocialTitle,
+    dismissLiveSocialTitlePrompt,
     sendCohostBanterNow,
     sendCohostIdleFullScriptPreference,
     sendViewerCohostScene,

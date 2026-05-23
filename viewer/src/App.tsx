@@ -13,6 +13,7 @@ import { CaptionsOverlay } from "./CaptionsOverlay";
 import { FloatingDock, type DockOverlay } from "./FloatingDock";
 import { SettingsOverlay } from "./SettingsOverlay";
 import { YouTubeLivePromptOverlay } from "./YouTubeLivePromptOverlay";
+import { LiveSocialTitlePromptOverlay } from "./LiveSocialTitlePromptOverlay";
 import { getCohostSoloMode, readCohostSoloModeStored } from "./cohostScenePrefs";
 import { CloseIcon } from "./icons";
 import { useMicSession } from "./useMicSession";
@@ -21,8 +22,6 @@ import { wsUrl } from "./useChatBridge";
 
 const CHROMA_STORAGE_KEY = "luna.chromaKey.v1";
 const CAPTIONS_STORAGE_KEY = "luna.captions.v1";
-const COHOST_FULL_CONVERSATION_KEY = "luna.cohostFullConversation.v1";
-
 function readStoredChromaKey(): ChromaKeyMode {
   try {
     const v = window.localStorage.getItem(CHROMA_STORAGE_KEY);
@@ -44,15 +43,6 @@ function readStoredCaptionsEnabled(): boolean {
   return true;
 }
 
-function readStoredCohostFullConversation(): boolean {
-  try {
-    return window.localStorage.getItem(COHOST_FULL_CONVERSATION_KEY) === "1";
-  } catch {
-    /* ignore */
-  }
-  return false;
-}
-
 export default function App() {
   return (
     <ChatBridgeProvider>
@@ -65,8 +55,14 @@ function AppInner() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const runtimeRef = useRef<VrmRuntime | null>(null);
   const cohostVrmUrlRef = useRef("");
+  const himariVrmUrlRef = useRef("");
+  const himariIdleUrlsRef = useRef<string[]>([]);
+  const himariThinkingUrlRef = useRef("");
+  const lunaThinkingUrlRef = useRef("");
   const cohostIdleUrlsRef = useRef<string[]>([]);
+  const cohostThinkingUrlRef = useRef("");
   const cohostNameRef = useRef("Co-host");
+  const himariNameRef = useRef("Himari");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -80,9 +76,10 @@ function AppInner() {
     sendYouTubeSummary,
     addStatusLine,
     youtubeLivePrompt,
-    sendCohostBanterNow,
+    liveSocialTitlePrompt,
     sendCohostIdleFullScriptPreference,
     sendViewerCohostScene,
+    setReplyTo,
   } = useBridge();
   const mic = useMicSession();
 
@@ -109,9 +106,10 @@ function AppInner() {
   const [cohostInScene, setCohostInScene] = useState(() => !readCohostSoloModeStored());
   const [cohostBusy, setCohostBusy] = useState(false);
   const [cohostDisplayName, setCohostDisplayName] = useState("Co-host");
-  const [cohostFullConversation, setCohostFullConversation] = useState(() =>
-    readStoredCohostFullConversation(),
-  );
+  const [himariAvailable, setHimariAvailable] = useState(false);
+  const [himariInScene, setHimariInScene] = useState(false);
+  const [himariBusy, setHimariBusy] = useState(false);
+  const [himariDisplayName, setHimariDisplayName] = useState("Himari");
 
   const setChromaKey = useCallback((mode: ChromaKeyMode) => {
     setChromaKeyState(mode);
@@ -155,20 +153,9 @@ function AppInner() {
   }, [captionsEnabled]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        COHOST_FULL_CONVERSATION_KEY,
-        cohostFullConversation ? "1" : "0",
-      );
-    } catch {
-      /* ignore */
-    }
-  }, [cohostFullConversation]);
-
-  useEffect(() => {
     if (conn !== "open") return;
-    void sendCohostIdleFullScriptPreference(cohostFullConversation);
-  }, [conn, cohostFullConversation, sendCohostIdleFullScriptPreference]);
+    void sendCohostIdleFullScriptPreference(true);
+  }, [conn, sendCohostIdleFullScriptPreference]);
 
   useEffect(() => {
     runtimeRef.current?.setChromaKeyMode(chromaKey);
@@ -207,26 +194,81 @@ function AppInner() {
   useEffect(() => {
     if (!screenStream) return;
 
-    const intervalMsRaw = import.meta.env.VITE_SCREEN_CONTEXT_INTERVAL_MS;
-    const intervalMs =
-      typeof intervalMsRaw === "string" && intervalMsRaw.trim()
-        ? Math.max(500, Number(intervalMsRaw) || 1000)
+    let intervalMs =
+      typeof import.meta.env.VITE_SCREEN_CONTEXT_INTERVAL_MS === "string" &&
+      import.meta.env.VITE_SCREEN_CONTEXT_INTERVAL_MS.trim()
+        ? Math.max(
+            2000,
+            Number(import.meta.env.VITE_SCREEN_CONTEXT_INTERVAL_MS) || 1000,
+          )
         : 1000;
-    const maxWRaw = import.meta.env.VITE_SCREEN_CAPTURE_MAX_WIDTH;
-    const maxW =
-      typeof maxWRaw === "string" && maxWRaw.trim()
-        ? Math.max(480, Math.min(1920, Number(maxWRaw) || 1280))
+    let maxW =
+      typeof import.meta.env.VITE_SCREEN_CAPTURE_MAX_WIDTH === "string" &&
+      import.meta.env.VITE_SCREEN_CAPTURE_MAX_WIDTH.trim()
+        ? Math.max(
+            480,
+            Math.min(
+              1920,
+              Number(import.meta.env.VITE_SCREEN_CAPTURE_MAX_WIDTH) || 1280,
+            ),
+          )
         : 1280;
-    const qualityRaw = import.meta.env.VITE_SCREEN_CAPTURE_JPEG_QUALITY;
-    const jpegQuality =
-      typeof qualityRaw === "string" && qualityRaw.trim()
-        ? Math.max(0.45, Math.min(0.92, Number(qualityRaw) || 0.72))
+    let jpegQuality =
+      typeof import.meta.env.VITE_SCREEN_CAPTURE_JPEG_QUALITY === "string" &&
+      import.meta.env.VITE_SCREEN_CAPTURE_JPEG_QUALITY.trim()
+        ? Math.max(
+            0.45,
+            Math.min(
+              0.92,
+              Number(import.meta.env.VITE_SCREEN_CAPTURE_JPEG_QUALITY) || 0.72,
+            ),
+          )
         : 0.72;
 
     let ws: WebSocket | null = null;
     let closed = false;
     let reconnectTimer: number | undefined;
     let frameTimer: number | undefined;
+    let uploadsPaused = document.visibilityState === "hidden";
+
+    const applyPerf = (detail?: {
+      screenCaptureIntervalMs?: number;
+      screenCaptureMaxWidth?: number;
+      screenCaptureJpegQuality?: number;
+    }) => {
+      if (
+        detail?.screenCaptureIntervalMs != null &&
+        Number.isFinite(detail.screenCaptureIntervalMs)
+      ) {
+        intervalMs = Math.max(2000, Math.min(120_000, detail.screenCaptureIntervalMs));
+        if (frameTimer !== undefined) {
+          window.clearInterval(frameTimer);
+          frameTimer = window.setInterval(sendFrame, intervalMs);
+        }
+      }
+      if (
+        detail?.screenCaptureMaxWidth != null &&
+        Number.isFinite(detail.screenCaptureMaxWidth)
+      ) {
+        maxW = Math.max(480, Math.min(1920, detail.screenCaptureMaxWidth));
+      }
+      if (
+        detail?.screenCaptureJpegQuality != null &&
+        Number.isFinite(detail.screenCaptureJpegQuality)
+      ) {
+        jpegQuality = Math.max(0.4, Math.min(0.92, detail.screenCaptureJpegQuality));
+      }
+    };
+
+    const onPerf = (ev: Event) => {
+      applyPerf((ev as CustomEvent).detail);
+    };
+    window.addEventListener("luna-perf-config", onPerf);
+
+    const onVisibility = () => {
+      uploadsPaused = document.visibilityState === "hidden";
+    };
+    document.addEventListener("visibilitychange", onVisibility);
 
     const connect = () => {
       if (closed) return;
@@ -236,6 +278,24 @@ function AppInner() {
         scheduleReconnect();
         return;
       }
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data)) as {
+            type?: string;
+            name?: string;
+            screen_capture_interval_ms?: number;
+          };
+          if (msg.type === "control" && msg.name === "perf_config") {
+            applyPerf({
+              screenCaptureIntervalMs: msg.screen_capture_interval_ms,
+              screenCaptureMaxWidth: msg.screen_capture_max_width,
+              screenCaptureJpegQuality: msg.screen_capture_jpeg_quality,
+            });
+          }
+        } catch {
+          /* ignore */
+        }
+      };
       ws.onclose = () => {
         ws = null;
         if (!closed) scheduleReconnect();
@@ -259,6 +319,7 @@ function AppInner() {
     };
 
     const sendFrame = () => {
+      if (uploadsPaused) return;
       const v = screenVideoRef.current;
       const socket = ws;
       if (!v || !socket || socket.readyState !== WebSocket.OPEN) return;
@@ -300,6 +361,8 @@ function AppInner() {
 
     return () => {
       closed = true;
+      window.removeEventListener("luna-perf-config", onPerf);
+      document.removeEventListener("visibilitychange", onVisibility);
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       if (frameTimer !== undefined) window.clearInterval(frameTimer);
       try {
@@ -312,9 +375,22 @@ function AppInner() {
 
   // Bridge → avatar event listeners.
   useEffect(() => {
+    const routeAvatar = (avatar?: string) => {
+      const rt = runtimeRef.current;
+      if (!rt) return;
+      const a = (avatar || "").trim().toLowerCase();
+      if (a === "luna") rt.setActiveSpeaker("luna");
+      else if (a === "himari") rt.setActiveSpeaker("himari");
+      else if (a === "cohost" || a === "viktor") rt.setActiveSpeaker("cohost");
+    };
+    const onActiveAvatar = (ev: Event) => {
+      const ce = ev as CustomEvent<{ avatar?: string }>;
+      routeAvatar(ce.detail?.avatar);
+    };
     const onEmotion = (ev: Event) => {
       const ce = ev as CustomEvent<
-        string | { emotion?: string; durationMs?: number }
+        | string
+        | { emotion?: string; durationMs?: number; avatar?: string }
       >;
       const d = ce.detail;
       const id =
@@ -330,6 +406,9 @@ function AppInner() {
         Number.isFinite(d.durationMs)
           ? d.durationMs
           : undefined;
+      if (typeof d === "object" && d && typeof d.avatar === "string") {
+        routeAvatar(d.avatar);
+      }
       runtimeRef.current?.triggerEmotion(String(id || "relaxed"), ms);
     };
     const onReply = (ev: Event) => {
@@ -340,27 +419,51 @@ function AppInner() {
       runtimeRef.current?.triggerTalk(String(ce.detail || ""));
     };
     const onSpeaking = (ev: Event) => {
-      const ce = ev as CustomEvent<boolean>;
-      runtimeRef.current?.setSpeaking(Boolean(ce.detail));
+      const ce = ev as CustomEvent<boolean | { value?: boolean; avatar?: string }>;
+      const d = ce.detail;
+      const active =
+        typeof d === "boolean" ? d : typeof d === "object" && d ? d.value === true : false;
+      if (typeof d === "object" && d && typeof d.avatar === "string") {
+        routeAvatar(d.avatar);
+      }
+      runtimeRef.current?.setSpeaking(active);
     };
     const onViseme = (ev: Event) => {
-      const ce = ev as CustomEvent<{ vowel?: string; intensity?: number; holdMs?: number }>;
+      const ce = ev as CustomEvent<{
+        vowel?: string;
+        intensity?: number;
+        holdMs?: number;
+        avatar?: string;
+      }>;
       const d = ce.detail || {};
+      if (typeof d.avatar === "string") routeAvatar(d.avatar);
       runtimeRef.current?.setViseme(
         String(d.vowel || ""),
         Number.isFinite(d.intensity) ? Number(d.intensity) : 1,
         Number.isFinite(d.holdMs) ? Number(d.holdMs) : 120,
       );
     };
+    const onAvatarThinking = (ev: Event) => {
+      const ce = ev as CustomEvent<{ avatar?: string; active?: boolean }>;
+      const raw = (ce.detail?.avatar || "").trim().toLowerCase();
+      const avatar =
+        raw === "himari" ? "himari" : raw === "cohost" || raw === "viktor" ? "cohost" : "luna";
+      const active = ce.detail?.active === true;
+      void runtimeRef.current?.setAvatarThinking(avatar, active);
+    };
+    window.addEventListener("luna-active-avatar", onActiveAvatar);
     window.addEventListener("luna-avatar-emotion", onEmotion);
     window.addEventListener("luna-assistant-reply", onReply);
     window.addEventListener("luna-avatar-speaking", onSpeaking);
     window.addEventListener("luna-avatar-viseme", onViseme);
+    window.addEventListener("luna-avatar-thinking", onAvatarThinking);
     return () => {
+      window.removeEventListener("luna-active-avatar", onActiveAvatar);
       window.removeEventListener("luna-avatar-emotion", onEmotion);
       window.removeEventListener("luna-assistant-reply", onReply);
       window.removeEventListener("luna-avatar-speaking", onSpeaking);
       window.removeEventListener("luna-avatar-viseme", onViseme);
+      window.removeEventListener("luna-avatar-thinking", onAvatarThinking);
     };
   }, [avatarSpeaking, ttsEnabled]);
 
@@ -385,14 +488,18 @@ function AppInner() {
     const cohostVrmParam = params.get("cohost_vrm")?.trim() || "";
     const cohostNameParam = params.get("cohost_name")?.trim() || "Co-host";
     const idleUrls = params.getAll("idle").filter((v) => v.trim().length > 0);
+    lunaThinkingUrlRef.current = params.get("luna_thinking")?.trim() || "";
     cohostIdleUrlsRef.current = params.getAll("cohost_idle").filter((v) => v.trim().length > 0);
-    const cohostSkipParam = params.get("cohost_idle_skip_sec");
-    if (cohostSkipParam != null && cohostSkipParam.trim() !== "") {
-      const skipSec = parseFloat(cohostSkipParam);
-      if (Number.isFinite(skipSec) && skipSec >= 0) {
-        runtime.setCohostIdleSkipSec(skipSec);
-      }
-    }
+    cohostThinkingUrlRef.current = params.get("cohost_thinking")?.trim() || "";
+    const parseIdleSkip = (raw: string | null) => {
+      if (raw == null || raw.trim() === "") return;
+      const skipSec = parseFloat(raw);
+      if (Number.isFinite(skipSec) && skipSec >= 0) return skipSec;
+    };
+    const lunaSkip = parseIdleSkip(params.get("luna_idle_skip_sec"));
+    if (lunaSkip != null) runtime.setLunaIdleSkipSec(lunaSkip);
+    const cohostSkip = parseIdleSkip(params.get("cohost_idle_skip_sec"));
+    if (cohostSkip != null) runtime.setCohostIdleSkipSec(cohostSkip);
 
     if (cohostVrmParam) {
       cohostVrmUrlRef.current = cohostVrmParam;
@@ -400,32 +507,71 @@ function AppInner() {
       setCohostAvailable(true);
       setCohostDisplayName(cohostNameParam);
     }
+    const himariVrmParam = params.get("himari_vrm")?.trim() || "";
+    const himariNameParam = params.get("himari_name")?.trim() || "Himari";
+    if (himariVrmParam) {
+      himariVrmUrlRef.current = himariVrmParam;
+      himariNameRef.current = himariNameParam;
+      setHimariAvailable(true);
+      setHimariDisplayName(himariNameParam);
+    }
+    himariIdleUrlsRef.current = params
+      .getAll("himari_idle")
+      .filter((v) => v.trim().length > 0);
+    himariThinkingUrlRef.current = params.get("himari_thinking")?.trim() || "";
+    const himariSkip = parseIdleSkip(params.get("himari_idle_skip_sec"));
+    if (himariSkip != null) runtime.setHimariIdleSkipSec(himariSkip);
 
     const onCohostAvatar = (ev: Event) => {
       const ce = ev as CustomEvent<{
         dualLayout?: boolean;
+        trioLayout?: boolean;
         vrmUrl?: string;
-        activeSpeaker?: "luna" | "cohost";
+        himariVrmUrl?: string;
+        activeSpeaker?: "luna" | "cohost" | "himari";
         chatReply?: boolean;
       }>;
       const rt = runtimeRef.current;
       if (!rt) return;
+      if (ce.detail?.chatReply && ce.detail.activeSpeaker === "himari") {
+        const url = ce.detail.vrmUrl?.trim() || himariVrmUrlRef.current;
+        if (url) himariVrmUrlRef.current = url;
+        void rt.prepareHimariChatReply(url);
+        return;
+      }
       if (ce.detail?.chatReply && ce.detail.activeSpeaker === "cohost") {
         const url = ce.detail.vrmUrl?.trim() || cohostVrmUrlRef.current;
         if (url) cohostVrmUrlRef.current = url;
         void rt.prepareCohostChatReply(url);
         return;
       }
-      if (ce.detail?.dualLayout) {
-        if (rt.isCohostSoloMode()) {
+      if (ce.detail?.dualLayout || ce.detail?.trioLayout) {
+        if (rt.isCohostSoloMode() && !ce.detail?.chatReply) {
           return;
         }
         const url = ce.detail.vrmUrl?.trim() || cohostVrmUrlRef.current;
         if (url) cohostVrmUrlRef.current = url;
+        const himariUrl =
+          ce.detail.himariVrmUrl?.trim() || himariVrmUrlRef.current;
+        if (himariUrl) himariVrmUrlRef.current = himariUrl;
         void rt.enableDualCohostLayout(url).then(async () => {
           setCohostInScene(rt.isCohostInScene());
+          if (cohostThinkingUrlRef.current) {
+            await rt.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
+          }
           if (cohostIdleUrlsRef.current.length > 0) {
             await rt.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
+          }
+          if (ce.detail?.trioLayout && himariUrl) {
+            const label = himariUrl.split("/").pop() || "himari.vrm";
+            await rt.summonHimari(himariUrl, label);
+            setHimariInScene(rt.isHimariInScene());
+            if (himariThinkingUrlRef.current) {
+              await rt.setHimariThinkingMotionUrl(himariThinkingUrlRef.current);
+            }
+            if (himariIdleUrlsRef.current.length > 0) {
+              await rt.setHimariIdleMotionUrls(himariIdleUrlsRef.current);
+            }
           }
         });
       }
@@ -436,7 +582,12 @@ function AppInner() {
         rt.setActiveSpeaker(ce.detail.activeSpeaker);
       }
     };
-    const onCohostChatReplyEnd = () => {
+    const onCohostChatReplyEnd = (ev: Event) => {
+      const ce = ev as CustomEvent<{ avatar?: string }>;
+      if (ce.detail?.avatar === "himari") {
+        runtimeRef.current?.finishHimariChatReply();
+        return;
+      }
       runtimeRef.current?.finishCohostChatReply();
     };
     window.addEventListener("luna-cohost-avatar", onCohostAvatar);
@@ -454,6 +605,9 @@ function AppInner() {
         .loadVrmFromUrl(vrmParam, vrmParam.split("/").pop() || "startup.vrm")
         .then(async () => {
           setLoadPct(100);
+          if (lunaThinkingUrlRef.current) {
+            await runtime.setLunaThinkingMotionUrl(lunaThinkingUrlRef.current);
+          }
           if (idleUrls.length > 0) {
             await runtime.setIdleMotionUrls(idleUrls);
           }
@@ -576,7 +730,7 @@ function AppInner() {
     if (rt.isCohostInScene()) {
       rt.dismissCohost();
       setCohostInScene(false);
-      void sendViewerCohostScene(false);
+      void sendViewerCohostScene(false, "viktor");
       return;
     }
     const url = cohostVrmUrlRef.current;
@@ -591,7 +745,10 @@ function AppInner() {
       .summonCohost(url, label)
       .then(async () => {
         setCohostInScene(true);
-        void sendViewerCohostScene(true);
+        void sendViewerCohostScene(true, "viktor");
+        if (cohostThinkingUrlRef.current) {
+          await rt.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
+        }
         if (cohostIdleUrlsRef.current.length > 0) {
           await rt.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
         }
@@ -602,6 +759,44 @@ function AppInner() {
       })
       .finally(() => setCohostBusy(false));
   }, [cohostBusy, sendViewerCohostScene]);
+
+  const toggleHimari = useCallback(() => {
+    const rt = runtimeRef.current;
+    if (!rt || himariBusy) return;
+    if (rt.isHimariInScene()) {
+      rt.dismissHimari();
+      setHimariInScene(false);
+      void sendViewerCohostScene(false, "himari");
+      setReplyTo("luna");
+      return;
+    }
+    const url = himariVrmUrlRef.current;
+    if (!url) {
+      setLastError("No Himari VRM URL — set LUNA_HIMARI_VRM in .env and restart main.py");
+      return;
+    }
+    setHimariBusy(true);
+    setLastError(null);
+    const label = url.split("/").pop() || "himari.vrm";
+    void rt
+      .summonHimari(url, label)
+      .then(async () => {
+        setHimariInScene(true);
+        setReplyTo("himari");
+        void sendViewerCohostScene(true, "himari");
+        if (himariThinkingUrlRef.current) {
+          await rt.setHimariThinkingMotionUrl(himariThinkingUrlRef.current);
+        }
+        if (himariIdleUrlsRef.current.length > 0) {
+          await rt.setHimariIdleMotionUrls(himariIdleUrlsRef.current);
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        setLastError(msg);
+      })
+      .finally(() => setHimariBusy(false));
+  }, [himariBusy, sendViewerCohostScene, setReplyTo]);
 
   const connLabel =
     conn === "open" ? "● live" : conn === "connecting" ? "◌ connecting…" : "○ offline";
@@ -644,6 +839,14 @@ function AppInner() {
         title={youtubeLivePrompt.title}
         hintUrl={youtubeLivePrompt.hintUrl}
         streamId={youtubeLivePrompt.streamId}
+      />
+
+      <LiveSocialTitlePromptOverlay
+        open={liveSocialTitlePrompt.open}
+        platform={liveSocialTitlePrompt.platform}
+        suggestedTitle={liveSocialTitlePrompt.suggestedTitle}
+        url={liveSocialTitlePrompt.url}
+        streamId={liveSocialTitlePrompt.streamId}
       />
 
       {activeOverlay === "upload" && (
@@ -694,8 +897,8 @@ function AppInner() {
             </div>
             {lastError && <p className="settings-hint settings-hint--err">{lastError}</p>}
             <p className="settings-hint">
-              Left-drag on avatar: camera up/down around them · Right-drag on avatar: move · Right-drag empty:
-              pan · Scroll: zoom
+              Left-drag on avatar: rotate (left/right + up/down) · Right-drag on avatar: move · Right-drag
+              empty: pan · Scroll: zoom
             </p>
           </div>
         </div>
@@ -791,10 +994,11 @@ function AppInner() {
         cohostName={cohostDisplayName}
         cohostBusy={cohostBusy}
         onToggleCohost={toggleCohost}
-        banterWsDisabled={conn !== "open"}
-        cohostFullConversation={cohostFullConversation}
-        onCohostFullConversationChange={setCohostFullConversation}
-        onCohostBanterNow={(full) => void sendCohostBanterNow(full)}
+        himariAvailable={himariAvailable}
+        himariInScene={himariInScene}
+        himariName={himariDisplayName}
+        himariBusy={himariBusy}
+        onToggleHimari={toggleHimari}
       />
     </div>
   );

@@ -49,17 +49,29 @@ export type BridgeControlTtsSpeakerMessage = {
   value: string;
 };
 
+export type ViewerAvatarId = "luna" | "cohost" | "himari";
+
 export type BridgeControlAvatarEmotionMessage = {
   type: "control";
   name: "avatar_emotion";
   value: string;
   /** How long to hold the expression preset (ms); should cover most of TTS. */
   duration_ms?: number;
+  avatar?: ViewerAvatarId;
 };
 
 export type BridgeControlAvatarSpeakingMessage = {
   type: "control";
   name: "avatar_speaking";
+  value: boolean;
+  avatar?: ViewerAvatarId;
+};
+
+export type BridgeControlAvatarThinkingMessage = {
+  type: "control";
+  name: "avatar_thinking";
+  /** ``luna`` | ``cohost`` | ``himari``. */
+  avatar: string;
   value: boolean;
 };
 
@@ -69,6 +81,7 @@ export type BridgeControlAvatarVisemeMessage = {
   value: string;
   intensity?: number;
   hold_ms?: number;
+  avatar?: ViewerAvatarId;
 };
 
 export type BridgeControlMicReadyMessage = {
@@ -93,7 +106,7 @@ export type BridgeControlTtsAudioMessage = {
   /** @deprecated use avatar */
   drive_avatar?: boolean;
   /** Speaking avatar for routing / lip-sync — default Luna when omitted. */
-  avatar?: "luna" | "cohost";
+  avatar?: ViewerAvatarId;
   /** Twitch/YouTube @Viktor reply — show co-host VRM/voice even in solo mode. */
   chat_reply?: boolean;
 };
@@ -108,8 +121,11 @@ export type BridgeControlCohostAvatarMessage = {
   name: "cohost_avatar";
   /** When true, show Luna + co-host together (no swapping). */
   dual_layout?: boolean;
+  /** Luna + Viktor + Himari on stage for cast banter. */
+  trio_layout?: boolean;
   vrm_url?: string;
-  active_speaker?: "luna" | "cohost";
+  himari_vrm_url?: string;
+  active_speaker?: ViewerAvatarId;
   /** Twitch/YouTube live chat routed to Viktor — bypass solo-mode viewer blocks. */
   chat_reply?: boolean;
 };
@@ -133,19 +149,42 @@ export type BridgeControlYoutubeLivePromptMessage = {
   stream_id?: string;
 };
 
+export type BridgeControlLiveSocialTitlePromptMessage = {
+  type: "control";
+  name: "live_social_title_prompt";
+  open: boolean;
+  platform?: string;
+  suggested_title?: string;
+  url?: string;
+  stream_id?: string;
+};
+
+export type BridgeControlPerfConfigMessage = {
+  type: "control";
+  name: "perf_config";
+  screen_capture_interval_ms?: number;
+  screen_context_interval_sec?: number;
+  screen_capture_max_width?: number;
+  screen_capture_jpeg_quality?: number;
+  renderer_max_dpr?: number;
+};
+
 export type BridgeControlMessage =
   | BridgeControlSpeakMessage
   | BridgeControlTtsVoicesMessage
   | BridgeControlTtsSpeakerMessage
   | BridgeControlAvatarEmotionMessage
   | BridgeControlAvatarSpeakingMessage
+  | BridgeControlAvatarThinkingMessage
   | BridgeControlAvatarVisemeMessage
   | BridgeControlMicReadyMessage
   | BridgeControlTtsAudioMessage
   | BridgeControlStopTtsMessage
   | BridgeControlEnrollStateMessage
   | BridgeControlYoutubeLivePromptMessage
-  | BridgeControlCohostAvatarMessage;
+  | BridgeControlLiveSocialTitlePromptMessage
+  | BridgeControlCohostAvatarMessage
+  | BridgeControlPerfConfigMessage;
 
 export type BridgeMessage =
   | BridgeChatMessage
@@ -196,23 +235,70 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       typeof o.duration_ms === "number" && Number.isFinite(o.duration_ms)
         ? o.duration_ms
         : undefined;
+    const avatarRaw = typeof o.avatar === "string" ? o.avatar.trim().toLowerCase() : "";
+    const avatar: ViewerAvatarId | undefined =
+      avatarRaw === "himari"
+        ? "himari"
+        : avatarRaw === "cohost"
+          ? "cohost"
+          : avatarRaw === "luna"
+            ? "luna"
+            : undefined;
     return {
       type: "control",
       name: "avatar_emotion",
       value: o.value,
       ...(duration_ms !== undefined ? { duration_ms } : {}),
+      ...(avatar ? { avatar } : {}),
     };
   }
   if (t === "control" && o.name === "avatar_speaking" && typeof o.value === "boolean") {
-    return { type: "control", name: "avatar_speaking", value: o.value };
+    const avatarRaw = typeof o.avatar === "string" ? o.avatar.trim().toLowerCase() : "";
+    const avatar: ViewerAvatarId | undefined =
+      avatarRaw === "himari"
+        ? "himari"
+        : avatarRaw === "cohost"
+          ? "cohost"
+          : avatarRaw === "luna"
+            ? "luna"
+            : undefined;
+    return {
+      type: "control",
+      name: "avatar_speaking",
+      value: o.value,
+      ...(avatar ? { avatar } : {}),
+    };
+  }
+  if (
+    t === "control" &&
+    o.name === "avatar_thinking" &&
+    typeof o.value === "boolean" &&
+    typeof o.avatar === "string"
+  ) {
+    return {
+      type: "control",
+      name: "avatar_thinking",
+      avatar: o.avatar,
+      value: o.value,
+    };
   }
   if (t === "control" && o.name === "avatar_viseme" && typeof o.value === "string") {
+    const avatarRaw = typeof o.avatar === "string" ? o.avatar.trim().toLowerCase() : "";
+    const avatar: ViewerAvatarId | undefined =
+      avatarRaw === "himari"
+        ? "himari"
+        : avatarRaw === "cohost"
+          ? "cohost"
+          : avatarRaw === "luna"
+            ? "luna"
+            : undefined;
     return {
       type: "control",
       name: "avatar_viseme",
       value: o.value,
       intensity: typeof o.intensity === "number" ? o.intensity : undefined,
       hold_ms: typeof o.hold_ms === "number" ? o.hold_ms : undefined,
+      ...(avatar ? { avatar } : {}),
     };
   }
   if (t === "control" && o.name === "mic_ready" && o.value === true) {
@@ -238,7 +324,12 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
           })
       : undefined;
     const avatarRaw = typeof o.avatar === "string" ? o.avatar.trim().toLowerCase() : "";
-    const avatar: "luna" | "cohost" = avatarRaw === "cohost" ? "cohost" : "luna";
+    const avatar: ViewerAvatarId =
+      avatarRaw === "himari"
+        ? "himari"
+        : avatarRaw === "cohost" || avatarRaw === "viktor"
+          ? "cohost"
+          : "luna";
     const drive_avatar = o.drive_avatar !== false;
     return {
       type: "control",
@@ -261,8 +352,18 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       type: "control",
       name: "cohost_avatar",
       dual_layout: o.dual_layout === true || o.visible === true,
+      trio_layout: o.trio_layout === true,
       vrm_url: typeof o.vrm_url === "string" ? o.vrm_url : undefined,
-      active_speaker: sp === "cohost" ? "cohost" : sp === "luna" ? "luna" : undefined,
+      himari_vrm_url:
+        typeof o.himari_vrm_url === "string" ? o.himari_vrm_url : undefined,
+      active_speaker:
+        sp === "himari"
+          ? "himari"
+          : sp === "cohost"
+            ? "cohost"
+            : sp === "luna"
+              ? "luna"
+              : undefined,
       chat_reply: o.chat_reply === true,
     };
   }
@@ -296,6 +397,54 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       title: typeof o.title === "string" ? o.title : undefined,
       url: typeof o.url === "string" ? o.url : undefined,
       stream_id: typeof o.stream_id === "string" ? o.stream_id : undefined,
+    };
+  }
+  if (t === "control" && o.name === "live_social_title_prompt") {
+    const open = o.open !== false;
+    return {
+      type: "control",
+      name: "live_social_title_prompt",
+      open,
+      platform: typeof o.platform === "string" ? o.platform : undefined,
+      suggested_title:
+        typeof o.suggested_title === "string" ? o.suggested_title : undefined,
+      url: typeof o.url === "string" ? o.url : undefined,
+      stream_id: typeof o.stream_id === "string" ? o.stream_id : undefined,
+    };
+  }
+  if (t === "control" && o.name === "perf_config") {
+    const capMs =
+      typeof o.screen_capture_interval_ms === "number" &&
+      Number.isFinite(o.screen_capture_interval_ms)
+        ? o.screen_capture_interval_ms
+        : undefined;
+    const ctxSec =
+      typeof o.screen_context_interval_sec === "number" &&
+      Number.isFinite(o.screen_context_interval_sec)
+        ? o.screen_context_interval_sec
+        : undefined;
+    const dpr =
+      typeof o.renderer_max_dpr === "number" && Number.isFinite(o.renderer_max_dpr)
+        ? o.renderer_max_dpr
+        : undefined;
+    const maxW =
+      typeof o.screen_capture_max_width === "number" &&
+      Number.isFinite(o.screen_capture_max_width)
+        ? o.screen_capture_max_width
+        : undefined;
+    const jpegQ =
+      typeof o.screen_capture_jpeg_quality === "number" &&
+      Number.isFinite(o.screen_capture_jpeg_quality)
+        ? o.screen_capture_jpeg_quality
+        : undefined;
+    return {
+      type: "control",
+      name: "perf_config",
+      ...(capMs !== undefined ? { screen_capture_interval_ms: capMs } : {}),
+      ...(ctxSec !== undefined ? { screen_context_interval_sec: ctxSec } : {}),
+      ...(maxW !== undefined ? { screen_capture_max_width: maxW } : {}),
+      ...(jpegQ !== undefined ? { screen_capture_jpeg_quality: jpegQ } : {}),
+      ...(dpr !== undefined ? { renderer_max_dpr: dpr } : {}),
     };
   }
   if (t === "chat" && typeof o.user === "string" && typeof o.text === "string") {

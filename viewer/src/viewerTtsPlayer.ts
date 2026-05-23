@@ -5,6 +5,8 @@ export type ViewerTtsViseme = {
   hold_ms?: number;
 };
 
+export type ViewerTtsAvatar = "luna" | "cohost" | "himari";
+
 export type ViewerTtsPayload = {
   mime: string;
   data: string;
@@ -12,6 +14,8 @@ export type ViewerTtsPayload = {
   visemes?: ViewerTtsViseme[];
   /** When false, play audio only (co-host voice; no Luna lip-sync). */
   driveAvatar?: boolean;
+  /** Lip-sync target when ``driveAvatar`` is true. */
+  avatar?: ViewerTtsAvatar;
 };
 
 let activeAudio: HTMLAudioElement | null = null;
@@ -102,6 +106,7 @@ export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
               vowel: String(v.vowel || ""),
               intensity: Number.isFinite(v.intensity) ? Number(v.intensity) : 1,
               holdMs: Number.isFinite(v.hold_ms) ? Number(v.hold_ms) : 120,
+              avatar: payload.avatar,
             },
           }),
         );

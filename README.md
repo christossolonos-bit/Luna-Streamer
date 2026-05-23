@@ -37,7 +37,7 @@
 | **Viewer** | React + Three.js + your VRM. Mic → **faster-whisper**. Lip-sync. Idle motions. Summon or dismiss Viktor from the dock |
 | **Creator** | Enroll your voice once—we learn *you* and ignore everyone else on the desk mic (including our own TTS in your headphones) |
 
-**Viktor:** Optional extras, for the ambitious: screen context, League of Legends stats from the Riot client, Playwright posting "we're live" to X or Facebook. None of that is required to hear us bicker.
+**Viktor:** Optional extras, for the ambitious: screen context, Playwright posting "we're live" to X or Facebook. None of that is required to hear us bicker.
 
 **Luna:** One command to wake the house:
 

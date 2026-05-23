@@ -44,34 +44,46 @@ export class VrmRuntime {
   private controls: OrbitControls;
   private readonly clock = new THREE.Clock();
   private vrm: VRM | null = null;
+  /** Scene root pivot at belly/waist — pitch/yaw rotate here; VRM mesh is offset downward. */
+  private lunaPivot: THREE.Group | null = null;
   private cohostVrm: VRM | null = null;
-  private activeAvatar: "luna" | "cohost" = "luna";
+  private cohostPivot: THREE.Group | null = null;
+  private himariVrm: VRM | null = null;
+  private himariPivot: THREE.Group | null = null;
+  private readonly _bellyPivotScratch = new THREE.Vector3();
+  private himariInScene = false;
+  private activeAvatar: "luna" | "cohost" | "himari" = "luna";
   private dualLayoutEnabled = false;
   private static readonly COHOST_SIDE_GAP = 0.18;
   /** At dismiss: co-host root minus Luna root (world), so re-summon can place Viktor without moving Luna. */
   private readonly _savedCohostOffsetFromLuna = new THREE.Vector3();
   private _haveSavedCohostRelativePlacement = false;
+  private readonly _savedHimariOffsetFromLuna = new THREE.Vector3();
+  private _haveSavedHimariRelativePlacement = false;
   /** Viktor answering Twitch/YouTube while Luna solo — temporary on-screen takeover. */
   private _chatReplyTakeover = false;
-  private static readonly CAMERA_ORBIT_PHI_PER_PX = 0.005;
-  private static readonly CAMERA_ORBIT_PHI_MIN = 0.12;
-  private static readonly CAMERA_ORBIT_PHI_MAX = Math.PI - 0.12;
+  private _himariChatReplyTakeover = false;
+  private static readonly AVATAR_ROT_YAW_PER_PX = 0.008;
+  private static readonly AVATAR_ROT_PITCH_PER_PX = 0.005;
+  private static readonly AVATAR_ROT_PITCH_MIN = -0.75;
+  private static readonly AVATAR_ROT_PITCH_MAX = 0.75;
   private static readonly AVATAR_DRAG_HORIZ_PER_PX = 0.0022;
   private static readonly AVATAR_DRAG_VERT_PER_PX = 0.0022;
   private readonly _layoutBox = new THREE.Box3();
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointerNdc = new THREE.Vector2();
-  /** Left-drag: vertical camera orbit (polar) around ``controls.target`` — no per-avatar hit areas. */
-  private verticalOrbitDragActive = false;
+  /** Left-drag on body: yaw (horizontal) + pitch (vertical) for the picked VRM only. */
+  private avatarRotateDrag: "luna" | "cohost" | "himari" | null = null;
+  /** Avatars manually rotated — skip auto face-camera on these. */
+  private readonly manualAvatarFacing = new Set<"luna" | "cohost" | "himari">();
   /** Right-drag reposition (horizontal on floor + vertical in world Y). */
-  private avatarDragMove: "luna" | "cohost" | null = null;
-  private orbitPointerY = 0;
+  private avatarDragMove: "luna" | "cohost" | "himari" | null = null;
+  private rotatePointerX = 0;
+  private rotatePointerY = 0;
   private dragMovePointerX = 0;
   private dragMovePointerY = 0;
   private interactionPointerId: number | null = null;
   private readonly _dragCamRight = new THREE.Vector3();
-  private readonly _orbitScratchOffset = new THREE.Vector3();
-  private readonly _orbitSpherical = new THREE.Spherical();
   private loader = new GLTFLoader();
   private animationLoader = new GLTFLoader();
   private mixer: THREE.AnimationMixer | null = null;
@@ -80,6 +92,12 @@ export class VrmRuntime {
   private idleClipIndex = 0;
   private idleModeEnabled = false;
   private idleSourceUrls: string[] = [];
+  /** Skip leading seconds on Luna VRMA idles (avoids bind/T-pose at t=0). */
+  private lunaIdleSkipSec = 2;
+  private lunaThinkingClip: THREE.AnimationClip | null = null;
+  private lunaThinkingAction: THREE.AnimationAction | null = null;
+  private lunaThinkingActive = false;
+  private lunaThinkingUrl = "";
   private cohostMixer: THREE.AnimationMixer | null = null;
   private cohostIdleAction: THREE.AnimationAction | null = null;
   private cohostIdleClips: THREE.AnimationClip[] = [];
@@ -88,11 +106,33 @@ export class VrmRuntime {
   private cohostIdleSourceUrls: string[] = [];
   /** Skip leading seconds on co-host VRMA idles (avoids bind/T-pose at t=0). */
   private cohostIdleSkipSec = 2;
+  private cohostThinkingAction: THREE.AnimationAction | null = null;
+  private cohostThinkingClip: THREE.AnimationClip | null = null;
+  private cohostThinkingActive = false;
+  private cohostThinkingUrl = "";
+  private himariMixer: THREE.AnimationMixer | null = null;
+  private himariIdleAction: THREE.AnimationAction | null = null;
+  private himariThinkingAction: THREE.AnimationAction | null = null;
+  private himariIdleClips: THREE.AnimationClip[] = [];
+  private himariThinkingClip: THREE.AnimationClip | null = null;
+  private himariIdleClipIndex = 0;
+  private himariIdleModeEnabled = false;
+  private himariThinkingActive = false;
+  private himariIdleSourceUrls: string[] = [];
+  private himariThinkingUrl = "";
+  private himariIdleSkipSec = 2;
+  /** Per-avatar 0–1 phase so idle/thinking VRMA do not stay in sync on stage. */
+  private readonly lunaAnimPhase = Math.random();
+  private readonly cohostAnimPhase = Math.random();
+  private readonly himariAnimPhase = Math.random();
+  /** Minimum seconds to play each one-shot idle clip before advancing (avoids rapid clip cycling). */
+  private static readonly MIN_IDLE_PLAY_SEC = 1.75;
   private raf = 0;
   private lastFrame = performance.now();
   private fpsAccum = 0;
   private fpsFrames = 0;
   private disposed = false;
+  private _disposePerfListener: (() => void) | null = null;
   private emotionTimer = 0;
   private talkTimer = 0;
   private talkRaf = 0;
@@ -115,10 +155,14 @@ export class VrmRuntime {
 
   private readonly onPointerDown = (e: PointerEvent) => {
     if (e.button === 0) {
+      const picked = this._pickAvatar(e.clientX, e.clientY);
+      if (!picked) return;
       e.preventDefault();
       e.stopPropagation();
-      this.verticalOrbitDragActive = true;
-      this.orbitPointerY = e.clientY;
+      this.avatarRotateDrag = picked;
+      this.manualAvatarFacing.add(picked);
+      this.rotatePointerX = e.clientX;
+      this.rotatePointerY = e.clientY;
       this.interactionPointerId = e.pointerId;
       this.controls.enabled = false;
       this.canvas.setPointerCapture(e.pointerId);
@@ -143,10 +187,20 @@ export class VrmRuntime {
     if (this.interactionPointerId !== null && e.pointerId !== this.interactionPointerId) {
       return;
     }
-    if (this.verticalOrbitDragActive) {
-      const dy = e.clientY - this.orbitPointerY;
-      this.orbitPointerY = e.clientY;
-      this._orbitCameraVerticallyAroundTarget(dy);
+    if (this.avatarRotateDrag) {
+      const dx = e.clientX - this.rotatePointerX;
+      const dy = e.clientY - this.rotatePointerY;
+      this.rotatePointerX = e.clientX;
+      this.rotatePointerY = e.clientY;
+      const root = this._sceneRootForAvatar(this.avatarRotateDrag);
+      if (!root) return;
+      root.rotation.y -= dx * VrmRuntime.AVATAR_ROT_YAW_PER_PX;
+      root.rotation.x = THREE.MathUtils.clamp(
+        root.rotation.x - dy * VrmRuntime.AVATAR_ROT_PITCH_PER_PX,
+        VrmRuntime.AVATAR_ROT_PITCH_MIN,
+        VrmRuntime.AVATAR_ROT_PITCH_MAX,
+      );
+      root.updateMatrixWorld(true);
       return;
     }
 
@@ -155,10 +209,7 @@ export class VrmRuntime {
       const dy = e.clientY - this.dragMovePointerY;
       this.dragMovePointerX = e.clientX;
       this.dragMovePointerY = e.clientY;
-      const root =
-        this.avatarDragMove === "luna"
-          ? this.vrm?.scene
-          : this.cohostVrm?.scene;
+      const root = this._sceneRootForAvatar(this.avatarDragMove);
       if (!root) return;
       this._dragCamRight.setFromMatrixColumn(this.camera.matrixWorld, 0).normalize();
       this._dragCamRight.y = 0;
@@ -182,7 +233,7 @@ export class VrmRuntime {
     ) {
       return;
     }
-    this.verticalOrbitDragActive = false;
+    this.avatarRotateDrag = null;
     this.avatarDragMove = null;
     this.interactionPointerId = null;
     this.controls.enabled = true;
@@ -203,8 +254,56 @@ export class VrmRuntime {
     return false;
   }
 
+  private _pivotForAvatar(
+    avatar: "luna" | "cohost" | "himari",
+  ): THREE.Group | null {
+    if (avatar === "luna") return this.lunaPivot;
+    if (avatar === "himari") return this.himariPivot;
+    return this.cohostPivot;
+  }
+
+  private _sceneRootForAvatar(
+    avatar: "luna" | "cohost" | "himari",
+  ): THREE.Object3D | null {
+    return this._pivotForAvatar(avatar);
+  }
+
+  /** Local Y of hips/waist so pivot origin sits at the belly, not the feet. */
+  private _computeBellyPivotLocalY(vrm: VRM): number {
+    vrm.scene.updateMatrixWorld(true);
+    const hips = vrm.humanoid?.getNormalizedBoneNode(VRMHumanBoneName.Hips);
+    if (hips) {
+      hips.getWorldPosition(this._bellyPivotScratch);
+      vrm.scene.worldToLocal(this._bellyPivotScratch);
+      if (this._bellyPivotScratch.y > 0.05) {
+        return this._bellyPivotScratch.y;
+      }
+    }
+    const box = new THREE.Box3().setFromObject(vrm.scene);
+    if (!box.isEmpty()) {
+      return box.min.y + (box.max.y - box.min.y) * 0.55;
+    }
+    return 0.9;
+  }
+
+  private _createAvatarPivot(vrm: VRM): THREE.Group {
+    const pivot = new THREE.Group();
+    const bellyY = this._computeBellyPivotLocalY(vrm);
+    vrm.scene.position.set(0, -bellyY, 0);
+    vrm.scene.rotation.set(0, 0, 0);
+    pivot.add(vrm.scene);
+    return pivot;
+  }
+
+  private _addVrmToScene(vrm: VRM, pivot: THREE.Group) {
+    this.scene.add(pivot);
+    vrm.scene.updateMatrixWorld(true);
+  }
+
   private activeVrm(): VRM | null {
-    return this.activeAvatar === "cohost" ? this.cohostVrm : this.vrm;
+    if (this.activeAvatar === "cohost") return this.cohostVrm;
+    if (this.activeAvatar === "himari") return this.himariVrm;
+    return this.vrm;
   }
 
   private _captureJawRestPose() {
@@ -233,9 +332,110 @@ export class VrmRuntime {
     jaw.quaternion.copy(this._jawRestQuat).multiply(this._jawWorkQuat);
   }
 
+  /** Re-apply TTS viseme morphs after VRMA + humanoid update (VRMA can stomp blend shapes). */
+  private _reapplyActiveLipMorphs() {
+    const now = performance.now();
+    if (this._visemeUntil > now && this._visemeVowel) {
+      this._setVowelExpressions(this._visemeVowel, this._visemeAmp);
+    }
+  }
+
+  private _animPhase(avatar: "luna" | "cohost" | "himari"): number {
+    if (avatar === "cohost") return this.cohostAnimPhase;
+    if (avatar === "himari") return this.himariAnimPhase;
+    return this.lunaAnimPhase;
+  }
+
+  /** Stagger idle start; always leave enough time before clip end (phase near 1.0 used to finish instantly). */
+  private _idleStartTime(
+    clip: THREE.AnimationClip,
+    skipSec: number,
+    avatar: "luna" | "cohost" | "himari",
+  ): number {
+    const dur = clip.duration;
+    if (dur <= 0) return 0;
+    const minPlay = Math.min(
+      dur * 0.85,
+      Math.max(0.35, VrmRuntime.MIN_IDLE_PLAY_SEC),
+    );
+    const maxStart = Math.max(0, dur - minPlay);
+    const skip = Math.min(Math.max(0, skipSec), maxStart);
+    const span = Math.max(0, maxStart - skip);
+    const t = skip + (this._animPhase(avatar) % 1) * span;
+    return Math.min(Math.max(0, t), Math.max(0, dur - 0.02));
+  }
+
+  /** Offset within a repeating thinking clip (full period — avoids a tiny first cycle then repeat). */
+  private _thinkingStartTime(
+    clip: THREE.AnimationClip,
+    avatar: "luna" | "cohost" | "himari",
+  ): number {
+    const dur = clip.duration;
+    if (dur <= 0) return 0;
+    return (this._animPhase(avatar) % 1) * dur;
+  }
+
+  private _initialIdleClipIndex(clipCount: number, avatar: "luna" | "cohost" | "himari"): number {
+    if (clipCount <= 0) return 0;
+    return Math.floor((this._animPhase(avatar) % 1) * clipCount) % clipCount;
+  }
+
+  /** Start a one-shot idle clip; holds last frame until the next clip (no bind-pose flash). */
+  private _beginIdleClipAction(
+    mixer: THREE.AnimationMixer,
+    clip: THREE.AnimationClip,
+    previous: THREE.AnimationAction | null,
+    skipSec: number,
+    avatar: "luna" | "cohost" | "himari",
+  ): THREE.AnimationAction {
+    if (previous) {
+      previous.stop();
+    }
+    const action = mixer.clipAction(clip);
+    action.reset();
+    action.enabled = true;
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    if (clip.duration > 0) {
+      action.time = this._idleStartTime(clip, skipSec, avatar);
+    }
+    action.play();
+    return action;
+  }
+
+  private _beginThinkingClipAction(
+    mixer: THREE.AnimationMixer,
+    clip: THREE.AnimationClip,
+    previous: THREE.AnimationAction | null,
+    avatar: "luna" | "cohost" | "himari",
+  ): THREE.AnimationAction {
+    if (previous) {
+      previous.stop();
+    }
+    const action = mixer.clipAction(clip);
+    action.reset();
+    action.enabled = true;
+    action.setLoop(THREE.LoopRepeat, Infinity);
+    if (clip.duration > 0) {
+      action.time = this._thinkingStartTime(clip, avatar);
+    }
+    action.play();
+    return action;
+  }
+
   private _orientAvatarTowardCamera(vrm: VRM) {
-    this._faceSceneRootTowardCamera(vrm.scene);
-    vrm.scene.updateMatrixWorld(true);
+    const pivot =
+      vrm === this.vrm
+        ? this.lunaPivot
+        : vrm === this.cohostVrm
+          ? this.cohostPivot
+          : vrm === this.himariVrm
+            ? this.himariPivot
+            : null;
+    if (pivot) {
+      this._faceSceneRootTowardCamera(pivot);
+      pivot.updateMatrixWorld(true);
+    }
   }
 
   private _resetMouth(model: VRM | null) {
@@ -252,7 +452,7 @@ export class VrmRuntime {
     this.pointerNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
   }
 
-  private _pickAvatar(clientX: number, clientY: number): "luna" | "cohost" | null {
+  private _pickAvatar(clientX: number, clientY: number): "luna" | "cohost" | "himari" | null {
     this._setPointerNdc(clientX, clientY);
     this.raycaster.setFromCamera(this.pointerNdc, this.camera);
     const roots: THREE.Object3D[] = [];
@@ -260,12 +460,16 @@ export class VrmRuntime {
     if (this.cohostVrm?.scene.visible && this.cohostVrm.scene) {
       roots.push(this.cohostVrm.scene);
     }
+    if (this.himariVrm?.scene.visible && this.himariVrm.scene) {
+      roots.push(this.himariVrm.scene);
+    }
     if (!roots.length) return null;
     const hits = this.raycaster.intersectObjects(roots, true);
     if (!hits.length) return null;
     let node: THREE.Object3D | null = hits[0].object;
     while (node) {
       if (this.cohostVrm && node === this.cohostVrm.scene) return "cohost";
+      if (this.himariVrm && node === this.himariVrm.scene) return "himari";
       if (this.vrm && node === this.vrm.scene) return "luna";
       node = node.parent;
     }
@@ -277,22 +481,6 @@ export class VrmRuntime {
     return this._layoutBox.setFromObject(vrm.scene);
   }
 
-  /** Polar orbit from vertical mouse drag; pivot = current orbit target (not a picked avatar). */
-  private _orbitCameraVerticallyAroundTarget(dyPx: number): void {
-    if (dyPx === 0) return;
-    const focus = this.controls.target;
-    this._orbitScratchOffset.subVectors(this.camera.position, focus);
-    this._orbitSpherical.setFromVector3(this._orbitScratchOffset);
-    this._orbitSpherical.phi = THREE.MathUtils.clamp(
-      this._orbitSpherical.phi - dyPx * VrmRuntime.CAMERA_ORBIT_PHI_PER_PX,
-      VrmRuntime.CAMERA_ORBIT_PHI_MIN,
-      VrmRuntime.CAMERA_ORBIT_PHI_MAX,
-    );
-    this._orbitScratchOffset.setFromSpherical(this._orbitSpherical);
-    this.camera.position.copy(focus).add(this._orbitScratchOffset);
-    this.camera.lookAt(focus);
-  }
-
   private _faceSceneRootTowardCamera(root: THREE.Object3D) {
     const cam = this.camera.position;
     const dx = cam.x - root.position.x;
@@ -302,31 +490,70 @@ export class VrmRuntime {
   }
 
   private _faceVisibleAvatarsTowardCamera() {
-    if (this.vrm?.scene.visible) this._faceSceneRootTowardCamera(this.vrm.scene);
-    if (this.cohostVrm?.scene.visible) this._faceSceneRootTowardCamera(this.cohostVrm.scene);
+    if (this.vrm?.scene.visible && this.lunaPivot && !this.manualAvatarFacing.has("luna")) {
+      this._faceSceneRootTowardCamera(this.lunaPivot);
+    }
+    if (
+      this.cohostVrm?.scene.visible &&
+      this.cohostPivot &&
+      !this.manualAvatarFacing.has("cohost")
+    ) {
+      this._faceSceneRootTowardCamera(this.cohostPivot);
+    }
+    if (
+      this.himariVrm?.scene.visible &&
+      this.himariPivot &&
+      !this.manualAvatarFacing.has("himari")
+    ) {
+      this._faceSceneRootTowardCamera(this.himariPivot);
+    }
   }
 
   /** Places co-host to Luna's side in world space. Does not move Luna (keeps summon/manual placement). */
   private _layoutCohostBesideLuna() {
-    if (!this.vrm || !this.cohostVrm) return;
+    if (!this.vrm || !this.cohostVrm || !this.lunaPivot || !this.cohostPivot) return;
 
     const lunaBox = this._worldBounds(this.vrm).clone();
-
-    this.cohostVrm.scene.position.set(0, 0, 0);
-    const cohostAtOrigin = this._worldBounds(this.cohostVrm).clone();
+    this.cohostPivot.position.copy(this.lunaPivot.position);
+    this.cohostPivot.rotation.set(0, 0, 0);
+    const cohostAtLuna = this._worldBounds(this.cohostVrm).clone();
 
     const gap = VrmRuntime.COHOST_SIDE_GAP;
-    const offsetX = lunaBox.max.x + gap - cohostAtOrigin.min.x;
+    const offsetX = lunaBox.max.x + gap - cohostAtLuna.min.x;
     const lunaCenterZ = (lunaBox.min.z + lunaBox.max.z) * 0.5;
-    const cohostCenterZ = (cohostAtOrigin.min.z + cohostAtOrigin.max.z) * 0.5;
-    const offsetY = lunaBox.min.y - cohostAtOrigin.min.y;
+    const cohostCenterZ = (cohostAtLuna.min.z + cohostAtLuna.max.z) * 0.5;
+    const offsetY = lunaBox.min.y - cohostAtLuna.min.y;
 
-    this.cohostVrm.scene.position.set(offsetX, offsetY, lunaCenterZ - cohostCenterZ);
+    this.cohostPivot.position.x += offsetX;
+    this.cohostPivot.position.y += offsetY;
+    this.cohostPivot.position.z += lunaCenterZ - cohostCenterZ;
   }
 
-  private _applyDualLayoutPositions() {
-    if (!this.vrm || !this.cohostVrm) return;
-    this._layoutCohostBesideLuna();
+  private _layoutHimariBesideLuna() {
+    if (!this.vrm || !this.himariVrm || !this.lunaPivot || !this.himariPivot) return;
+    const lunaBox = this._worldBounds(this.vrm).clone();
+    this.himariPivot.position.copy(this.lunaPivot.position);
+    this.himariPivot.rotation.set(0, 0, 0);
+    const himariAtLuna = this._worldBounds(this.himariVrm).clone();
+    const gap = VrmRuntime.COHOST_SIDE_GAP;
+    const offsetX = lunaBox.min.x - gap - himariAtLuna.max.x;
+    const lunaCenterZ = (lunaBox.min.z + lunaBox.max.z) * 0.5;
+    const himariCenterZ = (himariAtLuna.min.z + himariAtLuna.max.z) * 0.5;
+    const offsetY = lunaBox.min.y - himariAtLuna.min.y;
+    this.himariPivot.position.x += offsetX;
+    this.himariPivot.position.y += offsetY;
+    this.himariPivot.position.z += lunaCenterZ - himariCenterZ;
+  }
+
+  /** Place every visible cast member (Himari left, Viktor right of Luna). */
+  private _applyCastLayoutPositions() {
+    if (!this.vrm) return;
+    if (this.himariInScene && this.himariVrm?.scene.visible) {
+      this._layoutHimariBesideLuna();
+    }
+    if (this.dualLayoutEnabled && this.cohostVrm?.scene.visible) {
+      this._layoutCohostBesideLuna();
+    }
   }
 
   private _setVowelExpressions(vowel: string, amp: number) {
@@ -357,7 +584,25 @@ export class VrmRuntime {
       alpha: true,
       powerPreference: "high-performance",
     });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const dprRaw = import.meta.env.VITE_RENDERER_MAX_DPR;
+    let maxDpr = 1.5;
+    if (typeof dprRaw === "string" && dprRaw.trim()) {
+      const parsed = Number(dprRaw);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        maxDpr = Math.min(2, Math.max(0.75, parsed));
+      }
+    }
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, maxDpr));
+    const onPerf = (ev: Event) => {
+      const d = (ev as CustomEvent<{ rendererMaxDpr?: number }>).detail;
+      if (typeof d?.rendererMaxDpr === "number" && Number.isFinite(d.rendererMaxDpr)) {
+        const cap = Math.min(2, Math.max(0.75, d.rendererMaxDpr));
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, cap));
+        this.resize();
+      }
+    };
+    window.addEventListener("luna-perf-config", onPerf);
+    this._disposePerfListener = () => window.removeEventListener("luna-perf-config", onPerf);
     this.renderer.setClearColor(0x000000, 1);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -466,6 +711,10 @@ export class VrmRuntime {
     if (this.disposed) return;
     this.raf = requestAnimationFrame(this.loop);
 
+    if (typeof document !== "undefined" && document.hidden) {
+      return;
+    }
+
     const now = performance.now();
     const dt = (now - this.lastFrame) / 1000;
     this.lastFrame = now;
@@ -480,8 +729,10 @@ export class VrmRuntime {
     }
 
     const delta = this.clock.getDelta();
+    // Always advance mixers (paused actions keep their pose). Skipping updates caused T-pose during TTS.
     if (this.mixer) this.mixer.update(delta);
     if (this.cohostMixer) this.cohostMixer.update(delta);
+    if (this.himariMixer) this.himariMixer.update(delta);
     if (this.activeVrm()) {
       const lipTarget = this._lipJawTarget;
       this._lipJawSmoothed += (lipTarget - this._lipJawSmoothed) * Math.min(1, delta * 18);
@@ -490,9 +741,13 @@ export class VrmRuntime {
     this._faceVisibleAvatarsTowardCamera();
     if (this.vrm) this.vrm.update(delta);
     if (this.cohostVrm) this.cohostVrm.update(delta);
+    if (this.himariVrm) this.himariVrm.update(delta);
     if (this.activeVrm()) {
-      // After VRM/humanoid update so idle animation does not stomp co-host jaw/visemes.
+      // After VRM/humanoid update so VRMA does not stomp TTS jaw/visemes.
       this._applyJawBeforeHumanoidUpdate();
+      if (this._forceSpeaking || performance.now() < this._visemeUntil) {
+        this._reapplyActiveLipMorphs();
+      }
     }
     this.renderer.render(this.scene, this.camera);
   }
@@ -504,13 +759,19 @@ export class VrmRuntime {
     this.mixer.addEventListener("finished", this._onActionFinished);
   }
 
-  private _onActionFinished = () => {
-    if (!this.idleModeEnabled || this.idleClips.length === 0) return;
+  private _onActionFinished = (event: THREE.Event & { action?: THREE.AnimationAction }) => {
+    if (event.action !== this.action) return;
+    if (this.lunaThinkingActive || !this.idleModeEnabled || this.idleClips.length === 0) {
+      return;
+    }
     this._playIdleAt(this.idleClipIndex % this.idleClips.length);
   };
 
-  private _onCohostIdleFinished = () => {
-    if (!this.cohostIdleModeEnabled || this.cohostIdleClips.length === 0) return;
+  private _onCohostIdleFinished = (event: THREE.Event & { action?: THREE.AnimationAction }) => {
+    if (event.action !== this.cohostIdleAction) return;
+    if (this.cohostThinkingActive || !this.cohostIdleModeEnabled || this.cohostIdleClips.length === 0) {
+      return;
+    }
     this._playCohostIdleAt(
       this.cohostIdleClipIndex % this.cohostIdleClips.length,
     );
@@ -524,30 +785,21 @@ export class VrmRuntime {
   }
 
   private _playCohostIdleAt(index: number) {
-    if (!this.cohostMixer || this.cohostIdleClips.length === 0) return;
+    if (this.cohostThinkingActive || !this.cohostMixer || this.cohostIdleClips.length === 0) {
+      return;
+    }
     const normalized =
       ((index % this.cohostIdleClips.length) + this.cohostIdleClips.length) %
       this.cohostIdleClips.length;
     this.cohostIdleClipIndex = (normalized + 1) % this.cohostIdleClips.length;
     const clip = this.cohostIdleClips[normalized];
-    // Hard cut between clips (like Luna). crossFadeFrom/fadeIn blended toward VRMA bind
-    // pose at t=0 and caused a T-pose flash before each idle.
-    if (this.cohostIdleAction) {
-      this.cohostIdleAction.stop();
-      this.cohostIdleAction = null;
-    }
-    const action = this.cohostMixer.clipAction(clip);
-    action.reset();
-    action.setLoop(THREE.LoopOnce, 1);
-    action.clampWhenFinished = true;
-    if (this.cohostIdleSkipSec > 0 && clip.duration > 0) {
-      action.time = Math.min(
-        this.cohostIdleSkipSec,
-        Math.max(0, clip.duration - 0.05),
-      );
-    }
-    action.play();
-    this.cohostIdleAction = action;
+    this.cohostIdleAction = this._beginIdleClipAction(
+      this.cohostMixer,
+      clip,
+      this.cohostIdleAction,
+      this.cohostIdleSkipSec,
+      "cohost",
+    );
   }
 
   setCohostIdleSkipSec(seconds: number) {
@@ -571,14 +823,76 @@ export class VrmRuntime {
     }
     if (this.cohostIdleClips.length > 0) {
       this.cohostIdleModeEnabled = true;
-      this._playCohostIdleAt(0);
+      this.cohostIdleClipIndex = this._initialIdleClipIndex(
+        this.cohostIdleClips.length,
+        "cohost",
+      );
+      this._playCohostIdleAt(this.cohostIdleClipIndex);
       this.cb.onSceneStatus(
         `Co-host idle loop (${this.cohostIdleClips.length} clip${this.cohostIdleClips.length === 1 ? "" : "s"})`,
       );
     }
   }
 
+  private _stopCohostThinkingMotion() {
+    if (this.cohostThinkingAction) {
+      this.cohostThinkingAction.stop();
+      this.cohostThinkingAction = null;
+    }
+    this.cohostThinkingActive = false;
+  }
+
+  async setCohostThinkingMotionUrl(url: string): Promise<void> {
+    this.cohostThinkingUrl = url.trim();
+    this.cohostThinkingClip = null;
+    if (!this.cohostThinkingUrl || !this.cohostVrm) return;
+    try {
+      this.cohostThinkingClip = await this._loadVrmaClipForVrm(
+        this.cohostVrm,
+        this.cohostThinkingUrl,
+      );
+    } catch {
+      this.cohostThinkingClip = null;
+    }
+  }
+
+  async setCohostThinking(active: boolean): Promise<void> {
+    if (!this.cohostVrm) return;
+    if (!active) {
+      this._stopCohostThinkingMotion();
+      if (
+        this.cohostIdleClips.length > 0 &&
+        (this.dualLayoutEnabled || this._chatReplyTakeover)
+      ) {
+        this.cohostIdleModeEnabled = true;
+        this._ensureMixerForCohost();
+        this._playCohostIdleAt(this.cohostIdleClipIndex);
+      }
+      return;
+    }
+    if (!this.cohostThinkingClip && this.cohostThinkingUrl) {
+      await this.setCohostThinkingMotionUrl(this.cohostThinkingUrl);
+    }
+    if (!this.cohostThinkingClip) return;
+    this._ensureMixerForCohost();
+    this.cohostThinkingActive = true;
+    if (this.cohostIdleAction) {
+      this.cohostIdleAction.stop();
+      this.cohostIdleAction = null;
+    }
+    if (this.cohostThinkingAction) {
+      this.cohostThinkingAction.stop();
+    }
+    this.cohostThinkingAction = this._beginThinkingClipAction(
+      this.cohostMixer!,
+      this.cohostThinkingClip,
+      this.cohostThinkingAction,
+      "cohost",
+    );
+  }
+
   private _stopCohostIdleMotion() {
+    this._stopCohostThinkingMotion();
     if (this.cohostIdleAction) {
       this.cohostIdleAction.stop();
       this.cohostIdleAction = null;
@@ -593,23 +907,165 @@ export class VrmRuntime {
     this.cohostIdleModeEnabled = false;
   }
 
+  private _onHimariIdleFinished = (event: THREE.Event & { action?: THREE.AnimationAction }) => {
+    if (event.action !== this.himariIdleAction) return;
+    if (this.himariThinkingActive || !this.himariIdleModeEnabled) return;
+    if (this.himariIdleClips.length === 0) return;
+    this._playHimariIdleAt(
+      this.himariIdleClipIndex % this.himariIdleClips.length,
+    );
+  };
+
+  private _ensureMixerForHimari() {
+    if (!this.himariVrm) return;
+    if (this.himariMixer) return;
+    this.himariMixer = new THREE.AnimationMixer(this.himariVrm.scene);
+    this.himariMixer.addEventListener("finished", this._onHimariIdleFinished);
+  }
+
+  private _playHimariIdleAt(index: number) {
+    if (this.himariThinkingActive || !this.himariMixer || this.himariIdleClips.length === 0) {
+      return;
+    }
+    const normalized =
+      ((index % this.himariIdleClips.length) + this.himariIdleClips.length) %
+      this.himariIdleClips.length;
+    this.himariIdleClipIndex = (normalized + 1) % this.himariIdleClips.length;
+    const clip = this.himariIdleClips[normalized];
+    this.himariIdleAction = this._beginIdleClipAction(
+      this.himariMixer,
+      clip,
+      this.himariIdleAction,
+      this.himariIdleSkipSec,
+      "himari",
+    );
+  }
+
+  private _stopHimariThinkingMotion() {
+    if (this.himariThinkingAction) {
+      this.himariThinkingAction.stop();
+      this.himariThinkingAction = null;
+    }
+    this.himariThinkingActive = false;
+  }
+
+  setHimariIdleSkipSec(seconds: number) {
+    this.himariIdleSkipSec = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  }
+
+  async setHimariIdleMotionUrls(urls: string[]): Promise<void> {
+    this.himariIdleSourceUrls = [...urls];
+    this.himariIdleClips = [];
+    this.himariIdleClipIndex = 0;
+    this.himariIdleModeEnabled = false;
+    if (!this.himariVrm) return;
+    this._ensureMixerForHimari();
+    for (const url of urls) {
+      try {
+        const clip = await this._loadVrmaClipForVrm(this.himariVrm, url);
+        this.himariIdleClips.push(clip);
+      } catch {
+        /* skip bad files */
+      }
+    }
+    if (this.himariIdleClips.length > 0 && !this.himariThinkingActive) {
+      this.himariIdleModeEnabled = true;
+      this.himariIdleClipIndex = this._initialIdleClipIndex(
+        this.himariIdleClips.length,
+        "himari",
+      );
+      this._playHimariIdleAt(this.himariIdleClipIndex);
+      this.cb.onSceneStatus(
+        `Himari idle loop (${this.himariIdleClips.length} clip${this.himariIdleClips.length === 1 ? "" : "s"})`,
+      );
+    }
+  }
+
+  async setHimariThinkingMotionUrl(url: string): Promise<void> {
+    this.himariThinkingUrl = url.trim();
+    this.himariThinkingClip = null;
+    if (!this.himariThinkingUrl || !this.himariVrm) return;
+    try {
+      this.himariThinkingClip = await this._loadVrmaClipForVrm(
+        this.himariVrm,
+        this.himariThinkingUrl,
+      );
+    } catch {
+      this.himariThinkingClip = null;
+    }
+  }
+
+  private _clearHimariAnimations() {
+    this._stopHimariThinkingMotion();
+    if (this.himariIdleAction) {
+      this.himariIdleAction.stop();
+      this.himariIdleAction = null;
+    }
+    if (this.himariMixer) {
+      this.himariMixer.removeEventListener("finished", this._onHimariIdleFinished);
+      this.himariMixer.stopAllAction();
+      this.himariMixer = null;
+    }
+    this.himariIdleModeEnabled = false;
+  }
+
+  async setHimariThinking(active: boolean): Promise<void> {
+    if (!this.himariVrm || !this.himariInScene) return;
+    if (!active) {
+      this._stopHimariThinkingMotion();
+      if (this.himariIdleClips.length > 0) {
+        this.himariIdleModeEnabled = true;
+        this._ensureMixerForHimari();
+        this._playHimariIdleAt(this.himariIdleClipIndex);
+      }
+      return;
+    }
+    if (!this.himariThinkingClip && this.himariThinkingUrl) {
+      await this.setHimariThinkingMotionUrl(this.himariThinkingUrl);
+    }
+    if (!this.himariThinkingClip) return;
+    this._ensureMixerForHimari();
+    this.himariThinkingActive = true;
+    if (this.himariIdleAction) {
+      this.himariIdleAction.stop();
+      this.himariIdleAction = null;
+    }
+    if (this.himariThinkingAction) {
+      this.himariThinkingAction.stop();
+    }
+    this.himariThinkingAction = this._beginThinkingClipAction(
+      this.himariMixer!,
+      this.himariThinkingClip,
+      this.himariThinkingAction,
+      "himari",
+    );
+  }
+
+  setLunaIdleSkipSec(seconds: number) {
+    this.lunaIdleSkipSec = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  }
+
   private _playIdleAt(index: number) {
-    if (!this.mixer || this.idleClips.length === 0) return;
+    if (
+      this.lunaThinkingActive ||
+      !this.mixer ||
+      this.idleClips.length === 0 ||
+      !this.idleModeEnabled
+    ) {
+      return;
+    }
     const normalized =
       ((index % this.idleClips.length) + this.idleClips.length) %
       this.idleClips.length;
     this.idleClipIndex = (normalized + 1) % this.idleClips.length;
-    if (this.action) {
-      this.action.stop();
-      this.action = null;
-    }
     const clip = this.idleClips[normalized];
-    const action = this.mixer.clipAction(clip);
-    action.reset();
-    action.setLoop(THREE.LoopOnce, 1);
-    action.clampWhenFinished = false;
-    action.play();
-    this.action = action;
+    this.action = this._beginIdleClipAction(
+      this.mixer,
+      clip,
+      this.action,
+      this.lunaIdleSkipSec,
+      "luna",
+    );
   }
 
   async loadVrmFile(file: File): Promise<void> {
@@ -635,10 +1091,11 @@ export class VrmRuntime {
       });
 
       this.vrm = vrm;
+      this.lunaPivot = this._createAvatarPivot(vrm);
+      this._addVrmToScene(vrm, this.lunaPivot);
       this._orientAvatarTowardCamera(vrm);
       this._captureJawRestPose();
       this._ensureMixerForCurrentVrm();
-      this.scene.add(vrm.scene);
       this.cb.onSceneStatus(`Avatar loaded: ${file.name}`);
       if (this.idleSourceUrls.length > 0) {
         await this.setIdleMotionUrls(this.idleSourceUrls);
@@ -669,11 +1126,15 @@ export class VrmRuntime {
     });
 
     this.vrm = vrm;
+    this.lunaPivot = this._createAvatarPivot(vrm);
+    this._addVrmToScene(vrm, this.lunaPivot);
     this._orientAvatarTowardCamera(vrm);
     this._captureJawRestPose();
     this._ensureMixerForCurrentVrm();
-    this.scene.add(vrm.scene);
     this.cb.onSceneStatus(`Avatar loaded: ${label}`);
+    if (this.lunaThinkingUrl) {
+      await this.setLunaThinkingMotionUrl(this.lunaThinkingUrl);
+    }
     if (this.idleSourceUrls.length > 0) {
       await this.setIdleMotionUrls(this.idleSourceUrls);
     }
@@ -719,11 +1180,77 @@ export class VrmRuntime {
         // ignore invalid files and continue with remaining clips
       }
     }
-    if (this.idleClips.length > 0) {
+    if (this.idleClips.length > 0 && !this.lunaThinkingActive) {
       this.idleModeEnabled = true;
-      this._playIdleAt(0);
+      this.idleClipIndex = this._initialIdleClipIndex(this.idleClips.length, "luna");
+      this._playIdleAt(this.idleClipIndex);
       this.cb.onSceneStatus(`Idle motion loop active (${this.idleClips.length} clip${this.idleClips.length === 1 ? "" : "s"})`);
     }
+  }
+
+  async setLunaThinkingMotionUrl(url: string): Promise<void> {
+    this.lunaThinkingUrl = url.trim();
+    this.lunaThinkingClip = null;
+    if (!this.lunaThinkingUrl || !this.vrm) return;
+    try {
+      this.lunaThinkingClip = await this._loadVrmaClipForVrm(
+        this.vrm,
+        this.lunaThinkingUrl,
+      );
+    } catch {
+      this.lunaThinkingClip = null;
+    }
+  }
+
+  async setLunaThinking(active: boolean): Promise<void> {
+    if (!this.vrm) return;
+    if (!active) {
+      if (this.lunaThinkingAction) {
+        this.lunaThinkingAction.stop();
+        this.lunaThinkingAction = null;
+      }
+      this.lunaThinkingActive = false;
+      if (this.idleClips.length > 0) {
+        this.idleModeEnabled = true;
+        this._ensureMixerForCurrentVrm();
+        this._playIdleAt(this.idleClipIndex);
+      }
+      return;
+    }
+    if (!this.lunaThinkingClip && this.lunaThinkingUrl) {
+      await this.setLunaThinkingMotionUrl(this.lunaThinkingUrl);
+    }
+    if (!this.lunaThinkingClip) return;
+    this._ensureMixerForCurrentVrm();
+    this.lunaThinkingActive = true;
+    if (this.action) {
+      this.action.stop();
+      this.action = null;
+    }
+    if (this.lunaThinkingAction) {
+      this.lunaThinkingAction.stop();
+    }
+    this.lunaThinkingAction = this._beginThinkingClipAction(
+      this.mixer!,
+      this.lunaThinkingClip,
+      this.lunaThinkingAction,
+      "luna",
+    );
+  }
+
+  async setAvatarThinking(
+    avatar: "luna" | "cohost" | "himari",
+    active: boolean,
+  ): Promise<void> {
+    if (avatar === "luna") {
+      await this.setLunaThinking(active);
+      return;
+    }
+    if (avatar === "cohost") {
+      await this.setCohostThinking(active);
+      return;
+    }
+    await this.setHimariThinking(active);
   }
 
   private async _loadVrmaClipForVrm(
@@ -747,6 +1274,11 @@ export class VrmRuntime {
   }
 
   private clearVrm() {
+    if (this.lunaThinkingAction) {
+      this.lunaThinkingAction.stop();
+      this.lunaThinkingAction = null;
+    }
+    this.lunaThinkingActive = false;
     if (this.action) {
       this.action.stop();
       this.action = null;
@@ -760,9 +1292,14 @@ export class VrmRuntime {
     this.idleClipIndex = 0;
     this.idleModeEnabled = false;
     if (!this.vrm) return;
-    this.scene.remove(this.vrm.scene);
+    if (this.lunaPivot) {
+      this.lunaPivot.remove(this.vrm.scene);
+      this.scene.remove(this.lunaPivot);
+      this.lunaPivot = null;
+    }
     disposeObject(this.vrm.scene);
     this.vrm = null;
+    this.manualAvatarFacing.delete("luna");
     this.activeAvatar = "luna";
     this._jawRestQuat = null;
     this._lipJawTarget = 0;
@@ -772,9 +1309,14 @@ export class VrmRuntime {
   private clearCohostVrm() {
     if (!this.cohostVrm) return;
     this._stopCohostIdleMotion();
-    this.scene.remove(this.cohostVrm.scene);
+    if (this.cohostPivot) {
+      this.cohostPivot.remove(this.cohostVrm.scene);
+      this.scene.remove(this.cohostPivot);
+      this.cohostPivot = null;
+    }
     disposeObject(this.cohostVrm.scene);
     this.cohostVrm = null;
+    this.manualAvatarFacing.delete("cohost");
     if (this.activeAvatar === "cohost") {
       this.activeAvatar = "luna";
     }
@@ -801,6 +1343,84 @@ export class VrmRuntime {
     await this.enableDualCohostLayout();
   }
 
+  isHimariInScene(): boolean {
+    return this.himariInScene && this.himariVrm !== null;
+  }
+
+  async summonHimari(url: string, label = "himari.vrm"): Promise<void> {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      throw new Error("Himari VRM URL is missing (check LUNA_HIMARI_VRM in .env).");
+    }
+    if (!this.himariVrm) {
+      await this.loadHimariVrmFromUrl(trimmed, label);
+    }
+    this.himariInScene = true;
+    this.himariVrm!.scene.visible = true;
+    if (this.vrm) {
+      if (
+        this._haveSavedHimariRelativePlacement &&
+        this.himariVrm
+      ) {
+        this.himariPivot!.position
+          .copy(this.lunaPivot!.position)
+          .add(this._savedHimariOffsetFromLuna);
+        this._haveSavedHimariRelativePlacement = false;
+      } else {
+        this._applyCastLayoutPositions();
+      }
+    }
+    this.cb.onSceneStatus(
+      `${label} on stage · left-drag on body: rotate · right-drag on body: move`,
+    );
+  }
+
+  dismissHimari(): void {
+    if (!this.himariVrm) return;
+    this._clearHimariAnimations();
+    if (this.lunaPivot && this.himariPivot) {
+      this._savedHimariOffsetFromLuna
+        .copy(this.himariPivot.position)
+        .sub(this.lunaPivot.position);
+      this._haveSavedHimariRelativePlacement = true;
+    } else {
+      this._haveSavedHimariRelativePlacement = false;
+    }
+    this.himariInScene = false;
+    this.himariVrm.scene.visible = false;
+    if (this.activeAvatar === "himari") {
+      this.activeAvatar = "luna";
+      this._resetMouth(this.vrm);
+      this._resetMouth(this.himariVrm);
+      this._captureJawRestPose();
+    }
+    this.cb.onSceneStatus("Himari dismissed");
+  }
+
+  async loadHimariVrmFromUrl(url: string, label = "himari.vrm"): Promise<void> {
+    if (this.himariVrm) return;
+    const gltf = await this.loader.loadAsync(url);
+    const vrm = gltf.userData.vrm as VRM | undefined;
+    if (!vrm) {
+      throw new Error("Himari file is not a valid VRM.");
+    }
+    VRMUtils.removeUnnecessaryVertices(gltf.scene);
+    VRMUtils.combineSkeletons(gltf.scene);
+    VRMUtils.combineMorphs(vrm);
+    this._prepareVrmScene(vrm);
+    this.himariVrm = vrm;
+    this.himariPivot = this._createAvatarPivot(vrm);
+    this._addVrmToScene(vrm, this.himariPivot);
+    vrm.scene.visible = false;
+    this.cb.onSceneStatus(`Himari model ready: ${label}`);
+    if (this.himariThinkingUrl) {
+      await this.setHimariThinkingMotionUrl(this.himariThinkingUrl);
+    }
+    if (this.himariIdleSourceUrls.length > 0) {
+      await this.setHimariIdleMotionUrls(this.himariIdleSourceUrls);
+    }
+  }
+
   dismissCohost(): void {
     setCohostSoloMode(true);
     stopViewerTts();
@@ -808,15 +1428,15 @@ export class VrmRuntime {
       new CustomEvent("luna-avatar-speaking", { detail: false }),
     );
     if (!this.cohostVrm) return;
-    if (this.vrm && this.cohostVrm) {
+    if (this.lunaPivot && this.cohostPivot) {
       this._savedCohostOffsetFromLuna
-        .copy(this.cohostVrm.scene.position)
-        .sub(this.vrm.scene.position);
+        .copy(this.cohostPivot.position)
+        .sub(this.lunaPivot.position);
       this._haveSavedCohostRelativePlacement = true;
     } else {
       this._haveSavedCohostRelativePlacement = false;
     }
-    this.verticalOrbitDragActive = false;
+    this.avatarRotateDrag = null;
     this.avatarDragMove = null;
     this.interactionPointerId = null;
     this.controls.enabled = true;
@@ -858,9 +1478,13 @@ export class VrmRuntime {
     VRMUtils.combineMorphs(vrm);
     this._prepareVrmScene(vrm);
     this.cohostVrm = vrm;
-    this.scene.add(vrm.scene);
+    this.cohostPivot = this._createAvatarPivot(vrm);
+    this._addVrmToScene(vrm, this.cohostPivot);
     vrm.scene.visible = false;
     this.cb.onSceneStatus(`Co-host model ready: ${label}`);
+    if (this.cohostThinkingUrl) {
+      await this.setCohostThinkingMotionUrl(this.cohostThinkingUrl);
+    }
     if (this.cohostIdleSourceUrls.length > 0) {
       await this.setCohostIdleMotionUrls(this.cohostIdleSourceUrls);
     }
@@ -888,28 +1512,73 @@ export class VrmRuntime {
       /* Bot may resend dual_layout while both are already up — keep user-placed roots. */
     } else if (this._haveSavedCohostRelativePlacement && this.vrm && this.cohostVrm) {
       /* Re-summon after dismiss: keep Luna where she is; restore Viktor relative to her. */
-      this.cohostVrm.scene.position
-        .copy(this.vrm.scene.position)
+      this.cohostPivot!.position
+        .copy(this.lunaPivot!.position)
         .add(this._savedCohostOffsetFromLuna);
       this._haveSavedCohostRelativePlacement = false;
     } else {
-      this._applyDualLayoutPositions();
+      this._applyCastLayoutPositions();
     }
 
     this.activeAvatar = "luna";
     this._captureJawRestPose();
     this.cb.onSceneStatus(
-      "Luna + co-host · left-drag: camera up/down · right-drag on body: move · right-drag empty: pan · scroll: zoom · models track the camera",
+      "Cast on stage · left-drag on a body: rotate · right-drag on a body: move · right-drag empty: pan · scroll: zoom",
     );
   }
 
-  setActiveSpeaker(speaker: "luna" | "cohost") {
+  setActiveSpeaker(speaker: "luna" | "cohost" | "himari" | "viktor") {
+    const target = speaker === "viktor" ? "cohost" : speaker;
     this._resetMouth(this.vrm);
     this._resetMouth(this.cohostVrm);
+    this._resetMouth(this.himariVrm);
     this._lipJawTarget = 0;
     this._lipJawSmoothed = 0;
-    this.activeAvatar = speaker;
+    this.activeAvatar = target;
     this._captureJawRestPose();
+  }
+
+  /** Twitch/YouTube @Himari reply — lip-sync even when dismissed from scene. */
+  async prepareHimariChatReply(vrmUrl?: string): Promise<void> {
+    const url = (vrmUrl || "").trim();
+    if (!this.himariVrm && url) {
+      await this.loadHimariVrmFromUrl(url, "himari.vrm");
+    }
+    if (!this.himariVrm) return;
+
+    if (this.himariInScene) {
+      this.setActiveSpeaker("himari");
+      this.cb.onSceneStatus("Himari (Twitch/YouTube chat reply)");
+      return;
+    }
+
+    this._himariChatReplyTakeover = true;
+    this.himariVrm.scene.visible = true;
+    if (this.vrm) {
+      this._applyCastLayoutPositions();
+    }
+    this._orientAvatarTowardCamera(this.himariVrm);
+    this.setActiveSpeaker("himari");
+    this.cb.onSceneStatus("Himari (Twitch/YouTube chat reply)");
+  }
+
+  finishHimariChatReply(): void {
+    if (this._himariChatReplyTakeover) {
+      this._himariChatReplyTakeover = false;
+      if (this.himariVrm) {
+        this._resetMouth(this.himariVrm);
+        this.himariVrm.scene.visible = false;
+      }
+      if (this.activeAvatar === "himari") {
+        this.activeAvatar = "luna";
+        this._captureJawRestPose();
+      }
+      this.cb.onSceneStatus("Himari dismissed");
+      return;
+    }
+    if (this.himariInScene && this.activeAvatar === "himari") {
+      this.setActiveSpeaker("luna");
+    }
   }
 
   /** Twitch/YouTube @Viktor reply — load his VRM and lip-sync even when dismissed from scene. */
@@ -925,7 +1594,7 @@ export class VrmRuntime {
       if (this.vrm) this.vrm.scene.visible = false;
       this.cohostVrm.scene.visible = true;
       if (this.vrm) {
-        this.cohostVrm.scene.position.copy(this.vrm.scene.position);
+        this.cohostPivot!.position.copy(this.lunaPivot!.position);
       }
       this._orientAvatarTowardCamera(this.cohostVrm);
       this.activeAvatar = "cohost";
@@ -1083,16 +1752,9 @@ export class VrmRuntime {
 
   setSpeaking(active: boolean) {
     if (active) {
-      // Pause Viktor idle while he speaks so idle keyframes don't override lip/shape + jaw.
-      if (this.activeAvatar === "cohost" && this.cohostIdleAction) {
-        this.cohostIdleAction.paused = true;
-      }
-      // Keep viseme+jaw loop alive for the full TTS playback window.
+      // Keep VRMA idles/thinking running; visemes/jaw are re-applied after vrm.update().
       this.triggerTalk("speaking", true);
       return;
-    }
-    if (this.cohostIdleAction) {
-      this.cohostIdleAction.paused = false;
     }
     this._forceSpeaking = false;
     this._visemeUntil = 0;
@@ -1134,6 +1796,8 @@ export class VrmRuntime {
 
   dispose() {
     this.disposed = true;
+    this._disposePerfListener?.();
+    this._disposePerfListener = null;
     cancelAnimationFrame(this.raf);
     if (this.emotionTimer) window.clearTimeout(this.emotionTimer);
     if (this.talkTimer) window.clearTimeout(this.talkTimer);
@@ -1144,6 +1808,18 @@ export class VrmRuntime {
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("pointercancel", this.onPointerUp);
     this.clearCohostVrm();
+    if (this.himariVrm) {
+      this._clearHimariAnimations();
+      if (this.himariPivot) {
+        this.himariPivot.remove(this.himariVrm.scene);
+        this.scene.remove(this.himariPivot);
+        this.himariPivot = null;
+      }
+      disposeObject(this.himariVrm.scene);
+      this.himariVrm = null;
+      this.manualAvatarFacing.delete("himari");
+    }
+    this.himariInScene = false;
     this.clearVrm();
     this.controls.dispose();
     this.renderer.dispose();

@@ -19,7 +19,9 @@ Environment (or use CLI flags where noted):
   TWITCH_SEND_REPLIES  If "1", post model replies to chat (needs chat:write on token)
   TWITCH_AUTO_REPLY    If "1", generate replies from regular chat messages
   TWITCH_AUTO_TRIGGER  "all" (default: Luna replies even without @; Viktor only when named) or "mention"
-  TWITCH_AUTO_COOLDOWN Seconds between auto replies after TTS finishes (default 6)
+  TWITCH_AUTO_COOLDOWN / LUNA_PUBLIC_CHAT_COOLDOWN_SEC  Seconds between public-chat replies (default 4).
+  LUNA_YOUTUBE_LIVE_COOLDOWN_SEC  YouTube Live override (defaults to public chat cooldown).
+  LUNA_TIKTOK_LIVE_COOLDOWN_SEC   TikTok Live override (defaults to public chat cooldown).
   TWITCH_SYSTEM  Optional extra system prompt (in addition to --system). Can stay short if you use ``ollama create`` with a Modelfile (see ollama/Modelfile.luna) to bake persona into OLLAMA_MODEL.
   LUNA_PERSONA    Character depth (see luna_persona.py; merged with TWITCH_SYSTEM + LUNA_VOICE_RULES).
   LUNA_VOICE_RULES  Anti–stream-bot rules (default bans pack/tail-wag/stream filler unless user mentions them).
@@ -35,8 +37,9 @@ Environment (or use CLI flags where noted):
   LUNA_EDGE_PITCH    Edge pitch adjustment like +0Hz / -2Hz
   LUNA_TTS_SPEAKER   Initial voice id
   LUNA_TTS_VOICES    CSV voice list (voice or voice:Label) for viewer menu
-  LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC  Seconds after TTS playback ends before viewer mic
-    clips are accepted (echo / ring-out guard; default 3). Set 0 to disable the tail guard.
+  LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC  Seconds after TTS ends before mic STT (default 1.5; 0=off).
+  LUNA_TTS_VIEWER_WAIT_MAX_SEC       Max seconds live chat blocks on viewer TTS (default 18).
+  LUNA_CREATOR_TTS_BLOCK_UNTIL_DONE    If 1, panel/voice waits for TTS (default 0).
   LUNA_STT_LOCAL_MODEL  faster-whisper size (default tiny); LUNA_STT_LOCAL_DEVICE cpu|cuda (unset = auto GPU if available)
   LUNA_SPEAKER_ONLY  If 1, viewer mic clips must match the enrolled voice (see chat panel "Enroll my voice")
   LUNA_SPEAKER_MIN_SIM  Cosine similarity threshold for the speaker check (default 0.75)
@@ -44,7 +47,7 @@ Environment (or use CLI flags where noted):
   LUNA_VOICE_GATE_MALE_ONLY  Coarse fallback: drop clips with median pitch above LUNA_VOICE_GATE_MAX_F0_HZ (only used if speaker gate is off)
   LUNA_VOICE_GATE_MAX_F0_HZ  Default 172 — median voiced F0 must be ≤ this (Hz) to count as “male” for the fallback gate
   LUNA_SCREEN_CONTEXT  If 0/false/off, ignore viewer_screen_frame (default on)
-  LUNA_SCREEN_CONTEXT_INTERVAL_SEC  Min seconds between Ollama vision summaries (default 15; viewer may send frames at 1 FPS)
+  LUNA_SCREEN_CONTEXT_INTERVAL_SEC  Min seconds between Ollama vision summaries (default 1; pair with viewer 1000ms upload)
   LUNA_SCREEN_CAPTURE_INTERVAL_MS   Viewer JPEG upload interval (Vite: VITE_SCREEN_CONTEXT_INTERVAL_MS, default 1000 = 1 FPS)
   LUNA_SCREEN_CAPTURE_MAX_WIDTH     Viewer max frame width (Vite: VITE_SCREEN_CAPTURE_MAX_WIDTH, default 1280)
   LUNA_SCREEN_CAPTURE_JPEG_QUALITY  Viewer JPEG quality 0–1 (Vite: VITE_SCREEN_CAPTURE_JPEG_QUALITY, default 0.72)
@@ -60,11 +63,8 @@ Environment (or use CLI flags where noted):
   LUNA_OLLAMA_KEEP_ALIVE  e.g. -1 to keep models loaded between calls (optional)
   LUNA_OLLAMA_TEMPERATURE  Sampling temperature (optional)
   LUNA_SCREEN_YIELD_TO_CHAT  If 0, may run vision while a reply generates (default 1 = skip frames while chat uses Ollama)
-  LUNA_LOL_CONTEXT           If 1, poll local Riot/League Client (LCU + live game port) for match stats (solo play).
-  LUNA_LOL_LEAGUE_LNK        Windows shortcut to launch League (optional; used with LUNA_LOL_LAUNCH_ON_START).
-  LUNA_LOL_RIOT_CLIENT_LNK   Windows shortcut to launch Riot Client (optional).
-  LUNA_LOL_POLL_SEC          How often to refresh LoL stats (default 8).
-  LUNA_LOL_LAUNCH_ON_START   If 1, open the .lnk paths once when Luna starts (Windows).
+  LUNA_SCREEN_KEEP_ALIVE         Vision-only keep_alive (default 2m; chat uses LUNA_OLLAMA_KEEP_ALIVE).
+  LUNA_SCREEN_CAPTURE_INTERVAL_MS  Viewer JPEG upload interval (default 1000).
   LUNA_STREAM_ASSISTANT_WS  If 1 (default), stream tokens to the viewer over WS as they arrive (faster perceived replies)
   LUNA_OLLAMA_PRINT_STREAM  If 1, also print streamed tokens to the console (default 0; reduces overhead on Windows)
   LUNA_YOUTUBE_CHANNEL_ID   UC… id for legacy single-feed poller (ignored if LUNA_YOUTUBE_OBSERVE_CHANNELS is set).
@@ -82,6 +82,7 @@ Environment (or use CLI flags where noted):
   LUNA_YOUTUBE_LIVE_SESSION_LINES  Rolling log size for YouTube context (default 48).
   LUNA_YOUTUBE_LIVE_CHECK_URL      Single @handle/live or watch URL for manual “check YouTube live” (default @Solonaras1/live).
   LUNA_YOUTUBE_LIVE_WATCH_POLL     If 1 (default when live chat on), probe CHECK_URL on an interval and auto-connect pytchat.
+  Viewer dock “Check YouTube live” also probes TikTok (LUNA_TIKTOK_LIVE_CHAT) and connects TikTok chat when live.
   LUNA_YOUTUBE_LIVE_WATCH_POLL_SEC Probe interval in seconds (default 900 = 15 minutes).
   LUNA_YOUTUBE_LIVE_RECONNECT      If 1 (default), restart pytchat when the session drops mid-stream.
   LUNA_TIKTOK_LIVE_CHAT            If 1, read TikTok Live chat into the viewer (requires TikTokLive).
@@ -124,13 +125,15 @@ Environment (or use CLI flags where noted):
   LUNA_COHOST_BANTER        If 1, idle Luna ↔ vampire co-host banter (vampire_cohost.py / luna_cohost_banter.py).
   LUNA_COHOST_NAME          Display name (default Viktor). LUNA_COHOST_VRM path (default aichris.vrm). LUNA_COHOST_EDGE_VOICE.
   LUNA_COHOST_CHAT_PERSONAS If 1 (with BANTER=1), auto-replies to Twitch / YouTube chat may be Luna or the co-host (see LUNA_COHOST_CHAT_SPEAKER).
-  LUNA_COHOST_CHAT_SPEAKER  random (default) | luna | cohost | alternate — who speaks for chat auto-replies when CHAT_PERSONAS=1.
+  LUNA_COHOST_CHAT_SPEAKER  random (default) | luna | viktor | himari | cohost | alternate — who speaks when CHAT_PERSONAS=1 and no @name.
   LUNA_COHOST_CHAT_TWITCH_PREFIX  If 1 (default), Twitch chat replies from the co-host are prefixed [Name] when posting as the bot.
   LUNA_COHOST_AFTER_CHAT_SEC  Quiet after Twitch/YouTube chat before banter resumes (default 10).
   LUNA_COHOST_IDLE_SEC      Optional longer quiet before banter if set (default unused for resume; legacy 90).
   LUNA_COHOST_MIN_GAP_SEC   Minimum gap between banter exchanges (default 10).
   LUNA_COHOST_DYNAMICS      If 1 (default with BANTER), evolving Luna↔Viktor relationship notes in prompts (data/cohost_dynamics.json).
   LUNA_COHOST_DYNAMICS_LLM_EVERY  Re-summarize relationship with Ollama every N exchanges (default 10; 0=heuristics only).
+  LUNA_CAST_CONSCIOUSNESS   If 1 (default with BANTER), rolling on-mic threads + inner monologue for Luna↔cast (data/cast_consciousness.json).
+  LUNA_CAST_CONSCIOUSNESS_LLM_EVERY  Refresh thread topic / head notes with Ollama every N observes per partner (default 6; 0=heuristics only).
   LUNA_SESSION_MODE         auto (default) | live | local — whether to frame replies as public broadcast vs local VRM / off-air rehearsal.
   LUNA_SESSION_NOTE         Optional freeform line injected into the dual-presence context (e.g. "Tonight: game X").
 """
@@ -154,6 +157,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from chat_ws import ChatHub, start_chat_ws_server, stop_chat_ws_server
+from luna_perf import (
+    screen_context_interval_sec,
+    screen_context_max_chars,
+    viewer_perf_control_message,
+)
 from luna_tts import (
     maybe_speak,
     prewarm_edge_tts,
@@ -212,11 +220,16 @@ from tiktok_live_chat import (
     tiktok_live_watch_poll_enabled,
 )
 from live_social_share import (
+    _load_state as live_social_load_state,
+    complete_live_social_share,
+    live_discord_channel_ids,
+    skip_live_social_share,
     live_social_share_enabled,
     live_watch_enabled,
     run_live_social_poller,
 )
 from luna_cohost_banter import run_cohost_banter_loop
+from luna_cast_consciousness import CastConsciousness, consciousness_enabled
 from luna_cohost_dynamics import CohostDynamics, dynamics_enabled
 from vampire_cohost import (
     cohost_chat_personas_enabled,
@@ -229,6 +242,7 @@ from social_playwright_share import (
     generate_and_post_youtube_video_comment,
     post_youtube_video_comment,
     run_interactive_social_login,
+    share_live_stream,
     share_new_youtube_upload,
     social_playwright_configured,
     youtube_comment_posting_enabled,
@@ -265,12 +279,6 @@ from luna_youtube_live_session import (
     YouTubeLiveSessionLog,
     tiktok_live_reply_style_block,
     youtube_live_reply_style_block,
-)
-from riot_lol_context import (
-    build_lol_context_snapshot,
-    lol_context_enabled,
-    maybe_launch_riot_clients,
-    run_lol_context_poller,
 )
 from ollama_client import (
     ThinkStripper,
@@ -313,6 +321,14 @@ def _env_truthy(key: str, *, default: bool) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+from luna_public_chat_cooldown import (
+    live_chat_max_speakers_per_message,
+    public_chat_cooldown_sec,
+    tiktok_live_cooldown_sec,
+    youtube_live_cooldown_sec,
+)
+
+
 def _speaker_state_control_message() -> dict:
     state = speaker_state()
     return {
@@ -324,6 +340,15 @@ def _speaker_state_control_message() -> dict:
         "last_sim": state.get("last_sim"),
         "samples": int(state.get("samples") or 0),
     }
+
+
+def viewer_avatar_id(partner_id: str | None = None, *, speaker: str = "luna") -> str:
+    """Map cast partner / banter speaker to viewer lip-sync target (``luna`` | ``cohost`` | ``himari``)."""
+    if speaker == "luna":
+        return "luna"
+    if (partner_id or "").strip().lower() == "himari":
+        return "himari"
+    return "cohost"
 
 
 def detect_avatar_emotion(text: str) -> str:
@@ -514,7 +539,11 @@ class LunaTwitchBot(commands.Bot):
         self._auto_reply = auto_reply
         self._auto_trigger = auto_trigger
         self._auto_cooldown_sec = max(0.0, auto_cooldown_sec)
+        self._youtube_cooldown_sec = youtube_live_cooldown_sec()
+        self._tiktok_cooldown_sec = tiktok_live_cooldown_sec()
         self._last_auto_reply_ts = 0.0
+        self._cohost_banter_blocked_until = 0.0
+        self._public_chat_dedupe: dict[tuple[str, str, str], float] = {}
         self._ollama_lock = asyncio.Lock()
         self._chat_hub = chat_hub
         # Rolling chat memory so replies stay context-aware.
@@ -546,8 +575,10 @@ class LunaTwitchBot(commands.Bot):
         self._chatter_session_counts: dict[str, int] = {}
         self._youtube_live_session = YouTubeLiveSessionLog()
         self._tiktok_live_session = TikTokLiveSessionLog()
+        from luna_banter_novelty import get_banter_novelty_ledger
+
+        self._banter_novelty = get_banter_novelty_ledger()
         self._screen_context_summary = ""
-        self._lol_context_summary = ""
         self._screen_context_lock = asyncio.Lock()
         self._last_screen_summarize_ts = 0.0
         self._latest_screen_frame_b64 = ""
@@ -557,7 +588,10 @@ class LunaTwitchBot(commands.Bot):
         self._avatar_speaking = False
         self._last_avatar_speaking_end_ts = 0.0
         self._viewer_voice_block_after_tts_sec = max(
-            0.0, float(os.environ.get("LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC", "3.0").strip() or "3.0")
+            0.0,
+            float(
+                os.environ.get("LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC", "1.5").strip() or "1.5"
+            ),
         )
         self._mic_ready_task: asyncio.Task[None] | None = None
         self._last_assistant_reply = ""
@@ -565,15 +599,19 @@ class LunaTwitchBot(commands.Bot):
         self._last_cohost_banter_ts = 0.0
         self._cohost_banter_active = False
         # Viewer checkbox: idle co-host uses open-ended full script vs short exchange (see luna_cohost_banter).
-        self._cohost_idle_full_script = False
+        self._cohost_idle_full_script = True
         self._viewer_tts_done = asyncio.Event()
         self._viewer_tts_done.set()
+        self._viewer_tts_avatar: str = "luna"
         # Luna/co-host alternation for TWITCH_AUTO_REPLY + LUNA_COHOST_CHAT_PERSONAS (see _cohost_for_chat_reply).
         self._chat_reply_alt_next_luna = True
         self._cohost_dynamics = CohostDynamics()
-        from luna_cohost_scene import load_cohost_in_scene
+        self._cast_consciousness = CastConsciousness()
+        from luna_cast import load_cast_scene
 
-        self._viewer_cohost_in_scene = load_cohost_in_scene(default=False)
+        self._cast_scene = load_cast_scene(default_viktor=False)
+        self._viewer_cohost_in_scene = self._cast_scene.any_in_scene()
+        self._active_banter_partner: str | None = None
         self._cohost_banter_task: asyncio.Task[None] | None = None
         self._public_chat_reply_depth = 0
         # One public-chat reply (incl. viewer TTS) at a time — next message waits.
@@ -625,6 +663,63 @@ class LunaTwitchBot(commands.Bot):
         elapsed = time.monotonic() - self._last_avatar_speaking_end_ts
         return max(0.0, self._viewer_voice_block_after_tts_sec - elapsed)
 
+    def _public_chat_cooldown_sec_for(self, source: str) -> float:
+        s = (source or "").strip().lower()
+        if s == "youtube live":
+            return self._youtube_cooldown_sec
+        if s == "tiktok live":
+            return self._tiktok_cooldown_sec
+        return self._auto_cooldown_sec
+
+    def _public_chat_on_cooldown(self, source: str) -> bool:
+        sec = self._public_chat_cooldown_sec_for(source)
+        if sec <= 0:
+            return False
+        return (time.time() - self._last_auto_reply_ts) < sec
+
+    async def _wait_public_chat_cooldown(self, source: str = "Twitch chat") -> None:
+        """Space out public-chat replies so back-to-back viewer lines do not stack."""
+        sec = self._public_chat_cooldown_sec_for(source)
+        if sec <= 0:
+            return
+        remaining = sec - (time.time() - self._last_auto_reply_ts)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    def _trim_public_chat_dedupe(self, max_age_sec: float) -> None:
+        now = time.time()
+        self._public_chat_dedupe = {
+            k: ts for k, ts in self._public_chat_dedupe.items() if (now - ts) < max_age_sec
+        }
+
+    def _try_claim_public_chat_line(self, source: str, author: str, text: str) -> bool:
+        """Drop duplicate live lines (same author + text within cooldown)."""
+        body = (text or "").strip().lower()
+        if not body:
+            return False
+        key = (source.strip().lower(), author.strip().lower(), body)
+        sec = self._public_chat_cooldown_sec_for(source)
+        now = time.time()
+        self._trim_public_chat_dedupe(max(sec * 4, 30.0))
+        last = self._public_chat_dedupe.get(key)
+        if last is not None and sec > 0 and (now - last) < sec:
+            return False
+        self._public_chat_dedupe[key] = now
+        return True
+
+    def _cap_public_chat_addressees(self, source: str, addressees: list[str]) -> list[str]:
+        cap = live_chat_max_speakers_per_message(source)
+        if cap <= 0 or len(addressees) <= cap:
+            return addressees
+        kept = addressees[:cap]
+        dropped = addressees[cap:]
+        print(
+            f"(chat) {source}: capped to {kept[0]!r} "
+            f"(also named: {', '.join(dropped)}) — set LUNA_LIVE_CHAT_MAX_SPEAKERS_PER_MESSAGE>1 to allow all",
+            flush=True,
+        )
+        return kept
+
     def _cancel_mic_ready_task(self) -> None:
         t = self._mic_ready_task
         self._mic_ready_task = None
@@ -664,10 +759,17 @@ class LunaTwitchBot(commands.Bot):
         self._last_avatar_speaking_end_ts = time.monotonic()
         self._viewer_tts_done.set()
         if self._chat_hub:
+            avatar = (self._viewer_tts_avatar or "luna").strip().lower()
             await self._chat_hub.broadcast(
-                {"type": "control", "name": "avatar_speaking", "value": False}
+                {
+                    "type": "control",
+                    "name": "avatar_speaking",
+                    "value": False,
+                    "avatar": avatar,
+                }
             )
-            self._schedule_mic_ready_after_tts(self._chat_hub)
+            if avatar == "luna":
+                self._schedule_mic_ready_after_tts(self._chat_hub)
 
     def touch_activity(self) -> None:
         """Mark hub/chat/voice activity so co-host banter waits for a quiet moment."""
@@ -708,8 +810,49 @@ class LunaTwitchBot(commands.Bot):
         self._public_chat_reply_depth = max(0, self._public_chat_reply_depth - 1)
         self.touch_activity()
 
+    def _sync_cast_scene_flags(self, scene=None) -> None:
+        from luna_cast import load_cast_scene
+
+        self._cast_scene = scene if scene is not None else load_cast_scene()
+        self._viewer_cohost_in_scene = self._cast_scene.any_in_scene()
+
+    async def _broadcast_avatar_thinking(self, partner: str, active: bool) -> None:
+        """Viewer VRMA (``thinking.vrma``) while the LLM composes a reply."""
+        pid = (partner or "").strip().lower()
+        if pid in ("viktor", "cohost"):
+            if not self._cast_scene.viktor_in_scene:
+                return
+            avatar = "cohost"
+        elif pid == "himari":
+            if not self._cast_scene.himari_in_scene:
+                return
+            avatar = "himari"
+        elif pid == "luna":
+            avatar = "luna"
+        else:
+            return
+        if self._chat_hub is None:
+            return
+        await self._chat_hub.broadcast(
+            {
+                "type": "control",
+                "name": "avatar_thinking",
+                "avatar": avatar,
+                "value": bool(active),
+            }
+        )
+
+    async def _broadcast_cast_thinking(self, active: bool) -> None:
+        """Only Luna shows thinking while shared LLM runs (avoids synced VRMA poses)."""
+        await self._broadcast_avatar_thinking("luna", active)
+
     def cohost_idle_ready(self) -> bool:
-        from vampire_cohost import cohost_after_chat_sec, cohost_enabled, cohost_min_gap_sec
+        from vampire_cohost import (
+            cohost_after_chat_sec,
+            cohost_banter_fail_backoff_sec,
+            cohost_enabled,
+            cohost_min_gap_sec,
+        )
 
         if not cohost_enabled():
             return False
@@ -717,21 +860,47 @@ class LunaTwitchBot(commands.Bot):
             return False
         if self._cohost_banter_active or self._avatar_speaking:
             return False
-        if not self._viewer_cohost_in_scene:
+        if not self._cast_scene.idle_partner_ids():
             return False
         now = time.monotonic()
+        if now < self._cohost_banter_blocked_until:
+            return False
         if now - self._last_activity_ts < cohost_after_chat_sec():
             return False
         if self._last_cohost_banter_ts > 0 and now - self._last_cohost_banter_ts < cohost_min_gap_sec():
             return False
         return True
 
+    def _block_cohost_banter_after_fail(self, *, got_lines: int, need_lines: int) -> None:
+        from vampire_cohost import cohost_banter_fail_backoff_sec
+
+        backoff = cohost_banter_fail_backoff_sec()
+        self._cohost_banter_blocked_until = time.monotonic() + backoff
+        print(
+            f"(cohost) script too short ({got_lines}/{need_lines} lines) — "
+            f"idle banter pauses {int(backoff)}s (model must use LUNA: / VIKTOR: / HIMARI: lines). "
+            f"Set LUNA_COHOST_BANTER=0 to disable, or turn off “full conversation” in the viewer dock.",
+            flush=True,
+        )
+
+    def _viewer_tts_wait_max_sec(self) -> float:
+        raw = (os.environ.get("LUNA_TTS_VIEWER_WAIT_MAX_SEC") or "18").strip() or "18"
+        try:
+            cap = float(raw)
+        except ValueError:
+            cap = 18.0
+        return max(4.0, min(cap, 120.0))
+
+    def _creator_tts_blocks_until_done(self) -> bool:
+        return _env_truthy("LUNA_CREATOR_TTS_BLOCK_UNTIL_DONE", default=False)
+
     def _viewer_tts_wait_seconds(self, bundle: object, text: str) -> float:
         pad = float(os.environ.get("LUNA_TTS_VIEWER_WAIT_PAD_SEC", "1.5").strip() or "1.5")
         dur_ms = int(getattr(bundle, "duration_ms", 0) or 0)
         audio_sec = max(0.0, dur_ms / 1000.0)
         char_est = len((text or "").strip()) * 0.07
-        return min(180.0, max(3.0, audio_sec + pad, char_est + 1.0))
+        est = max(3.0, audio_sec + pad, char_est + 1.0)
+        return min(self._viewer_tts_wait_max_sec(), est)
 
     async def _wait_viewer_tts_done(self, timeout_sec: float) -> None:
         self._viewer_tts_done.clear()
@@ -739,28 +908,20 @@ class LunaTwitchBot(commands.Bot):
             await asyncio.wait_for(self._viewer_tts_done.wait(), timeout=timeout_sec)
         except asyncio.TimeoutError:
             print(
-                f"(tts) viewer playback wait timed out after {timeout_sec:.1f}s — "
-                "still blocking next chat message until event or retry",
+                f"(tts) viewer playback wait timed out after {timeout_sec:.1f}s — releasing gate",
                 flush=True,
             )
-            # Give the viewer a little more time before releasing the serial lock.
-            try:
-                await asyncio.wait_for(self._viewer_tts_done.wait(), timeout=timeout_sec)
-            except asyncio.TimeoutError:
-                print(
-                    f"(tts) viewer playback still not finished after {timeout_sec * 2:.1f}s — continuing",
-                    flush=True,
-                )
-            self._viewer_tts_done.set()
+            await self.finish_viewer_tts()
 
-    async def _emit_viewer_tts_and_wait(
+    async def _emit_viewer_tts(
         self,
         bundle: "TtsPlaybackBundle",
         *,
         reply_text: str,
         extra: dict | None = None,
+        block_until_done: bool = True,
     ) -> bool:
-        """Send ``tts_audio`` to the viewer and block until playback finishes."""
+        """Send ``tts_audio`` to the viewer; optionally block until playback finishes."""
         if self._chat_hub is None or bundle is None:
             return False
         payload: dict = {
@@ -774,10 +935,64 @@ class LunaTwitchBot(commands.Bot):
         }
         if extra:
             payload.update(extra)
+        avatar = str(payload.get("avatar") or "luna").strip().lower()
+        if avatar in ("luna", "cohost", "himari"):
+            self._viewer_tts_avatar = avatar
         await self._chat_hub.broadcast(payload)
+        if not block_until_done:
+            return True
         wait = self._viewer_tts_wait_seconds(bundle, reply_text)
         await self._wait_viewer_tts_done(wait)
         return True
+
+    async def _emit_viewer_tts_and_wait(
+        self,
+        bundle: "TtsPlaybackBundle",
+        *,
+        reply_text: str,
+        extra: dict | None = None,
+    ) -> bool:
+        return await self._emit_viewer_tts(
+            bundle, reply_text=reply_text, extra=extra, block_until_done=True
+        )
+
+    async def _broadcast_cast_on_viewer_for_banter(
+        self,
+        partner_ids: list[str],
+        *,
+        trio: bool = False,
+    ) -> None:
+        """Ensure summoned co-hosts are visible in the viewer before banter TTS."""
+        from luna_cast import partner_vrm_viewer_url
+
+        if not self._chat_hub:
+            return
+        viktor_url = (
+            partner_vrm_viewer_url("viktor") if "viktor" in partner_ids else ""
+        )
+        himari_url = (
+            partner_vrm_viewer_url("himari") if "himari" in partner_ids else ""
+        )
+        if trio and viktor_url:
+            payload: dict = {
+                "type": "control",
+                "name": "cohost_avatar",
+                "dual_layout": True,
+                "trio_layout": True,
+                "vrm_url": viktor_url,
+            }
+            if himari_url:
+                payload["himari_vrm_url"] = himari_url
+            await self._chat_hub.broadcast(payload)
+        elif "viktor" in partner_ids and viktor_url:
+            await self._chat_hub.broadcast(
+                {
+                    "type": "control",
+                    "name": "cohost_avatar",
+                    "dual_layout": True,
+                    "vrm_url": viktor_url,
+                }
+            )
 
     async def _dispatch_banter_line(
         self,
@@ -785,19 +1000,40 @@ class LunaTwitchBot(commands.Bot):
         text: str,
         *,
         cohost_display: str,
+        partner_id: str | None = None,
     ) -> None:
-        """Play one line of Luna ↔ co-host banter in the viewer (dual voice)."""
-        from vampire_cohost import cohost_edge_voice
+        """Play one banter line (luna | viktor | himari) in the viewer."""
+        from luna_cast import partner_display_name, partner_edge_voice
 
         if self.public_chat_reply_priority_busy():
             return
         line = (text or "").strip()
+        spk = (speaker or "").strip().lower()
+        if spk == "himari" or (partner_id or "").strip().lower() == "himari":
+            from himari_cohost import himari_banter_line_broken, sanitize_himari_speech_text
+
+            line = sanitize_himari_speech_text(line)
+            if himari_banter_line_broken(line):
+                print("(cohost) Himari banter line unusable after sanitize — skipped", flush=True)
+                return
         if not line or self._chat_hub is None:
             return
-        if speaker == "cohost" and not self._viewer_cohost_in_scene:
-            return
-        is_luna = speaker == "luna"
-        display = (self.nick or "Luna") if is_luna else cohost_display
+        is_luna = spk == "luna"
+        pid = (
+            (partner_id or spk or self._active_banter_partner or "viktor")
+            .strip()
+            .lower()
+        )
+        if not is_luna:
+            if pid not in ("viktor", "himari"):
+                pid = (self._active_banter_partner or "viktor").strip().lower()
+            if pid == "himari" and not self._cast_scene.himari_in_scene:
+                return
+            if pid == "viktor" and not self._cast_scene.viktor_in_scene:
+                return
+        display = (self.nick or "Luna") if is_luna else (
+            cohost_display or partner_display_name(pid)
+        )
         channel = "cohost"
         ts = int(time.time() * 1000)
         await self._chat_hub.broadcast(
@@ -811,31 +1047,43 @@ class LunaTwitchBot(commands.Bot):
         )
         if not tts_enabled() or not tts_play_to_viewer():
             return
-        voice_override = None if is_luna else cohost_edge_voice()
+        voice_override = None if is_luna else partner_edge_voice(pid)
         bundle = await asyncio.to_thread(
             synthesize_playback_bundle, line, voice=voice_override
         )
         if bundle is None:
             return
+        banter_avatar = viewer_avatar_id(pid, speaker=speaker)
+        cohost_payload: dict = {
+            "type": "control",
+            "name": "cohost_avatar",
+            "active_speaker": "luna" if is_luna else banter_avatar,
+        }
+        if not is_luna:
+            from luna_cast import partner_vrm_viewer_url
+
+            vrm_url = partner_vrm_viewer_url(pid)
+            if vrm_url:
+                cohost_payload["vrm_url"] = vrm_url
+        await self._chat_hub.broadcast(cohost_payload)
+        if is_luna:
+            self._cancel_mic_ready_task()
+        self._avatar_speaking = True
         await self._chat_hub.broadcast(
             {
                 "type": "control",
-                "name": "cohost_avatar",
-                "active_speaker": "luna" if is_luna else "cohost",
+                "name": "avatar_speaking",
+                "value": True,
+                "avatar": banter_avatar,
             }
         )
-        if is_luna:
-            self._cancel_mic_ready_task()
-            self._avatar_speaking = True
-            await self._chat_hub.broadcast(
-                {"type": "control", "name": "avatar_speaking", "value": True}
-            )
         await self._chat_hub.broadcast(
             {
                 "type": "control",
                 "name": "avatar_emotion",
                 "value": detect_avatar_emotion(line),
                 "duration_ms": min(12_000, max(1_800, int(len(line) * 42))),
+                "avatar": banter_avatar,
             }
         )
         payload: dict = {
@@ -846,32 +1094,61 @@ class LunaTwitchBot(commands.Bot):
             "duration_ms": bundle.duration_ms,
             "visemes": bundle.visemes,
             "drive_avatar": True,
-            "avatar": "luna" if is_luna else "cohost",
+            "avatar": banter_avatar,
         }
         await self._chat_hub.broadcast(payload)
         wait = self._viewer_tts_wait_seconds(bundle, line)
         await self._wait_viewer_tts_done(wait)
-        if is_luna:
-            self._avatar_speaking = False
-            self._last_avatar_speaking_end_ts = time.monotonic()
-            await self._chat_hub.broadcast(
-                {"type": "control", "name": "avatar_speaking", "value": False}
-            )
+        self._avatar_speaking = False
+        self._last_avatar_speaking_end_ts = time.monotonic()
+        await self._chat_hub.broadcast(
+            {
+                "type": "control",
+                "name": "avatar_speaking",
+                "value": False,
+                "avatar": banter_avatar,
+            }
+        )
 
     async def run_cohost_banter_exchange(self, *, full_conversation: bool = False) -> None:
-        from luna_cohost_banter import _generate_banter_script_sync
+        from luna_cast import (
+            choose_idle_banter_partner_sync,
+            partner_display_name,
+            save_last_idle_partner,
+        )
+        from luna_banter_novelty import banter_novelty_strict_on_tiktok
+        from luna_cohost_banter import generate_banter_script_with_novelty
         from vampire_cohost import (
             cohost_exchange_lines,
             cohost_full_banter_line_cap,
-            cohost_name,
-            cohost_vrm_viewer_url,
         )
 
         if self._cohost_banter_active:
             return
-        if not self._viewer_cohost_in_scene:
+        partner_ids = self._cast_scene.idle_partner_ids()
+        if not partner_ids:
             return
-        name = cohost_name()
+        trio = self._cast_scene.trio_on_stage()
+        partner = partner_ids[0]
+        if not trio:
+            if len(partner_ids) == 1:
+                partner = partner_ids[0]
+            else:
+                async with self._ollama_lock:
+                    partner = await asyncio.to_thread(
+                        choose_idle_banter_partner_sync,
+                        model=self._chat_model,
+                        luna_name=self.nick or "Luna",
+                        scene=self._cast_scene,
+                        recent_memory=list(self._memory),
+                    )
+            if not partner:
+                return
+            save_last_idle_partner(partner)
+        self._active_banter_partner = partner if not trio else "viktor"
+        viktor_name = partner_display_name("viktor")
+        himari_name = partner_display_name("himari")
+        duo_name = partner_display_name(partner) if not trio else ""
         self._cohost_banter_active = True
         self.touch_activity()
         played: list[tuple[str, str]] = []
@@ -880,71 +1157,156 @@ class LunaTwitchBot(commands.Bot):
                 line_budget = cohost_full_banter_line_cap()
             else:
                 line_budget = cohost_exchange_lines()
-            async with self._ollama_lock:
-                presence = self._dual_presence_context_block()
-                dynamics = self._cohost_dynamics.block_for_banter()
-                yt_banter = self._youtube_live_session.block_for_banter(cohost_name=name)
-                tt_banter = self._tiktok_live_session.block_for_banter(cohost_name=name)
-                extra_ctx = "\n\n".join(
-                    x for x in (presence, dynamics, yt_banter, tt_banter) if x
-                ).strip()
-                script = await asyncio.to_thread(
-                    _generate_banter_script_sync,
-                    model=self._chat_model,
-                    luna_name=self.nick or "Luna",
-                    cohost=name,
-                    max_lines=line_budget,
-                    full_conversation=full_conversation,
-                    presence_block=extra_ctx,
+            if trio:
+                line_budget = max(line_budget, cohost_exchange_lines() * 2)
+            min_lines = 3 if trio else 2
+            script: list[tuple[str, str]] = []
+            await self._broadcast_cast_thinking(True)
+            try:
+                async with self._ollama_lock:
+                    presence = self._dual_presence_context_block()
+                    dynamics = self._cohost_dynamics.block_for_banter()
+                    if trio:
+                        consciousness = self._cast_consciousness.block_for_trio_banter(
+                            viktor_name=viktor_name,
+                            himari_name=himari_name,
+                        )
+                        cast_label = f"{viktor_name} and {himari_name}"
+                        yt_banter = self._youtube_live_session.block_for_banter(
+                            cohost_name=cast_label
+                        )
+                        tt_banter = self._tiktok_live_session.block_for_banter(
+                            cohost_name=cast_label
+                        )
+                    else:
+                        consciousness = self._cast_consciousness.block_for_banter(
+                            partner, cohost_name=duo_name
+                        )
+                        yt_banter = self._youtube_live_session.block_for_banter(
+                            cohost_name=duo_name
+                        )
+                        tt_banter = self._tiktok_live_session.block_for_banter(
+                            cohost_name=duo_name
+                        )
+                    extra_ctx = "\n\n".join(
+                        x for x in (presence, dynamics, yt_banter, tt_banter) if x
+                    ).strip()
+                    strict_novelty = banter_novelty_strict_on_tiktok() and self._tiktok_live_listening()
+                    script = await asyncio.to_thread(
+                        generate_banter_script_with_novelty,
+                        model=self._chat_model,
+                        luna_name=self.nick or "Luna",
+                        trio=trio,
+                        ledger=self._banter_novelty,
+                        strict_novelty=strict_novelty,
+                        max_lines=line_budget,
+                        full_conversation=full_conversation,
+                        presence_block=extra_ctx,
+                        consciousness_block=consciousness,
+                        cohost=duo_name,
+                        partner_id=partner,
+                        viktor_name=viktor_name,
+                        himari_name=himari_name,
+                        min_lines=min_lines,
+                    )
+                    overlaps = self._banter_novelty.count_overlaps(script)
+                    if overlaps >= 2:
+                        print(
+                            f"(banter_novelty) warning: {overlaps} lines still near recent banter",
+                            flush=True,
+                        )
+            finally:
+                await self._broadcast_cast_thinking(False)
+            if len(script) < min_lines:
+                self._block_cohost_banter_after_fail(
+                    got_lines=len(script),
+                    need_lines=min_lines,
                 )
-            if len(script) < 2:
-                print("(cohost) script too short — skipped", flush=True)
                 return
             mode = "open-ended full" if full_conversation else "short"
-            print(
-                f"(cohost) exchange ({len(script)} lines, {mode}) Luna ↔ {name}",
-                flush=True,
-            )
+            if trio:
+                print(
+                    f"(cohost) trio exchange ({len(script)} lines, {mode}) "
+                    f"Luna + {viktor_name} + {himari_name}",
+                    flush=True,
+                )
+                status_label = f"Luna + {viktor_name} + {himari_name}"
+            else:
+                print(
+                    f"(cohost) exchange ({len(script)} lines, {mode}) Luna ↔ {duo_name}",
+                    flush=True,
+                )
+                status_label = f"Luna ↔ {duo_name}"
             if self._chat_hub:
                 await self._chat_hub.broadcast(
                     {
                         "type": "status",
-                        "text": f"Cohost banter: Luna ↔ {name}",
+                        "text": f"Cast banter: {status_label}",
                     }
                 )
-            vrm_url = cohost_vrm_viewer_url()
-            if vrm_url and self._chat_hub and self._viewer_cohost_in_scene:
-                await self._chat_hub.broadcast(
-                    {
-                        "type": "control",
-                        "name": "cohost_avatar",
-                        "dual_layout": True,
-                        "vrm_url": vrm_url,
-                    }
-                )
-            elif not self._viewer_cohost_in_scene:
-                print("(cohost) banter skipped — co-host dismissed (solo mode)", flush=True)
+            on_stage = set(self._cast_scene.idle_partner_ids())
+            if not on_stage:
+                print("(cohost) banter skipped — cast left the stage", flush=True)
                 return
+            await self._broadcast_cast_on_viewer_for_banter(
+                list(on_stage),
+                trio=trio,
+            )
             for spk, line in script:
-                if not self._viewer_cohost_in_scene:
+                if on_stage != set(self._cast_scene.idle_partner_ids()):
                     break
                 if self.public_chat_reply_priority_busy():
                     print("(cohost) banter yielding — chat reply in progress", flush=True)
                     break
-                if spk == "cohost" and not self._viewer_cohost_in_scene:
+                if spk not in ("luna", *on_stage):
                     continue
-                await self._dispatch_banter_line(spk, line, cohost_display=name)
+                pname = (
+                    partner_display_name(spk)
+                    if spk in ("viktor", "himari")
+                    else (self.nick or "Luna")
+                )
+                await self._dispatch_banter_line(
+                    spk,
+                    line,
+                    cohost_display=pname,
+                    partner_id=spk if spk != "luna" else None,
+                )
                 if self.public_chat_reply_priority_busy():
                     print("(cohost) banter yielding — chat took priority", flush=True)
                     break
                 played.append((spk, line))
             if played:
-                self._cohost_dynamics.observe_banter_script(played)
+                self._banter_novelty.record_script(played)
+                if trio:
+                    self._cast_consciousness.observe_trio_banter_script(played)
+                    viktor_lines = [
+                        ("luna" if s == "luna" else "cohost", t)
+                        for s, t in played
+                        if s in ("luna", "viktor")
+                    ]
+                    if viktor_lines:
+                        self._cohost_dynamics.observe_banter_script(viktor_lines)
+                else:
+                    self._cast_consciousness.observe_banter_script(partner, played)
+                    if partner == "viktor":
+                        self._cohost_dynamics.observe_banter_script(played)
             if dynamics_enabled():
                 asyncio.create_task(
                     self._maybe_refresh_cohost_dynamics(),
                     name="cohost-dynamics-refresh",
                 )
+            if consciousness_enabled():
+                if trio:
+                    for pid in ("viktor", "himari"):
+                        asyncio.create_task(
+                            self._maybe_refresh_cast_consciousness(pid),
+                            name=f"cast-consciousness-refresh-{pid}",
+                        )
+                else:
+                    asyncio.create_task(
+                        self._maybe_refresh_cast_consciousness(partner),
+                        name="cast-consciousness-refresh",
+                    )
             self._last_cohost_banter_ts = time.monotonic()
         except asyncio.CancelledError:
             print("(cohost) banter cancelled (chat or dismissed)", flush=True)
@@ -1256,10 +1618,10 @@ class LunaTwitchBot(commands.Bot):
             sec = float(raw)
         except ValueError:
             sec = 15.0
-        return max(5.0, min(sec, 300.0))
+        return screen_context_interval_sec(sec)
 
     async def ingest_viewer_screen_frame(self, image_b64: str) -> None:
-        """Accept viewer JPEG frames (~1 FPS); run vision on the latest frame every N seconds."""
+        """Accept viewer JPEG frames (~1/sec); run vision on the latest frame every N seconds (default 1)."""
         raw = (os.environ.get("LUNA_SCREEN_CONTEXT", "1") or "1").strip().lower()
         if raw in ("0", "false", "no", "off"):
             return
@@ -1273,7 +1635,7 @@ class LunaTwitchBot(commands.Bot):
             self._latest_screen_frame_b64 = b64
             if _env_truthy("LUNA_SCREEN_YIELD_TO_CHAT", default=True) and self._ollama_lock.locked():
                 return
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_screen_summarize_ts < self._screen_context_interval_sec():
                 return
             if self._screen_summarize_task is not None and not self._screen_summarize_task.done():
@@ -1305,19 +1667,12 @@ class LunaTwitchBot(commands.Bot):
                     {"type": "status", "text": f"Screen context error: {exc}"}
                 )
             return
-        max_chars = int(os.environ.get("LUNA_SCREEN_CONTEXT_MAX_CHARS", "1200").strip() or "1200")
-        max_chars = max(200, max_chars)
+        max_chars = screen_context_max_chars()
         summary = (summary or "").strip()
         if not summary:
             return
         if len(summary) > max_chars:
             summary = summary[: max_chars - 1] + "…"
-        lol = (self._lol_context_summary or "").strip()
-        if lol:
-            merged = f"{summary}\n\n[League client stats — use with what you see on screen]\n{lol}"
-            if len(merged) > max_chars:
-                merged = merged[: max_chars - 1] + "…"
-            summary = merged
         self._screen_context_summary = summary
         print(f"(viewer_screen) context updated ({len(summary)} chars)", flush=True)
         if self._chat_hub and os.environ.get("LUNA_SCREEN_CONTEXT_STATUS", "").strip() == "1":
@@ -1365,6 +1720,21 @@ class LunaTwitchBot(commands.Bot):
                 }
             )
 
+    async def _prompt_live_social_title(self, item: dict[str, str]) -> None:
+        if self._chat_hub is None:
+            return
+        await self._chat_hub.broadcast(
+            {
+                "type": "control",
+                "name": "live_social_title_prompt",
+                "open": True,
+                "platform": str(item.get("platform") or "live"),
+                "suggested_title": str(item.get("suggested_title") or ""),
+                "url": str(item.get("url") or ""),
+                "stream_id": str(item.get("stream_id") or item.get("id") or ""),
+            }
+        )
+
     async def event_message(self, message: Message) -> None:
         if message.echo:
             return
@@ -1396,7 +1766,7 @@ class LunaTwitchBot(commands.Bot):
             await self._dispatch_twitch_chat_replies(message)
 
     async def _dispatch_twitch_chat_replies(self, message: Message) -> None:
-        """One real Twitch line; Luna and/or Viktor each reply when named (no duplicate user turns)."""
+        """One Twitch line; Luna and/or cast partners each reply when named."""
         text = (message.content or "").strip()
         if not text:
             return
@@ -1412,27 +1782,36 @@ class LunaTwitchBot(commands.Bot):
         )
         if not addressees:
             return
+        source = "Twitch chat"
+        if not self._try_claim_public_chat_line(source, author, text):
+            return
+        addressees = self._cap_public_chat_addressees(source, addressees)
         if len(addressees) > 1:
             print(
-                f"(chat) Twitch → {author}: both mentioned — "
+                f"(chat) Twitch → {author}: "
                 f"{' then '.join(addressees)} reply separately",
                 flush=True,
             )
+        print(f"\n--- Twitch /{channel} {author}: {text.strip()}", flush=True)
         async with self._public_chat_serial_lock:
             await self.begin_public_chat_reply_priority()
             try:
+                await self._wait_public_chat_cooldown(source)
                 for i, speaker in enumerate(addressees):
+                    if i > 0:
+                        await self._wait_public_chat_cooldown(source)
                     await self._generate_and_dispatch_reply(
                         channel_name=channel,
                         author=author,
                         question=text,
                         send_to_twitch=True,
-                        source="Twitch chat",
+                        source=source,
                         allow_cohost_persona=True,
                         force_speaker=speaker,
                         record_user_memory=(i == 0),
-                        update_auto_reply_cooldown=(i == len(addressees) - 1),
+                        update_auto_reply_cooldown=True,
                         chatter_profile=profile,
+                        log_incoming_chat=False,
                     )
             finally:
                 self.end_public_chat_reply_priority()
@@ -1445,8 +1824,7 @@ class LunaTwitchBot(commands.Bot):
             return False
         if text.startswith("!"):
             return False
-        now = time.time()
-        if now - self._last_auto_reply_ts < self._auto_cooldown_sec:
+        if self._public_chat_on_cooldown("Twitch chat"):
             return False
         addressees = twitch_message_addressees(
             text, trigger_all=self._auto_trigger == "all"
@@ -1454,13 +1832,9 @@ class LunaTwitchBot(commands.Bot):
         return bool(addressees)
 
     def _mention_triggers_chat_reply(self, text: str) -> bool:
-        from vampire_cohost import chat_directed_at_cohost, chat_directed_at_luna
+        from luna_cast import public_chat_addressees
 
-        if chat_directed_at_luna(text):
-            return True
-        if cohost_enabled() and chat_directed_at_cohost(text):
-            return True
-        return False
+        return bool(public_chat_addressees(text, trigger_all=False))
 
     def _should_auto_reply_youtube(self, text: str) -> bool:
         if not youtube_live_auto_reply_enabled():
@@ -1468,8 +1842,7 @@ class LunaTwitchBot(commands.Bot):
         cleaned = (text or "").strip()
         if not cleaned or cleaned.startswith("!"):
             return False
-        now = time.time()
-        if now - self._last_auto_reply_ts < self._auto_cooldown_sec:
+        if self._public_chat_on_cooldown("YouTube Live"):
             return False
         if youtube_live_auto_trigger() == "all":
             return True
@@ -1485,8 +1858,7 @@ class LunaTwitchBot(commands.Bot):
         cleaned = (text or "").strip()
         if not cleaned or cleaned.startswith("!"):
             return False
-        now = time.time()
-        if now - self._last_auto_reply_ts < self._auto_cooldown_sec:
+        if self._public_chat_on_cooldown("TikTok Live"):
             return False
         if tiktok_live_auto_trigger() == "all":
             return True
@@ -1496,31 +1868,37 @@ class LunaTwitchBot(commands.Bot):
             )
         )
 
-    async def _broadcast_cohost_chat_reply_viewer(self) -> None:
-        """Show Viktor VRM + route lip-sync before Twitch/YouTube live chat TTS."""
-        from vampire_cohost import cohost_vrm_viewer_url
+    async def _broadcast_partner_chat_reply_viewer(self, partner_id: str) -> None:
+        """Show partner VRM + route lip-sync before Twitch/YouTube live chat TTS."""
+        from luna_cast import partner_vrm_viewer_url
 
         if not self._chat_hub:
             return
+        pid = (partner_id or "viktor").strip().lower()
+        avatar = viewer_avatar_id(pid, speaker="cohost")
         payload: dict = {
             "type": "control",
             "name": "cohost_avatar",
-            "active_speaker": "cohost",
+            "active_speaker": avatar,
             "chat_reply": True,
         }
-        vrm_url = cohost_vrm_viewer_url()
+        vrm_url = partner_vrm_viewer_url(pid)
         if vrm_url:
             payload["vrm_url"] = vrm_url
-        if self._viewer_cohost_in_scene:
+        if self._viewer_cohost_in_scene or (
+            pid == "himari" and self._cast_scene.himari_in_scene
+        ):
             payload["dual_layout"] = True
         await self._chat_hub.broadcast(payload)
 
     async def dismiss_cohost_from_viewer(self) -> None:
-        """Viewer dismissed Viktor — stop banter/TTS pipeline until summoned again."""
-        from luna_cohost_scene import save_cohost_in_scene
+        """Viewer dismissed co-host(s) — stop banter/TTS until summoned again."""
+        from luna_cast import CastScene, save_cast_scene
 
-        self._viewer_cohost_in_scene = False
-        save_cohost_in_scene(False)
+        scene = CastScene()
+        save_cast_scene(scene)
+        self._sync_cast_scene_flags(scene)
+        self._active_banter_partner = None
         task = self._cohost_banter_task
         self._cohost_banter_task = None
         if task is not None and not task.done():
@@ -1545,44 +1923,81 @@ class LunaTwitchBot(commands.Bot):
                 }
             )
 
-    def _chat_reply_speaker(self, question: str) -> str:
-        """``luna`` or ``cohost`` for non-Twitch paths (YouTube live, etc.)."""
-        from vampire_cohost import resolve_chat_reply_speaker
+    def _chat_reply_partner(self, question: str) -> str:
+        """``luna``, ``viktor``, or ``himari`` (Twitch / YouTube / TikTok)."""
+        from luna_cast import resolve_chat_reply_partner
 
-        return resolve_chat_reply_speaker(
-            (question or "").strip(), cohost_in_scene=self._viewer_cohost_in_scene
+        return resolve_chat_reply_partner(
+            (question or "").strip(), self._cast_scene
         )
 
-    def _cohost_for_chat_reply(self, question: str = "") -> bool:
-        return self._chat_reply_speaker(question) == "cohost"
+    def _creator_panel_reply_partner(
+        self, question: str, *, creator_reply_to: str | None = None
+    ) -> str:
+        """Creator panel/voice routing — viewer ``reply_to`` + on-stage cast."""
+        from luna_cast import resolve_creator_reply_partner
 
-    def _cohost_chat_system(self) -> str:
+        return resolve_creator_reply_partner(
+            (question or "").strip(),
+            self._cast_scene,
+            explicit_target=creator_reply_to,
+        )
+
+    def _chat_reply_speaker(self, question: str) -> str:
+        """Legacy: ``luna`` or ``cohost``."""
+        partner = self._chat_reply_partner(question)
+        return "cohost" if partner in ("viktor", "himari") else "luna"
+
+    def _cohost_for_chat_reply(self, question: str = "") -> bool:
+        return self._chat_reply_partner(question) != "luna"
+
+    def _partner_chat_system(self, partner_id: str) -> str:
+        from himari_cohost import build_himari_chat_system, build_himari_system_prompt, himari_enabled
+        from luna_cast import format_cast_roster_block, partner_cast_line
         from vampire_cohost import build_vampire_system_prompt, cohost_name
 
-        vn = cohost_name()
-        luna_ctx = build_luna_system_prompt()
-        parts = [
-            f"You are {vn}, the vampire co-host on stream with Luna.\n\n",
-            build_vampire_system_prompt(),
-            f"\n\nLuna (your co-host — context only; never reply as Luna):\n{luna_ctx}\n\n",
-            "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, they want "
-            "**you** — not Luna. Reply in your voice only, as plain text for TTS. "
-            "Keep it to one short paragraph or a few sentences unless they asked for more. "
-            "Do not prefix with your name or a role tag.",
-        ]
-        return "".join(parts)
-
-    def _cohost_off_stage_context_block(self, *, as_cohost: bool = False) -> str:
-        from vampire_cohost import cohost_enabled, cohost_name
-
-        if not cohost_enabled() or self._viewer_cohost_in_scene:
-            return ""
-        if as_cohost:
+        if partner_id == "himari":
+            base = build_himari_chat_system()
+        else:
             vn = cohost_name()
+            luna_ctx = build_luna_system_prompt()
+            cast_extra = ""
+            if himari_enabled():
+                cast_extra = (
+                    f"\n\n{partner_cast_line('himari')}\n"
+                    f"Himari (context only — never reply as her):\n"
+                    f"{build_himari_system_prompt()}\n"
+                )
+            base = (
+                f"You are {vn}, the male vampire co-host on stream with Luna.\n\n"
+                f"{build_vampire_system_prompt()}"
+                f"{cast_extra}"
+                f"\n\nLuna (your co-host — context only; never reply as Luna):\n{luna_ctx}\n\n"
+                "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, "
+                "they want **you** — not Luna. Reply in your voice only, as plain text for TTS. "
+                "Use he/him for yourself. "
+                "Keep it to one short paragraph or a few sentences unless they asked for more. "
+                "Do not prefix with your name or a role tag."
+            )
+        roster = format_cast_roster_block(self._cast_scene)
+        return f"{base}\n\n{roster}".strip() if roster else base
+
+    def _cohost_off_stage_context_block(
+        self, *, as_cohost: bool = False, partner_id: str = "viktor"
+    ) -> str:
+        from luna_cast import partner_display_name
+        from vampire_cohost import cohost_enabled
+
+        if as_cohost:
+            if partner_id == "viktor" and (not cohost_enabled() or self._cast_scene.viktor_in_scene):
+                return ""
+            if partner_id == "himari" and self._cast_scene.himari_in_scene:
+                return ""
+            pn = partner_display_name(partner_id)
             return (
-                f"## {vn} — off camera, answering Twitch chat\n"
-                f"Your VRM may be dismissed in the viewer, but a chatter addressed **{vn}** by name. "
-                "Reply in your voice on Twitch; you do not need Luna to proxy for you."
+                f"## {pn} — off camera, answering chat\n"
+                f"Your VRM may be dismissed in the viewer, but a chatter addressed **{pn}** by name. "
+                "Reply in your voice; you do not need Luna to proxy for you."
             )
         from luna_cohost_scene import format_cohost_off_stage_block
 
@@ -1638,6 +2053,34 @@ class LunaTwitchBot(commands.Bot):
         except Exception as exc:
             print(f"(cohost_dynamics) llm refresh failed: {exc}", flush=True)
 
+    async def _maybe_refresh_cast_consciousness(self, partner_id: str) -> None:
+        if not self._cast_consciousness.needs_llm_refresh(partner_id):
+            return
+        messages = self._cast_consciousness.build_llm_refresh_messages(partner_id)
+        try:
+            async with self._ollama_lock:
+                raw = await asyncio.to_thread(
+                    chat_once,
+                    self._ollama,
+                    self._chat_model,
+                    messages,
+                    stream=False,
+                )
+            payload = self._parse_dynamics_json(raw)
+            if payload:
+                self._cast_consciousness.apply_llm_refresh(partner_id, payload)
+        except Exception as exc:
+            print(f"(cast_consciousness) llm refresh failed: {exc}", flush=True)
+
+    def _tiktok_live_listening(self) -> bool:
+        cb = self._tiktok_live_active_cb
+        if cb is None:
+            return False
+        try:
+            return bool(cb())
+        except Exception:
+            return False
+
     def _dual_presence_context_block(self) -> str:
         yt = False
         cb = self._youtube_live_active_cb
@@ -1683,12 +2126,19 @@ class LunaTwitchBot(commands.Bot):
         )
         if not addressees:
             return
+        if not self._try_claim_public_chat_line(source, author, q):
+            return
+        addressees = self._cap_public_chat_addressees(source, addressees)
         yt_profile = profile_from_login(author)
         self._register_youtube_chatter(yt_profile)
+        print(f"\n--- Twitch /{source} {author}: {q}", flush=True)
         async with self._public_chat_serial_lock:
             await self.begin_public_chat_reply_priority()
             try:
+                await self._wait_public_chat_cooldown(source)
                 for i, speaker in enumerate(addressees):
+                    if i > 0:
+                        await self._wait_public_chat_cooldown(source)
                     reply = await self._generate_and_dispatch_reply(
                         channel_name=source,
                         author=author,
@@ -1699,16 +2149,23 @@ class LunaTwitchBot(commands.Bot):
                         allow_cohost_persona=True,
                         force_speaker=speaker,
                         record_user_memory=(i == 0),
-                        update_auto_reply_cooldown=(i == len(addressees) - 1),
+                        update_auto_reply_cooldown=True,
                         chatter_profile=yt_profile,
+                        log_incoming_chat=False,
                     )
                     if reply:
+                        from luna_cast import partner_display_name
+
                         self._youtube_live_session.note_reply(
                             speaker=speaker,
                             author=author,
                             user_text=q,
                             reply=reply,
-                            cohost_display=cohost_name(),
+                            cohost_display=(
+                                partner_display_name(speaker)
+                                if speaker != "luna"
+                                else cohost_name()
+                            ),
                         )
             finally:
                 self.end_public_chat_reply_priority()
@@ -1737,12 +2194,19 @@ class LunaTwitchBot(commands.Bot):
         )
         if not addressees:
             return
+        if not self._try_claim_public_chat_line(source, author, q):
+            return
+        addressees = self._cap_public_chat_addressees(source, addressees)
         tt_profile = profile_from_login(author, display_name=author)
         self._register_tiktok_chatter(tt_profile)
+        print(f"\n--- Twitch /{source} {author}: {q}", flush=True)
         async with self._public_chat_serial_lock:
             await self.begin_public_chat_reply_priority()
             try:
+                await self._wait_public_chat_cooldown(source)
                 for i, speaker in enumerate(addressees):
+                    if i > 0:
+                        await self._wait_public_chat_cooldown(source)
                     reply = await self._generate_and_dispatch_reply(
                         channel_name=source,
                         author=author,
@@ -1753,16 +2217,23 @@ class LunaTwitchBot(commands.Bot):
                         allow_cohost_persona=True,
                         force_speaker=speaker,
                         record_user_memory=(i == 0),
-                        update_auto_reply_cooldown=(i == len(addressees) - 1),
+                        update_auto_reply_cooldown=True,
                         chatter_profile=tt_profile,
+                        log_incoming_chat=False,
                     )
                     if reply:
+                        from luna_cast import partner_display_name
+
                         self._tiktok_live_session.note_reply(
                             speaker=speaker,
                             author=author,
                             user_text=q,
                             reply=reply,
-                            cohost_display=cohost_name(),
+                            cohost_display=(
+                                partner_display_name(speaker)
+                                if speaker != "luna"
+                                else cohost_name()
+                            ),
                         )
             finally:
                 self.end_public_chat_reply_priority()
@@ -1889,6 +2360,8 @@ class LunaTwitchBot(commands.Bot):
         record_user_memory: bool = True,
         update_auto_reply_cooldown: bool = True,
         chatter_profile: TwitchChatterProfile | None = None,
+        log_incoming_chat: bool = True,
+        creator_reply_to: str | None = None,
     ) -> str:
         """Generate a reply, append to shared memory, broadcast to hub + TTS.
 
@@ -1923,6 +2396,10 @@ class LunaTwitchBot(commands.Bot):
         is_creator = from_creator or is_creator_viewer_turn(source=source, author=author)
         if chatter_profile is not None and is_twitch and is_creator_twitch_profile(chatter_profile):
             is_creator = True
+        src_lower = source.strip().lower()
+        is_creator_panel = src_lower in ("viewer panel", "viewer voice") or (
+            is_creator and not is_public_chat
+        )
 
         memory_author = (
             chatter_profile.login if chatter_profile is not None else author
@@ -1958,34 +2435,96 @@ class LunaTwitchBot(commands.Bot):
 
         if is_creator and cohost_replies_to_creator_enabled():
             allow_cohost_persona = True
+        elif is_creator_panel:
+            from himari_cohost import chat_directed_at_himari, himari_enabled
+            from vampire_cohost import chat_directed_at_cohost, cohost_enabled
 
-        if force_speaker in ("luna", "cohost"):
-            speaker = force_speaker
+            if (himari_enabled() and chat_directed_at_himari(question)) or (
+                cohost_enabled() and chat_directed_at_cohost(question)
+            ):
+                allow_cohost_persona = True
+
+        if force_speaker in ("luna", "viktor", "himari"):
+            partner = force_speaker
+        elif force_speaker == "cohost":
+            partner = "viktor"
+        elif allow_cohost_persona and is_creator_panel:
+            partner = self._creator_panel_reply_partner(
+                question, creator_reply_to=creator_reply_to
+            )
         elif allow_cohost_persona:
-            speaker = self._chat_reply_speaker(question)
+            partner = self._chat_reply_partner(question)
         else:
-            speaker = "luna"
-        as_cohost = speaker == "cohost"
-        assistant_user = cohost_name() if as_cohost else (self.nick or "luna")
+            partner = "luna"
+        as_cohost = partner in ("viktor", "himari")
+        if is_creator_panel and as_cohost:
+            from luna_cast import partner_display_name as _partner_name
+
+            print(
+                f"(creator) routing panel/voice reply → {_partner_name(partner)}",
+                flush=True,
+            )
+        # Luna panel/voice: non-blocking by default. Live chat + co-hosts always wait for playback.
+        block_viewer_tts = (
+            is_public_chat
+            or as_cohost
+            or (not is_creator_panel)
+            or self._creator_tts_blocks_until_done()
+        )
+        from luna_cast import format_cast_roster_block, format_viewer_addressee_note, partner_display_name
+
+        display_name = partner_display_name(partner) if as_cohost else (self.nick or "luna")
+        assistant_user = display_name
 
         messages: list[dict] = []
         if as_cohost:
-            system_content = self._cohost_chat_system()
+            system_content = self._partner_chat_system(partner)
         else:
             system_content = self._system
+            roster = format_cast_roster_block(self._cast_scene)
+            if roster:
+                system_content = (
+                    f"{system_content}\n\n{roster}".strip() if system_content else roster
+                )
+            addressee = format_viewer_addressee_note(question, self._cast_scene)
+            if addressee:
+                system_content = (
+                    f"{system_content}\n\n{addressee}".strip() if system_content else addressee
+                )
         presence = self._dual_presence_context_block()
         if presence:
             system_content = (
                 f"{system_content}\n\n{presence}".strip() if system_content else presence
             )
-        off_stage = self._cohost_off_stage_context_block(as_cohost=as_cohost)
+        off_stage = self._cohost_off_stage_context_block(as_cohost=as_cohost, partner_id=partner)
         if off_stage:
             system_content = (
                 f"{system_content}\n\n{off_stage}".strip() if system_content else off_stage
             )
-        system_content = self._append_cohost_dynamics_to_system(
-            system_content, as_cohost=as_cohost
-        )
+        if partner == "viktor":
+            system_content = self._append_cohost_dynamics_to_system(
+                system_content, as_cohost=as_cohost
+            )
+        if partner in ("viktor", "himari"):
+            cast_block = self._cast_consciousness.block_for_partner_chat(
+                partner, as_cohost=as_cohost
+            )
+            if cast_block:
+                system_content = (
+                    f"{system_content}\n\n{cast_block}".strip()
+                    if system_content
+                    else cast_block
+                )
+        if not as_cohost:
+            on_stage = self._cast_scene.idle_partner_ids()
+            if on_stage:
+                couch = self._cast_consciousness.block_for_luna(on_stage_partners=on_stage)
+                if couch:
+                    system_content = (
+                        f"{system_content}\n\n{couch}".strip()
+                        if system_content
+                        else couch
+                    )
         if is_creator:
             if chatter_profile is not None and is_twitch:
                 creator_block = creator_twitch_chat_system_block(profile=chatter_profile)
@@ -2008,9 +2547,9 @@ class LunaTwitchBot(commands.Bot):
             chat_note = live_chatter_system_note(
                 profile=chatter_profile,
                 message=question,
-                speaker=speaker,
+                speaker="cohost" if as_cohost else "luna",
                 platform=platform,
-                cohost_name=cohost_name(),
+                cohost_name=display_name,
                 session_messages=session_msgs,
                 returning=returning,
             )
@@ -2031,9 +2570,21 @@ class LunaTwitchBot(commands.Bot):
                         else yt_extra
                     )
         if is_tiktok_live:
+            from luna_banter_novelty import block_for_chat_novelty
+
+            recent_assistant = [
+                str(m.get("content") or "").strip()
+                for m in self._memory
+                if str(m.get("role") or "").strip().lower() == "assistant"
+            ]
+            chat_novelty = block_for_chat_novelty(
+                recent_assistant,
+                strict=self._tiktok_live_listening(),
+            )
             for tt_extra in (
                 self._tiktok_live_session.block_for_chat_reply(),
                 tiktok_live_reply_style_block(),
+                chat_novelty,
             ):
                 if tt_extra:
                     system_content = (
@@ -2086,22 +2637,6 @@ class LunaTwitchBot(commands.Bot):
         )
         if user_memory:
             system_content = f"{system_content}{user_memory}" if system_content else user_memory.lstrip()
-        if self._lol_context_summary.strip():
-            lol_block = os.environ.get(
-                "LUNA_LOL_CONTEXT_INJECTION",
-                (
-                    "\n\n## League of Legends (Riot Client — local stats)\n"
-                    "The streamer is playing solo. Trust these numbers for KDA, gold, phase, rank; "
-                    "combine with screen context when they share the game:\n{summary}"
-                ),
-            ).strip()
-            if "{summary}" in lol_block:
-                lol_extra = lol_block.format(summary=self._lol_context_summary.strip())
-            else:
-                lol_extra = f"{lol_block}\n{self._lol_context_summary.strip()}"
-            system_content = (
-                f"{system_content}{lol_extra}" if system_content else lol_extra.lstrip()
-            )
         if self._screen_context_summary:
             block = os.environ.get(
                 "LUNA_SCREEN_CONTEXT_INJECTION",
@@ -2129,7 +2664,8 @@ class LunaTwitchBot(commands.Bot):
             messages.extend(reversed(kept))
         messages.append({"role": "user", "content": user_line})
 
-        print(f"\n--- Twitch /{channel_name} {author}: {question.strip()}", flush=True)
+        if log_incoming_chat:
+            print(f"\n--- Twitch /{channel_name} {author}: {question.strip()}", flush=True)
         stream_ws = self._chat_hub is not None and _env_truthy(
             "LUNA_STREAM_ASSISTANT_WS",
             default=True,
@@ -2140,21 +2676,34 @@ class LunaTwitchBot(commands.Bot):
         else:
             print("Assistant: ", end="", flush=True)
 
-        async with self._ollama_lock:
-            if stream_ws and not use_or_buffer:
-                reply = await self._ollama_stream_to_hub(
-                    channel_name,
-                    messages,
-                    assistant_display_name=assistant_user,
-                )
-            else:
-                reply = await asyncio.to_thread(
-                    chat_once,
-                    self._ollama,
-                    self._chat_model,
-                    messages,
-                    stream=False,
-                )
+        thinking_partner: str | None = None
+        if partner == "luna":
+            thinking_partner = "luna"
+        elif partner == "himari" and self._cast_scene.himari_in_scene:
+            thinking_partner = "himari"
+        elif partner == "viktor" and self._cast_scene.viktor_in_scene:
+            thinking_partner = "cohost"
+        if thinking_partner:
+            await self._broadcast_avatar_thinking(thinking_partner, True)
+        try:
+            async with self._ollama_lock:
+                if stream_ws and not use_or_buffer:
+                    reply = await self._ollama_stream_to_hub(
+                        channel_name,
+                        messages,
+                        assistant_display_name=assistant_user,
+                    )
+                else:
+                    reply = await asyncio.to_thread(
+                        chat_once,
+                        self._ollama,
+                        self._chat_model,
+                        messages,
+                        stream=False,
+                    )
+        finally:
+            if thinking_partner:
+                await self._broadcast_avatar_thinking(thinking_partner, False)
         reply_stripped = strip_think_blocks(reply).strip()
         self._last_assistant_reply = reply_stripped
         if self._memory_turns > 0:
@@ -2169,24 +2718,37 @@ class LunaTwitchBot(commands.Bot):
                 else:
                     self._append_memory("user", user_line)
             mem_assistant = (
-                f"[{cohost_name()}] {reply_stripped}" if as_cohost else reply_stripped
+                f"[{display_name}] {reply_stripped}" if as_cohost else reply_stripped
             )
             self._append_memory("assistant", mem_assistant)
-        self._cohost_dynamics.observe_exchange(
-            author=author,
-            source=source,
-            user_line=user_line,
-            assistant_line=reply_stripped,
-            speaker="cohost" if as_cohost else "luna",
-        )
-        if dynamics_enabled():
-            asyncio.create_task(
-                self._maybe_refresh_cohost_dynamics(),
-                name="cohost-dynamics-refresh",
+        if partner in ("viktor", "himari"):
+            self._cast_consciousness.observe_exchange(
+                partner,
+                user_line=user_line,
+                assistant_line=reply_stripped,
+                speaker="cohost" if as_cohost else "luna",
             )
+            if consciousness_enabled():
+                asyncio.create_task(
+                    self._maybe_refresh_cast_consciousness(partner),
+                    name="cast-consciousness-refresh",
+                )
+        if partner == "viktor":
+            self._cohost_dynamics.observe_exchange(
+                author=author,
+                source=source,
+                user_line=user_line,
+                assistant_line=reply_stripped,
+                speaker="cohost" if as_cohost else "luna",
+            )
+            if dynamics_enabled():
+                asyncio.create_task(
+                    self._maybe_refresh_cohost_dynamics(),
+                    name="cohost-dynamics-refresh",
+                )
         twitch_out = reply_stripped
         if as_cohost and _env_truthy("LUNA_COHOST_CHAT_TWITCH_PREFIX", default=True):
-            twitch_out = f"[{cohost_name()}] {reply_stripped}"
+            twitch_out = f"[{display_name}] {reply_stripped}"
 
         if send_to_twitch and self._send_replies:
             if is_twitch and chatter_profile is not None and not is_creator:
@@ -2201,25 +2763,28 @@ class LunaTwitchBot(commands.Bot):
                 if channel:
                     await channel.send(part[:500])
 
-        cohost_public_chat = as_cohost and is_public_chat
+        cohost_route_viewer = as_cohost and (is_public_chat or is_creator_panel)
         if self._chat_hub:
             ts = int(time.time() * 1000)
             if (
-                cohost_public_chat
+                cohost_route_viewer
                 and local_speak
                 and tts_enabled()
                 and tts_play_to_viewer()
             ):
-                await self._broadcast_cohost_chat_reply_viewer()
+                await self._broadcast_partner_chat_reply_viewer(partner)
             # Tell the viewer TTS is about to start *before* the assistant line so
             # the UI does not fire text-timed lip animation (luna-assistant-reply).
-            if local_speak and tts_enabled() and not as_cohost:
-                self._cancel_mic_ready_task()
+            if local_speak and tts_enabled():
+                if not as_cohost:
+                    self._cancel_mic_ready_task()
+                chat_avatar = viewer_avatar_id(partner) if as_cohost else "luna"
                 await self._chat_hub.broadcast(
                     {
                         "type": "control",
                         "name": "avatar_speaking",
                         "value": True,
+                        "avatar": chat_avatar,
                     }
                 )
                 self._avatar_speaking = True
@@ -2242,12 +2807,13 @@ class LunaTwitchBot(commands.Bot):
                             12_000,
                             max(1_800, int(len(reply_stripped) * 42)),
                         ),
+                        **({"avatar": viewer_avatar_id(partner)} if as_cohost else {}),
                     }
                 ),
             )
 
         if local_speak and tts_enabled():
-            from vampire_cohost import cohost_edge_voice
+            from luna_cast import partner_edge_voice
 
             loop = asyncio.get_running_loop()
             viewer_only = tts_play_to_viewer() and not tts_play_locally()
@@ -2263,6 +2829,8 @@ class LunaTwitchBot(commands.Bot):
                     "intensity": max(0.0, min(1.0, float(intensity))),
                     "hold_ms": max(40, min(400, int(hold_ms))),
                 }
+                if as_cohost:
+                    payload["avatar"] = viewer_avatar_id(partner)
                 try:
                     asyncio.run_coroutine_threadsafe(hub.broadcast(payload), loop)
                 except RuntimeError:
@@ -2271,7 +2839,7 @@ class LunaTwitchBot(commands.Bot):
             viewer_tts_played = False
             try:
                 if tts_play_to_viewer() and self._chat_hub:
-                    voice = cohost_edge_voice() if as_cohost else None
+                    voice = partner_edge_voice(partner) if as_cohost else None
                     bundle = await asyncio.to_thread(
                         synthesize_playback_bundle,
                         reply_stripped,
@@ -2280,36 +2848,43 @@ class LunaTwitchBot(commands.Bot):
                     if bundle is not None:
                         extra: dict = {}
                         if as_cohost:
-                            extra["avatar"] = "cohost"
-                            if cohost_public_chat:
+                            extra["avatar"] = viewer_avatar_id(partner)
+                            if cohost_route_viewer:
                                 extra["chat_reply"] = True
-                        viewer_tts_played = await self._emit_viewer_tts_and_wait(
+                        viewer_tts_played = await self._emit_viewer_tts(
                             bundle,
                             reply_text=reply_stripped,
                             extra=extra,
+                            block_until_done=block_viewer_tts,
                         )
                 if tts_play_locally():
                     await asyncio.to_thread(
                         maybe_speak,
                         reply_stripped,
                         viseme_cb=_emit_viseme,
-                        voice=cohost_edge_voice() if as_cohost else None,
+                        voice=partner_edge_voice(partner) if as_cohost else None,
                     )
             finally:
-                if viewer_tts_played:
+                if viewer_tts_played and not block_viewer_tts:
+                    # Creator panel/voice: audio plays in viewer; gate clears on viewer_tts_ended.
                     pass
-                elif not viewer_only and not as_cohost:
+                elif viewer_tts_played and block_viewer_tts:
+                    pass
+                elif not viewer_only:
                     self._avatar_speaking = False
                     self._last_avatar_speaking_end_ts = time.monotonic()
                     if self._chat_hub:
+                        end_avatar = viewer_avatar_id(partner) if as_cohost else "luna"
                         await self._chat_hub.broadcast(
                             {
                                 "type": "control",
                                 "name": "avatar_speaking",
                                 "value": False,
+                                "avatar": end_avatar,
                             }
                         )
-                        self._schedule_mic_ready_after_tts(self._chat_hub)
+                        if not as_cohost:
+                            self._schedule_mic_ready_after_tts(self._chat_hub)
         if update_auto_reply_cooldown and is_public_chat:
             self._last_auto_reply_ts = time.time()
         return reply_stripped
@@ -2590,6 +3165,7 @@ async def _run_async(
         async def _on_ws_join(ws: web.WebSocketResponse) -> None:
             await hub.send_to(ws, tts_voices_control_message())
             await hub.send_to(ws, _speaker_state_control_message())
+            await hub.send_to(ws, viewer_perf_control_message())
 
         runner, site = await start_chat_ws_server(
             hub, host=ws_host, port=ws_port, on_ws_join=_on_ws_join
@@ -2907,33 +3483,6 @@ async def _run_async(
                 await bot.ingest_viewer_screen_frame(raw_b64.strip())
                 return
 
-            if msg_type == "viewer_lol_refresh":
-                if not lol_context_enabled():
-                    await hub.broadcast(
-                        {
-                            "type": "status",
-                            "text": "League context off — set LUNA_LOL_CONTEXT=1 in .env.",
-                        },
-                    )
-                    return
-                snap = await asyncio.to_thread(build_lol_context_snapshot)
-                bot._lol_context_summary = (snap or "").strip()
-                if bot._lol_context_summary:
-                    await hub.broadcast(
-                        {
-                            "type": "status",
-                            "text": f"League context updated ({len(bot._lol_context_summary)} chars).",
-                        },
-                    )
-                else:
-                    await hub.broadcast(
-                        {
-                            "type": "status",
-                            "text": "League: open Riot Client / be in a match (lockfile not found).",
-                        },
-                    )
-                return
-
             if msg_type == "viewer_play":
                 query = str(payload.get("query") or payload.get("url") or "").strip()
                 if not query:
@@ -2947,18 +3496,37 @@ async def _run_async(
                 return
 
             if msg_type == "viewer_cohost_scene":
-                from luna_cohost_scene import save_cohost_in_scene
+                from luna_cast import load_cast_scene, partner_display_name, save_cast_scene
 
                 in_scene = payload.get("in_scene") is True
-                if in_scene:
-                    bot._viewer_cohost_in_scene = True
-                    save_cohost_in_scene(True)
+                partner = str(payload.get("partner") or "").strip().lower()
+                cast = payload.get("cast")
+                scene = load_cast_scene()
+                if isinstance(cast, dict):
+                    if "viktor" in cast:
+                        scene.viktor_in_scene = bool(cast.get("viktor"))
+                    if "himari" in cast:
+                        scene.himari_in_scene = bool(cast.get("himari"))
+                elif partner == "himari":
+                    scene.himari_in_scene = in_scene
+                elif partner == "viktor":
+                    scene.viktor_in_scene = in_scene
                 else:
+                    scene.viktor_in_scene = in_scene
+                    if not in_scene:
+                        scene.himari_in_scene = False
+                save_cast_scene(scene)
+                bot._sync_cast_scene_flags(scene)
+                if not scene.any_in_scene():
                     await bot.dismiss_cohost_from_viewer()
                 if hub is not None:
-                    label = "in scene" if bot._viewer_cohost_in_scene else "solo (Luna only)"
+                    on_stage = [
+                        partner_display_name(p)
+                        for p in scene.idle_partner_ids()
+                    ]
+                    label = ", ".join(on_stage) if on_stage else "solo (Luna only)"
                     await hub.broadcast(
-                        {"type": "status", "text": f"Co-host: {label}"},
+                        {"type": "status", "text": f"On stage: {label}"},
                     )
                 return
 
@@ -3053,28 +3621,82 @@ async def _run_async(
                 return
 
             if msg_type == "viewer_youtube_live_check":
-                if not youtube_live_chat_requested():
-                    await hub.broadcast(
-                        {
-                            "type": "status",
-                            "text": "YouTube Live chat off — set LUNA_YOUTUBE_LIVE_CHAT=1.",
-                        },
-                    )
-                    return
-                from live_social_share import probe_youtube_live
+                from live_social_share import probe_tiktok_live, probe_youtube_live
 
-                url = youtube_live_check_probe_url()
-                await hub.broadcast({"type": "status", "text": f"YouTube live: checking {url}…"})
-                item = await asyncio.to_thread(probe_youtube_live, url)
-                if not item:
+                async def _manual_youtube_live_check() -> None:
+                    if not youtube_live_chat_requested():
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "YouTube Live chat off — set LUNA_YOUTUBE_LIVE_CHAT=1.",
+                            },
+                        )
+                        return
+                    url = youtube_live_check_probe_url()
                     await hub.broadcast(
-                        {
-                            "type": "status",
-                            "text": "YouTube live: not detected on this channel (tap again after you go live).",
-                        },
+                        {"type": "status", "text": f"YouTube live: checking {url}…"}
                     )
-                    return
-                await _prompt_youtube_live_url(item, force=True)
+                    item = await asyncio.to_thread(probe_youtube_live, url)
+                    if not item:
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": (
+                                    "YouTube live: not detected on this channel "
+                                    "(tap again after you go live)."
+                                ),
+                            },
+                        )
+                        return
+                    await _prompt_youtube_live_url(item, force=True)
+
+                async def _manual_tiktok_live_check() -> None:
+                    if not tiktok_live_chat_requested():
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "TikTok Live chat off — set LUNA_TIKTOK_LIVE_CHAT=1.",
+                            },
+                        )
+                        return
+                    uid = tiktok_live_username()
+                    if not uid:
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "TikTok Live: set LUNA_TIKTOK_LIVE_USERNAME (e.g. @handle).",
+                            },
+                        )
+                        return
+                    if (
+                        tt_runner.is_running
+                        and tt_runner.active_username.lower() == uid.lower()
+                    ):
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": f"TikTok Live chat: already listening ({uid}).",
+                            },
+                        )
+                        return
+                    await hub.broadcast(
+                        {"type": "status", "text": f"TikTok live: checking {uid}…"}
+                    )
+                    tt_item = await probe_tiktok_live(uid)
+                    if not tt_item:
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": f"TikTok live: not detected for {uid} (tap again after you go live).",
+                            },
+                        )
+                        return
+                    await _on_tiktok_live_watch_detected(tt_item)
+
+                await asyncio.gather(
+                    _manual_youtube_live_check(),
+                    _manual_tiktok_live_check(),
+                )
                 return
 
             if msg_type == "viewer_social_share_video":
@@ -3199,6 +3821,7 @@ async def _run_async(
                         "ts": int(time.time() * 1000),
                     }
                 )
+                reply_to = str(payload.get("reply_to") or payload.get("target") or "").strip()
                 await bot._generate_and_dispatch_reply(
                     channel_name="panel",
                     author=creator,
@@ -3206,6 +3829,7 @@ async def _run_async(
                     send_to_twitch=False,
                     source="viewer panel",
                     from_creator=True,
+                    creator_reply_to=reply_to or None,
                 )
                 return
 
@@ -3238,6 +3862,73 @@ async def _run_async(
                         "name": "youtube_live_prompt",
                         "open": False,
                     }
+                )
+                return
+
+            if msg_type == "viewer_live_social_title":
+                title = str(payload.get("title") or "").strip()
+                platform = str(payload.get("platform") or "twitch").strip().lower()
+                sid = str(payload.get("stream_id") or "").strip()
+                url = str(payload.get("url") or "").strip()
+                if not title or not sid or not url:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": "Go-live post: enter a stream title.",
+                        },
+                    )
+                    return
+                st = live_social_load_state()
+
+                async def _social_send(post_title: str, stream_url: str, plat: str) -> None:
+                    await _social_playwright_live(post_title, stream_url, plat)
+
+                ok = await complete_live_social_share(
+                    platform=platform,
+                    stream_id=sid,
+                    title=title,
+                    url=url,
+                    state=st,
+                    social_share_send=_social_send,
+                    broadcast_status=_hub_status,
+                )
+                await hub.broadcast(
+                    {
+                        "type": "control",
+                        "name": "live_social_title_prompt",
+                        "open": False,
+                    }
+                )
+                if ok:
+                    await hub.broadcast(
+                        {
+                            "type": "status",
+                            "text": f"Posted to X & Facebook: {title}",
+                        },
+                    )
+                return
+
+            if msg_type == "viewer_live_social_title_dismiss":
+                platform = str(payload.get("platform") or "twitch").strip().lower()
+                sid = str(payload.get("stream_id") or "").strip()
+                if sid:
+                    skip_live_social_share(
+                        platform=platform,
+                        stream_id=sid,
+                        state=live_social_load_state(),
+                    )
+                await hub.broadcast(
+                    {
+                        "type": "control",
+                        "name": "live_social_title_prompt",
+                        "open": False,
+                    },
+                )
+                await hub.broadcast(
+                    {
+                        "type": "status",
+                        "text": "Skipped X/Facebook go-live post.",
+                    },
                 )
                 return
 
@@ -3315,6 +4006,9 @@ async def _run_async(
                             "ts": int(time.time() * 1000),
                         }
                     )
+                    reply_to = str(
+                        payload.get("reply_to") or payload.get("target") or ""
+                    ).strip()
                     await bot._generate_and_dispatch_reply(
                         channel_name="panel",
                         author=creator,
@@ -3322,6 +4016,7 @@ async def _run_async(
                         send_to_twitch=False,
                         source="viewer voice",
                         from_creator=True,
+                        creator_reply_to=reply_to or None,
                     )
                 except Exception as exc:
                     print(f"(viewer_voice) error: {exc}", flush=True)
@@ -3339,7 +4034,6 @@ async def _run_async(
     yt_watch_task: asyncio.Task | None = None
     tt_watch_task: asyncio.Task | None = None
     tt_task: asyncio.Task | None = None
-    lol_task: asyncio.Task | None = None
     live_social_task: asyncio.Task | None = None
     cohost_task: asyncio.Task | None = None
     if hub is not None:
@@ -3388,8 +4082,15 @@ async def _run_async(
             except Exception as exc:
                 print(f"(social playwright) share failed: {exc}", flush=True)
 
-        async def _social_playwright_live(title: str, stream_url: str) -> None:
-            await _social_playwright_upload(title, stream_url)
+        async def _social_playwright_live(title: str, stream_url: str, platform: str) -> None:
+            try:
+                await share_live_stream(
+                    platform=platform,
+                    title=title,
+                    stream_url=stream_url,
+                )
+            except Exception as exc:
+                print(f"(social playwright) live share failed: {exc}", flush=True)
 
         if observe_feed_enabled():
             d_send = (
@@ -3458,10 +4159,10 @@ async def _run_async(
 
         if live_watch_enabled():
 
-            async def _live_social_share_send(title: str, url: str) -> None:
-                await _social_playwright_live(title, url)
+            async def _live_social_share_send(title: str, url: str, platform: str) -> None:
+                await _social_playwright_live(title, url, platform)
 
-            async def _discord_twitch_live_announce(text: str) -> None:
+            async def _discord_live_announce(text: str, platform: str, image_path: str) -> None:
                 if discord_bot_obj is None:
                     return
                 dbot = discord_bot_obj.bot
@@ -3470,14 +4171,27 @@ async def _run_async(
                 except Exception as exc:
                     print(f"(discord live) wait_until_ready failed: {exc}", flush=True)
                     return
-                n = await discord_bot_obj.announce_live_all_guilds(text)
-                await _hub_status(f"Discord live announce: posted to {n} server(s).")
+                img = image_path.strip() or None
+                ch_ids = live_discord_channel_ids()
+                if ch_ids:
+                    n = await discord_bot_obj.announce_live_to_channel_ids(
+                        text, ch_ids, image_path=img
+                    )
+                    await _hub_status(
+                        f"Discord live announce ({platform}): posted to {n} channel(s)."
+                    )
+                else:
+                    n = await discord_bot_obj.announce_live_all_guilds(text, image_path=img)
+                    await _hub_status(
+                        f"Discord live announce ({platform}): posted to {n} server(s)."
+                    )
 
             live_social_task = asyncio.create_task(
                 run_live_social_poller(
                     social_share_send=_live_social_share_send,
-                    discord_live_send=_discord_twitch_live_announce,
+                    discord_live_send=_discord_live_announce,
                     broadcast_status=_hub_status,
+                    request_social_title_prompt=bot._prompt_live_social_title,
                     twitch_bot=bot,
                     twitch_login=channel,
                 ),
@@ -3488,21 +4202,6 @@ async def _run_async(
             cohost_task = asyncio.create_task(
                 run_cohost_banter_loop(bot),
                 name="luna-cohost-banter",
-            )
-
-        async def _on_lol_context_update(snap: str) -> None:
-            bot._lol_context_summary = (snap or "").strip()
-            if snap:
-                print(f"(lol) context updated ({len(snap)} chars)", flush=True)
-
-        if lol_context_enabled():
-            maybe_launch_riot_clients()
-            lol_task = asyncio.create_task(
-                run_lol_context_poller(
-                    _on_lol_context_update,
-                    broadcast_status=_hub_status,
-                ),
-                name="luna-lol-context",
             )
 
     try:
@@ -3544,12 +4243,6 @@ async def _run_async(
             cohost_task.cancel()
             try:
                 await cohost_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if lol_task is not None:
-            lol_task.cancel()
-            try:
-                await lol_task
             except (asyncio.CancelledError, Exception):
                 pass
         if discord_bot_obj is not None:
@@ -3623,7 +4316,7 @@ def main() -> None:
     auto_trigger = os.environ.get("TWITCH_AUTO_TRIGGER", "all").strip().lower()
     if auto_trigger not in {"mention", "all"}:
         auto_trigger = "all"
-    auto_cooldown_sec = float(os.environ.get("TWITCH_AUTO_COOLDOWN", "6").strip() or "6")
+    auto_cooldown_sec = public_chat_cooldown_sec()
 
     chat_model = resolve_chat_model()
     provider = llm_provider()
@@ -3641,6 +4334,8 @@ def main() -> None:
         f"Starting Twitch bot | channel #{channel} | "
         f"{llm_line} | "
         f"send_replies={send_replies} | auto_reply={auto_reply} ({auto_trigger}) | "
+        f"public_chat_cooldown twitch={auto_cooldown_sec}s "
+        f"youtube={youtube_live_cooldown_sec()}s tiktok={tiktok_live_cooldown_sec()}s | "
         f"LUNA_TTS={tts_enabled()} | LUNA_TTS_PLAY={tts_playback_enabled()} | "
         f"LUNA_TTS_PLAY_TARGET={tts_play_target()}",
         flush=True,

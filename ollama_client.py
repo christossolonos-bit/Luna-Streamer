@@ -669,9 +669,12 @@ def summarize_viewer_screen(client: Client | OpenRouterChatClient, model: str, i
             "stream": False,
             "options": opts,
         }
+        ka_screen = _screen_keep_alive()
+        if ka_screen is not None:
+            kwargs["keep_alive"] = ka_screen
         response = client.chat(**kwargs)
         return (response.message.content or "").strip()
-    ka = ollama_keep_alive()
+    ka = _screen_keep_alive()
     opts = build_ollama_options(for_screen=True)
     think = ollama_think_mode()
     final_messages = base_messages
@@ -690,6 +693,15 @@ def summarize_viewer_screen(client: Client | OpenRouterChatClient, model: str, i
         kwargs["think"] = think
     response = client.chat(**kwargs)
     return (response.message.content or "").strip()
+
+
+def _screen_keep_alive() -> float | str | int | None:
+    try:
+        from luna_perf import screen_ollama_keep_alive
+
+        return screen_ollama_keep_alive()
+    except ImportError:
+        return ollama_keep_alive()
 
 
 def describe_youtube_video(

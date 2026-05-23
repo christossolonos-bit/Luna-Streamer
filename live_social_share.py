@@ -19,9 +19,10 @@ from youtube_feed import (
 from tiktok_live_chat import tiktok_live_username
 from youtube_live_chat import youtube_live_check_probe_url, youtube_live_video_id
 
-SocialShareSend = Callable[[str, str], Awaitable[None]]
+SocialShareSend = Callable[[str, str, str], Awaitable[None]]  # title, url, platform
 BroadcastStatus = Callable[[str], Awaitable[None]]
-DiscordLiveSend = Callable[[str], Awaitable[None]]
+DiscordLiveSend = Callable[[str, str, str], Awaitable[None]]  # message, platform, image_path
+LiveSocialTitlePrompt = Callable[[dict[str, str]], Awaitable[None]]
 
 
 def _env_truthy(key: str, *, default: bool = False) -> bool:
@@ -31,25 +32,44 @@ def _env_truthy(key: str, *, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def live_announce_master_enabled() -> bool:
+    """Master switch: watch Twitch / YouTube / TikTok for go-live (``LUNA_LIVE_ANNOUNCE``)."""
+    return _env_truthy("LUNA_LIVE_ANNOUNCE", default=False)
+
+
 def live_social_share_enabled() -> bool:
     from social_playwright_share import social_playwright_configured
 
+    if live_announce_master_enabled():
+        return social_playwright_configured() and _env_truthy(
+            "LUNA_LIVE_SOCIAL", default=True
+        )
     return social_playwright_configured() and _env_truthy("LUNA_SOCIAL_LIVE_SHARE", default=False)
 
 
 def twitch_live_announce_enabled() -> bool:
-    return _env_truthy("LUNA_TWITCH_LIVE_ANNOUNCE", default=False)
+    return live_announce_master_enabled() or _env_truthy("LUNA_TWITCH_LIVE_ANNOUNCE", default=False)
+
+
+def live_discord_enabled() -> bool:
+    if not twitch_live_announce_enabled() and not live_social_share_enabled():
+        return False
+    if live_announce_master_enabled():
+        return _env_truthy("LUNA_LIVE_DISCORD", default=True)
+    if _env_truthy("LUNA_TWITCH_LIVE_ANNOUNCE", default=False):
+        return _env_truthy("LUNA_TWITCH_LIVE_DISCORD", default=True)
+    return _env_truthy("LUNA_SOCIAL_LIVE_DISCORD", default=True)
 
 
 def twitch_live_discord_enabled() -> bool:
-    if not twitch_live_announce_enabled():
-        return False
-    return _env_truthy("LUNA_TWITCH_LIVE_DISCORD", default=True)
+    return live_discord_enabled()
 
 
 def twitch_live_social_enabled() -> bool:
     if not twitch_live_announce_enabled():
         return False
+    if live_announce_master_enabled():
+        return live_social_share_enabled()
     if not _env_truthy("LUNA_TWITCH_LIVE_SOCIAL", default=True):
         return False
     from social_playwright_share import social_playwright_configured
@@ -59,6 +79,53 @@ def twitch_live_social_enabled() -> bool:
 
 def live_watch_enabled() -> bool:
     return live_social_share_enabled() or twitch_live_announce_enabled()
+
+
+def live_announce_image_path() -> Path | None:
+    raw = (os.environ.get("LUNA_LIVE_ANNOUNCE_IMAGE") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_file():
+        return p
+    print(f"(live announce) image not found: {p}", flush=True)
+    return None
+
+
+def live_ask_social_title_enabled() -> bool:
+    """If true, X/Facebook wait for streamer title in the viewer before posting."""
+    return _env_truthy("LUNA_LIVE_ASK_SOCIAL_TITLE", default=True)
+
+
+def _platform_state_key(platform: str) -> str:
+    p = (platform or "").strip().lower()
+    if p == "youtube":
+        return "youtube"
+    if p == "tiktok":
+        return "tiktok"
+    return "twitch"
+
+
+def live_discord_channel_ids() -> list[int]:
+    """Optional fixed channel list (comma-separated). Falls back to all guilds when empty."""
+    raw = (
+        os.environ.get("LUNA_LIVE_DISCORD_CHANNEL_IDS")
+        or os.environ.get("LUNA_PUBLISH_ANNOUNCE_DISCORD_CHANNEL_IDS")
+        or os.environ.get("DISCORD_LIVE_ANNOUNCE_CHANNEL_ID")
+        or ""
+    ).strip()
+    if not raw:
+        return []
+    out: list[int] = []
+    for part in re.split(r"[\s,]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out
 
 
 def live_social_poll_sec() -> float:
@@ -281,24 +348,160 @@ def _live_post_title(platform: str, title: str) -> str:
     return title
 
 
-def format_twitch_live_discord_message(title: str, url: str) -> str:
+def _platform_display(platform: str) -> str:
+    p = (platform or "").strip().lower()
+    return {"twitch": "Twitch", "youtube": "YouTube", "tiktok": "TikTok"}.get(p, p.title() or "Live")
+
+
+def format_live_discord_message(platform: str, title: str, url: str) -> str:
+    plat = _platform_display(platform)
     tmpl = (
-        os.environ.get("LUNA_TWITCH_LIVE_DISCORD_MESSAGE")
-        or "🔴 **Live now on Twitch!**\n{title}\n\nJoin here: {url}"
+        os.environ.get("LUNA_LIVE_DISCORD_MESSAGE")
+        or os.environ.get("LUNA_TWITCH_LIVE_DISCORD_MESSAGE")
+        or "🔴 **We're live on {platform}!**\n{title}\n\nCome hang out — Luna & Viktor are on stage 💫\n{url}"
     ).strip()
-    return tmpl.replace("{title}", title).replace("{url}", url)
+    return (
+        tmpl.replace("{platform}", plat)
+        .replace("{title}", title)
+        .replace("{url}", url)
+    )
+
+
+def format_twitch_live_discord_message(title: str, url: str) -> str:
+    return format_live_discord_message("twitch", title, url)
 
 
 def _should_social_share(platform: str) -> bool:
     if platform == "twitch":
         return live_social_share_enabled() or twitch_live_social_enabled()
-    if platform == "tiktok":
-        return live_social_share_enabled()
     return live_social_share_enabled()
 
 
 def _should_discord_announce(platform: str) -> bool:
-    return platform == "twitch" and twitch_live_discord_enabled()
+    return live_discord_enabled()
+
+
+def _announced_ids(state: dict[str, Any], bucket: str, platform: str) -> list[str]:
+    root = state.setdefault(bucket, {})
+    if not isinstance(root, dict):
+        root = {}
+        state[bucket] = root
+    return list(root.get(_platform_state_key(platform)) or [])
+
+
+def _mark_announced(state: dict[str, Any], bucket: str, platform: str, sid: str) -> None:
+    root = state.setdefault(bucket, {})
+    if not isinstance(root, dict):
+        root = {}
+        state[bucket] = root
+    key = _platform_state_key(platform)
+    ids: list[str] = list(root.get(key) or [])
+    if sid not in ids:
+        ids.append(sid)
+    root[key] = ids[-40:]
+    state[bucket] = root
+
+
+def _legacy_announced_ids(state: dict[str, Any], platform: str) -> list[str]:
+    announced = state.setdefault("announced", {})
+    if not isinstance(announced, dict):
+        announced = {}
+        state["announced"] = announced
+    return list(announced.get(_platform_state_key(platform)) or [])
+
+
+def _mark_legacy_announced(state: dict[str, Any], platform: str, sid: str) -> None:
+    sid = (sid or "").strip()
+    if not sid:
+        return
+    announced = state.setdefault("announced", {})
+    if not isinstance(announced, dict):
+        announced = {}
+        state["announced"] = announced
+    key = _platform_state_key(platform)
+    ids: list[str] = list(announced.get(key) or [])
+    if sid not in ids:
+        ids.append(sid)
+    announced[key] = ids[-40:]
+    state["announced"] = announced
+
+
+def _live_session_handled(state: dict[str, Any], platform: str, sid: str) -> bool:
+    """True when this stream id was already logged or announced (any channel)."""
+    sid = (sid or "").strip()
+    if not sid:
+        return True
+    key = _platform_state_key(platform)
+    if sid in _legacy_announced_ids(state, key):
+        return True
+    if sid in _announced_ids(state, "announced_discord", key):
+        return True
+    if sid in _announced_ids(state, "announced_social", key):
+        return True
+    pending = state.get("pending_social")
+    if isinstance(pending, dict):
+        entry = pending.get(key)
+        if isinstance(entry, dict) and str(entry.get("id") or "") == sid:
+            return True
+    return False
+
+
+def skip_live_social_share(
+    *,
+    platform: str,
+    stream_id: str,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """Mark social go-live as handled without posting (streamer dismissed the title prompt)."""
+    sid = (stream_id or "").strip()
+    plat = _platform_state_key(platform)
+    if not sid:
+        return
+    st = state if state is not None else _load_state()
+    _mark_announced(st, "announced_social", plat, sid)
+    pending = st.get("pending_social")
+    if isinstance(pending, dict):
+        pending.pop(plat, None)
+        st["pending_social"] = pending
+    _save_state(st)
+
+
+async def complete_live_social_share(
+    *,
+    platform: str,
+    stream_id: str,
+    title: str,
+    url: str,
+    state: dict[str, Any] | None = None,
+    social_share_send: SocialShareSend | None,
+    broadcast_status: BroadcastStatus | None,
+) -> bool:
+    """Post X/Facebook after the streamer confirms the stream title in the viewer."""
+    sid = (stream_id or "").strip()
+    url = (url or "").strip()
+    title = (title or "").strip() or "Live stream"
+    plat = _platform_state_key(platform)
+    if not sid or not url or social_share_send is None:
+        return False
+    st = state if state is not None else _load_state()
+    if sid in _announced_ids(st, "announced_social", plat):
+        return True
+    line = f"Social share ({plat}): {title} — {url}"
+    print(f"(live announce) {line}", flush=True)
+    if broadcast_status:
+        await broadcast_status(f"Posting to X & Facebook: {title}")
+    try:
+        await social_share_send(title, url, plat)
+    except Exception as exc:
+        print(f"(live announce) social share failed: {exc}", flush=True)
+        return False
+    _mark_announced(st, "announced_social", plat, sid)
+    pending = st.get("pending_social")
+    if isinstance(pending, dict):
+        pending.pop(plat, None)
+        st["pending_social"] = pending
+    _save_state(st)
+    return True
 
 
 async def _announce_live(
@@ -308,6 +511,7 @@ async def _announce_live(
     social_share_send: SocialShareSend | None,
     discord_live_send: DiscordLiveSend | None,
     broadcast_status: BroadcastStatus | None,
+    request_social_title_prompt: LiveSocialTitlePrompt | None = None,
 ) -> None:
     platform = item.get("platform") or "live"
     sid = item.get("id") or ""
@@ -316,16 +520,12 @@ async def _announce_live(
     if not sid or not url:
         return
 
-    announced: dict[str, list[str]] = state.setdefault("announced", {})
-    if platform == "youtube":
-        key = "youtube"
-    elif platform == "tiktok":
-        key = "tiktok"
-    else:
-        key = "twitch"
-    ids: list[str] = list(announced.get(key) or [])
-    if sid in ids:
+    key = _platform_state_key(platform)
+    if _live_session_handled(state, platform, sid):
         return
+
+    _mark_legacy_announced(state, platform, sid)
+    _save_state(state)
 
     post_title = _live_post_title(platform, title)
     line = f"Going live on {platform}: {title} — {url}"
@@ -333,21 +533,58 @@ async def _announce_live(
     if broadcast_status:
         await broadcast_status(line)
 
+    img = live_announce_image_path()
+    img_str = str(img) if img else ""
+
     if _should_discord_announce(platform) and discord_live_send is not None:
-        try:
-            await discord_live_send(format_twitch_live_discord_message(title, url))
-        except Exception as exc:
-            print(f"(live announce) Discord failed: {exc}", flush=True)
+        if sid not in _announced_ids(state, "announced_discord", key):
+            try:
+                await discord_live_send(
+                    format_live_discord_message(platform, title, url),
+                    platform,
+                    img_str,
+                )
+            except Exception as exc:
+                print(f"(live announce) Discord failed: {exc}", flush=True)
+            _mark_announced(state, "announced_discord", key, sid)
 
-    if _should_social_share(platform) and social_share_send is not None:
-        try:
-            await social_share_send(post_title, url)
-        except Exception as exc:
-            print(f"(live announce) social share failed: {exc}", flush=True)
+    want_social = _should_social_share(platform) and social_share_send is not None
+    if want_social and sid not in _announced_ids(state, "announced_social", key):
+        if live_ask_social_title_enabled() and request_social_title_prompt is not None:
+            pending = state.setdefault("pending_social", {})
+            if not isinstance(pending, dict):
+                pending = {}
+                state["pending_social"] = pending
+            pending[key] = {
+                "id": sid,
+                "url": url,
+                "suggested_title": title,
+                "platform": platform,
+            }
+            _save_state(state)
+            try:
+                await request_social_title_prompt(
+                    {
+                        "platform": platform,
+                        "stream_id": sid,
+                        "url": url,
+                        "suggested_title": title,
+                    }
+                )
+            except Exception as exc:
+                print(f"(live announce) title prompt failed: {exc}", flush=True)
+            if broadcast_status:
+                await broadcast_status(
+                    f"Go-live on {platform}: enter stream title in the viewer for X & Facebook."
+                )
+        else:
+            try:
+                await social_share_send(post_title, url, platform)
+            except Exception as exc:
+                print(f"(live announce) social share failed: {exc}", flush=True)
+            _mark_announced(state, "announced_social", key, sid)
 
-    ids.append(sid)
-    announced[key] = ids[-40:]
-    state["announced"] = announced
+    _mark_legacy_announced(state, platform, sid)
     _save_state(state)
 
 
@@ -356,6 +593,7 @@ async def run_live_social_poller(
     social_share_send: SocialShareSend | None,
     discord_live_send: DiscordLiveSend | None = None,
     broadcast_status: BroadcastStatus | None,
+    request_social_title_prompt: LiveSocialTitlePrompt | None = None,
     twitch_bot: object | None = None,
     twitch_login: str = "",
 ) -> None:
@@ -390,8 +628,11 @@ async def run_live_social_poller(
     if watch_twitch:
         parts.append(f"Twitch #{twitch_login}")
     actions = []
-    if twitch_live_discord_enabled():
-        actions.append("Discord (all servers)")
+    if live_discord_enabled():
+        ch_ids = live_discord_channel_ids()
+        actions.append(
+            f"Discord ({len(ch_ids)} channel(s))" if ch_ids else "Discord (all servers)"
+        )
     if live_social_share_enabled() or twitch_live_social_enabled():
         actions.append("X/Facebook")
     action_txt = " + ".join(actions) if actions else "status only"
@@ -413,6 +654,7 @@ async def run_live_social_poller(
                         social_share_send=social_share_send,
                         discord_live_send=discord_live_send,
                         broadcast_status=broadcast_status,
+                        request_social_title_prompt=request_social_title_prompt,
                     )
 
             if twitch_bot is not None and watch_twitch:
@@ -424,6 +666,7 @@ async def run_live_social_poller(
                         social_share_send=social_share_send,
                         discord_live_send=discord_live_send,
                         broadcast_status=broadcast_status,
+                        request_social_title_prompt=request_social_title_prompt,
                     )
 
             if tiktok_uid:
@@ -435,6 +678,7 @@ async def run_live_social_poller(
                         social_share_send=social_share_send,
                         discord_live_send=discord_live_send,
                         broadcast_status=broadcast_status,
+                        request_social_title_prompt=request_social_title_prompt,
                     )
         except asyncio.CancelledError:
             raise

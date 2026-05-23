@@ -276,6 +276,10 @@
   background: rgba(255, 60, 60, 0.1);
 }
 
+.dock-btn--himari.dock-btn--active {
+  box-shadow: 0 0 0 2px rgba(255, 182, 193, 0.55);
+}
+
 .dock-btn--cohost-opts.dock-btn--active,
 .dock-cohost-cluster--open .dock-btn--cohost-opts {
   color: #c9a0ff;
@@ -896,6 +900,31 @@
 .chat-assistant-body {
   color: #c8eef5;
   white-space: pre-wrap;
+}
+
+.chat-reply-targets {
+  display: flex;
+  gap: 0.35rem;
+  padding: 0.35rem 0.6rem 0;
+  flex-shrink: 0;
+}
+
+.chat-reply-target {
+  flex: 1;
+  font-family: inherit;
+  font-size: 0.58rem;
+  padding: 0.28rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid rgba(0, 240, 255, 0.2);
+  background: rgba(0, 8, 14, 0.55);
+  color: #8ab4bc;
+  cursor: pointer;
+}
+
+.chat-reply-target--active {
+  border-color: #00f0ff;
+  color: #e8fbff;
+  background: rgba(0, 240, 255, 0.12);
 }
 
 .chat-input-row {

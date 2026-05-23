@@ -149,11 +149,15 @@ export function CohostSummonIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
-/** Small chevron — co-host dock opens a panel upward. */
-export function CohostOptionsIcon(props: SVGProps<SVGSVGElement>) {
+/** Shrine maiden co-host (Himari) — torii + figure. */
+export function HimariSummonIcon(props: SVGProps<SVGSVGElement>) {
   return (
-    <svg {...base} width={14} height={14} {...props}>
-      <polyline points="18 15 12 9 6 15" />
+    <svg {...base} {...props}>
+      <path d="M6 8V6h12v2" />
+      <path d="M4 8h16" />
+      <path d="M12 8v3" />
+      <circle cx="12" cy="14" r="2.2" />
+      <path d="M8.5 20v-1.8a3.5 3.5 0 0 1 7 0V20" />
     </svg>
   );
 }

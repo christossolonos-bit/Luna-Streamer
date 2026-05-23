@@ -63,11 +63,21 @@ def _viewer_page_url(
     cohost_vrm_file: Path | None = None,
     cohost_display_name: str | None = None,
     cohost_idle_skip_sec: float | None = None,
+    cohost_thinking_motion_file: Path | None = None,
+    himari_vrm_file: Path | None = None,
+    himari_display_name: str | None = None,
+    himari_idle_motion_files: list[Path] | None = None,
+    himari_thinking_motion_file: Path | None = None,
+    himari_idle_skip_sec: float | None = None,
+    luna_idle_skip_sec: float | None = None,
+    luna_thinking_motion_file: Path | None = None,
 ) -> str:
     fs_url = _to_vite_fs_url(vrm_file)
     payload: list[tuple[str, str]] = [("vrm", fs_url)]
     for motion in idle_motion_files:
         payload.append(("idle", _to_vite_fs_url(motion)))
+    if luna_thinking_motion_file is not None and luna_thinking_motion_file.is_file():
+        payload.append(("luna_thinking", _to_vite_fs_url(luna_thinking_motion_file)))
     for motion in cohost_idle_motion_files or []:
         payload.append(("cohost_idle", _to_vite_fs_url(motion)))
     if cohost_vrm_file is not None and cohost_vrm_file.is_file():
@@ -76,6 +86,20 @@ def _viewer_page_url(
         payload.append(("cohost_name", cohost_display_name.strip()))
     if cohost_idle_skip_sec is not None and cohost_idle_skip_sec > 0:
         payload.append(("cohost_idle_skip_sec", str(cohost_idle_skip_sec)))
+    if cohost_thinking_motion_file is not None and cohost_thinking_motion_file.is_file():
+        payload.append(("cohost_thinking", _to_vite_fs_url(cohost_thinking_motion_file)))
+    if himari_vrm_file is not None and himari_vrm_file.is_file():
+        payload.append(("himari_vrm", _to_vite_fs_url(himari_vrm_file)))
+    if himari_display_name:
+        payload.append(("himari_name", himari_display_name.strip()))
+    for motion in himari_idle_motion_files or []:
+        payload.append(("himari_idle", _to_vite_fs_url(motion)))
+    if himari_thinking_motion_file is not None and himari_thinking_motion_file.is_file():
+        payload.append(("himari_thinking", _to_vite_fs_url(himari_thinking_motion_file)))
+    if himari_idle_skip_sec is not None and himari_idle_skip_sec > 0:
+        payload.append(("himari_idle_skip_sec", str(himari_idle_skip_sec)))
+    if luna_idle_skip_sec is not None and luna_idle_skip_sec > 0:
+        payload.append(("luna_idle_skip_sec", str(luna_idle_skip_sec)))
     if chat_ws:
         payload.append(("chat_ws", chat_ws))
     query = urllib.parse.urlencode(payload, doseq=True)
@@ -260,17 +284,43 @@ def main() -> None:
 
     print(f"Viewer dir: {viewer_dir}")
     print(f"Default VRM: {vrm_file}")
+    luna_thinking_motion_file: Path | None = None
     if expressions_dir.is_dir():
-        idle_motion_files = sorted(expressions_dir.glob("**/*.vrma"))
+        luna_thinking_motion_file = expressions_dir / "thinking.vrma"
+        if not luna_thinking_motion_file.is_file():
+            luna_thinking_motion_file = None
+        idle_motion_files = sorted(
+            p
+            for p in expressions_dir.glob("**/*.vrma")
+            if p.name.lower() != "thinking.vrma"
+        )
     else:
         idle_motion_files = []
-    print(f"Idle motions found: {len(idle_motion_files)} in {expressions_dir}")
+    think_note = (
+        f", thinking={luna_thinking_motion_file.name}"
+        if luna_thinking_motion_file
+        else ""
+    )
+    print(f"Idle motions found: {len(idle_motion_files)} in {expressions_dir}{think_note}")
+    cohost_thinking_motion_file: Path | None = None
     if cohost_expressions_dir.is_dir():
-        cohost_idle_motion_files = sorted(cohost_expressions_dir.glob("**/*.vrma"))
+        cohost_thinking_motion_file = cohost_expressions_dir / "thinking.vrma"
+        if not cohost_thinking_motion_file.is_file():
+            cohost_thinking_motion_file = None
+        cohost_idle_motion_files = sorted(
+            p
+            for p in cohost_expressions_dir.glob("**/*.vrma")
+            if p.name.lower() != "thinking.vrma"
+        )
     else:
         cohost_idle_motion_files = []
+    cohost_think_note = (
+        f", thinking={cohost_thinking_motion_file.name}"
+        if cohost_thinking_motion_file
+        else ""
+    )
     print(
-        f"Co-host idle motions: {len(cohost_idle_motion_files)} in {cohost_expressions_dir}",
+        f"Co-host idle motions: {len(cohost_idle_motion_files)} in {cohost_expressions_dir}{cohost_think_note}",
     )
 
     viewer_server: http.server.ThreadingHTTPServer | None = None
@@ -291,6 +341,8 @@ def main() -> None:
     )
     cohost_vrm: Path | None = None
     cohost_name: str | None = None
+    himari_vrm: Path | None = None
+    himari_name: str | None = None
     try:
         from vampire_cohost import cohost_name as _cohost_name
         from vampire_cohost import cohost_vrm_path
@@ -305,12 +357,52 @@ def main() -> None:
     except Exception:
         cohost_vrm = None
         cohost_name = None
-
-    _cohost_skip_raw = (os.environ.get("LUNA_COHOST_IDLE_SKIP_SEC") or "2").strip() or "2"
+    himari_idle_motion_files: list[Path] = []
+    himari_thinking_motion_file: Path | None = None
     try:
-        cohost_idle_skip_sec = max(0.0, float(_cohost_skip_raw))
+        from himari_cohost import (
+            himari_enabled,
+            himari_idle_vrma_paths,
+            himari_name as _himari_name,
+            himari_thinking_vrma_path,
+            himari_vrm_path,
+        )
+
+        if himari_enabled():
+            himari_name = _himari_name()
+            hp = himari_vrm_path()
+            if hp.is_file():
+                himari_vrm = hp
+                print(
+                    f"Himari VRM (summon from viewer dock): {himari_vrm} ({himari_name})"
+                )
+            from himari_cohost import himari_expressions_dir
+
+            himari_idle_motion_files = himari_idle_vrma_paths()
+            himari_thinking_motion_file = himari_thinking_vrma_path()
+            if himari_idle_motion_files or himari_thinking_motion_file:
+                print(
+                    f"Himari expressions: {len(himari_idle_motion_files)} idle in "
+                    f"{himari_expressions_dir()}"
+                    + (
+                        f", thinking={himari_thinking_motion_file.name}"
+                        if himari_thinking_motion_file
+                        else ""
+                    ),
+                )
+    except Exception:
+        himari_vrm = None
+        himari_name = None
+        himari_idle_motion_files = []
+        himari_thinking_motion_file = None
+
+    _idle_skip_raw = (os.environ.get("LUNA_IDLE_SKIP_SEC") or "").strip()
+    if not _idle_skip_raw:
+        _idle_skip_raw = (os.environ.get("LUNA_COHOST_IDLE_SKIP_SEC") or "2").strip() or "2"
+    try:
+        idle_skip_sec = max(0.0, float(_idle_skip_raw))
     except ValueError:
-        cohost_idle_skip_sec = 2.0
+        idle_skip_sec = 2.0
 
     page_url = _viewer_page_url(
         active_port,
@@ -320,7 +412,15 @@ def main() -> None:
         chat_ws=chat_ws_url,
         cohost_vrm_file=cohost_vrm,
         cohost_display_name=cohost_name,
-        cohost_idle_skip_sec=cohost_idle_skip_sec,
+        cohost_idle_skip_sec=idle_skip_sec,
+        cohost_thinking_motion_file=cohost_thinking_motion_file,
+        himari_vrm_file=himari_vrm,
+        himari_display_name=himari_name,
+        himari_idle_motion_files=himari_idle_motion_files,
+        himari_thinking_motion_file=himari_thinking_motion_file,
+        himari_idle_skip_sec=idle_skip_sec,
+        luna_idle_skip_sec=idle_skip_sec,
+        luna_thinking_motion_file=luna_thinking_motion_file,
     )
     if viewer_already_running:
         print(f"Viewer already running at {base_url}")

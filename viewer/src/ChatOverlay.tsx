@@ -73,6 +73,8 @@ export function ChatOverlay({ onClose }: Props) {
   const {
     lines,
     conn,
+    replyTo,
+    setReplyTo,
     sendPrompt,
     sendPlayRequest,
     sendYouTubeSummary,
@@ -364,12 +366,37 @@ export function ChatOverlay({ onClose }: Props) {
             <div ref={endRef} />
           </div>
 
+          <div className="chat-reply-targets" role="group" aria-label="Who to talk to">
+            {(
+              [
+                ["luna", "Luna"],
+                ["himari", "Himari"],
+                ["cohost", "Viktor"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className={`chat-reply-target${replyTo === id ? " chat-reply-target--active" : ""}`}
+                onClick={() => setReplyTo(id)}
+                aria-pressed={replyTo === id}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <form className="chat-input-row" onSubmit={submit}>
             <input
               className="chat-input"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Talk to Luna…"
+              placeholder={
+                replyTo === "himari"
+                  ? "Talk to Himari…"
+                  : replyTo === "cohost"
+                    ? "Talk to Viktor…"
+                    : "Talk to Luna…"
+              }
               autoComplete="off"
             />
             <button

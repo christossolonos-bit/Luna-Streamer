@@ -1,4 +1,8 @@
-"""YouTube Live chat reader for Luna (pytchat). Incoming chat only — replies stay in the viewer."""
+"""YouTube Live chat reader for Luna (pytchat). Incoming chat only — replies stay in the viewer.
+
+Reply spacing uses ``LUNA_YOUTUBE_LIVE_COOLDOWN_SEC`` or ``LUNA_PUBLIC_CHAT_COOLDOWN_SEC`` (see
+``luna_public_chat_cooldown``), shared with Twitch/TikTok so rapid viewer chat does not stack.
+"""
 
 from __future__ import annotations
 

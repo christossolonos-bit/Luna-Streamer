@@ -13,6 +13,7 @@ Discord commands (in any text channel the bot can read):
   !stop                   Stop and clear the queue
   !pause / !resume        Toggle playback
   !queue / !nowplaying    Show queue / current track
+  !dm <@user|user_id> <message>  Send that user a DM (owner only; see LUNA_OWNER_DISCORD_ID)
 
 Env:
   DISCORD_TOKEN                    Bot token (required to enable Discord).
@@ -36,6 +37,9 @@ Env:
   LUNA_DISCORD_CHAT_BOT_IDS        Optional comma-separated bot user ids; empty = any bot (not self).
   LUNA_DISCORD_CHAT_DEBUG          1 to log skipped messages and reasons (default 0).
   LUNA_DISCORD_CHAT_DM             1 to also reply to DMs (default 1).
+  LUNA_DISCORD_DM_COMMAND          1 to enable !dm (default 1).
+  LUNA_OWNER_DISCORD_ID            Your Discord user id (can use !dm). Comma list ok.
+  LUNA_DISCORD_DM_ALLOWED_IDS      Optional extra user ids allowed to use !dm.
   LUNA_DISCORD_WELCOME             1 to greet new members (default 1 when channel id set).
   LUNA_DISCORD_WELCOME_CHANNEL_ID  Text channel id for join messages (requires Members intent).
   LUNA_DISCORD_WELCOME_GUILD_ID    Optional server id; empty = infer from channel.
@@ -140,6 +144,35 @@ def _env_truthy(key: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw not in ("0", "false", "no", "off")
+
+
+def discord_dm_command_enabled() -> bool:
+    return _env_truthy("LUNA_DISCORD_DM_COMMAND", default=True)
+
+
+def discord_dm_allowed_user_ids() -> frozenset[int]:
+    """Discord user ids that may run ``!dm``."""
+    raw = (
+        os.environ.get("LUNA_DISCORD_DM_ALLOWED_IDS")
+        or os.environ.get("LUNA_OWNER_DISCORD_ID")
+        or os.environ.get("DISCORD_DM_OWNER_ID")
+        or ""
+    ).strip()
+    out: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
+def _can_use_discord_dm_command(author_id: int) -> bool:
+    allowed = discord_dm_allowed_user_ids()
+    return bool(allowed) and int(author_id) in allowed
 
 
 def _discord_chat_allowed_channel_ids() -> frozenset[str]:
@@ -749,6 +782,29 @@ class LunaDiscordBot:
             self._chat_locks[channel_id] = lock
         return lock
 
+    async def send_user_dm(self, user: Any, text: str) -> str:
+        """Send a DM as the bot. Returns a short status for ``!dm`` replies."""
+        import discord as _discord  # noqa: PLC0415
+
+        body = (text or "").strip()
+        if not body:
+            return "Usage: `!dm @user your message here`"
+        if getattr(user, "bot", False):
+            return "Can't DM bots."
+        label = getattr(user, "display_name", None) or str(user)
+        try:
+            ch = await user.create_dm()
+            await ch.send(body[:_DISCORD_MSG_CHUNK])
+            print(f"(discord dm) sent to {user.id} ({label}): {body[:120]}", flush=True)
+            return f"DM sent to **{label}**."
+        except _discord.Forbidden:
+            return (
+                "Couldn't DM that user — they may have DMs closed or have blocked the bot."
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"(discord dm) failed for {user.id}: {exc}", flush=True)
+            return f"DM failed: {exc}"
+
     async def resolve_welcome_channel(self, guild: Any) -> Any | None:
         import discord as _discord  # noqa: PLC0415
 
@@ -1027,7 +1083,60 @@ class LunaDiscordBot:
                 return c
         return None
 
-    async def announce_live_all_guilds(self, text: str) -> int:
+    async def _discord_live_send_payload(
+        self,
+        channel: Any,
+        text: str,
+        image_path: str | Path | None,
+    ) -> None:
+        import discord  # noqa: PLC0415
+
+        content = text[:1900]
+        file_obj = None
+        if image_path:
+            p = Path(image_path).expanduser()
+            if p.is_file():
+                file_obj = discord.File(str(p))
+        if file_obj is not None:
+            await channel.send(content=content, file=file_obj)
+        else:
+            await channel.send(content)
+
+    async def announce_live_to_channel_ids(
+        self,
+        text: str,
+        channel_ids: list[int],
+        *,
+        image_path: str | Path | None = None,
+    ) -> int:
+        """Post go-live to specific Discord text channel ids."""
+        import discord  # noqa: PLC0415
+
+        if not text.strip() or not channel_ids:
+            return 0
+        sent = 0
+        for cid in channel_ids:
+            ch = self.bot.get_channel(cid)
+            if ch is None or not isinstance(ch, discord.TextChannel):
+                print(f"(discord live) channel {cid} not found or not text", flush=True)
+                continue
+            if not ch.permissions_for(ch.guild.me).send_messages:
+                print(f"(discord live) no send permission in #{ch.name}", flush=True)
+                continue
+            try:
+                await self._discord_live_send_payload(ch, text, image_path)
+                sent += 1
+                print(f"(discord live) posted in #{ch.name} ({ch.guild.name})", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"(discord live) #{ch.name}: {exc}", flush=True)
+        return sent
+
+    async def announce_live_all_guilds(
+        self,
+        text: str,
+        *,
+        image_path: str | Path | None = None,
+    ) -> int:
         """Post a go-live line to every joined server (system or first writable text channel)."""
         if not text.strip():
             return 0
@@ -1038,7 +1147,7 @@ class LunaDiscordBot:
                 print(f"(discord live) skip {guild.name!r}: no writable text channel", flush=True)
                 continue
             try:
-                await channel.send(text[:1900])
+                await self._discord_live_send_payload(channel, text, image_path)
                 sent += 1
                 print(f"(discord live) posted in #{channel.name} ({guild.name})", flush=True)
             except Exception as exc:  # noqa: BLE001
@@ -1457,6 +1566,22 @@ class LunaDiscordBot:
                     )
                 else:
                     print(f"(discord) auto-joined #{ch.name} in {guild.name!r}", flush=True)
+
+        @bot.command(name="dm")
+        async def cmd_dm(ctx: dcommands.Context, user: "discord.User", *, message: str) -> None:
+            """Send a DM to a user (streamer only). Works in servers or in DM with the bot."""
+            if not discord_dm_command_enabled():
+                await ctx.reply("`!dm` is disabled (set `LUNA_DISCORD_DM_COMMAND=1`).")
+                return
+            if not _can_use_discord_dm_command(ctx.author.id):
+                await ctx.reply(
+                    "Only allowed owners can use `!dm`. Add your Discord user id to "
+                    "`LUNA_OWNER_DISCORD_ID` in `.env` (Developer Mode → right-click your "
+                    "profile → Copy User ID), then restart the bot."
+                )
+                return
+            result = await outer.send_user_dm(user, message)
+            await ctx.reply(result[:_DISCORD_MSG_CHUNK])
 
         @bot.command(name="joins_today", aliases=["joined_today", "joinstoday"])
         async def cmd_joins_today(ctx: dcommands.Context) -> None:
