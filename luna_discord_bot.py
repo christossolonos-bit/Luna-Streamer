@@ -14,6 +14,8 @@ Discord commands (in any text channel the bot can read):
   !pause / !resume        Toggle playback
   !queue / !nowplaying    Show queue / current track
   !dm <@user|user_id> <message>  Send that user a DM (owner only; see LUNA_OWNER_DISCORD_ID)
+  !setup-community        Create persona + fan channels (owner only; never deletes)
+  !daily-post             Post today's Wolf Den engagement message now (owner only)
 
 Env:
   DISCORD_TOKEN                    Bot token (required to enable Discord).
@@ -25,13 +27,20 @@ Env:
                                    bot still does not use VC audio for STT). Default: 1.
   LUNA_DISCORD_CHAT                Master switch for free-text chat replies. Default 1.
   LUNA_DISCORD_CHAT_TRIGGER        "all" (any non-command msg in allowed channels) or
-                                   "mention" (only when bot is @-mentioned or "luna" appears).
-                                   Default "mention".
+                                   "mention" (only when @bot, reply to bot, or luna/viktor/himari
+                                   in text). Default "mention".
+  LUNA_DISCORD_COHOST_CHAT         If 1 (default when co-host personas enabled), Viktor/Himari
+                                   can answer Discord when their names are used (see twitch_bot).
   LUNA_DISCORD_CHAT_CHANNEL_IDS    Optional global allowlist (all servers). Empty = all channels
                                    except servers listed in LUNA_DISCORD_GUILD_CHAT_CHANNELS.
   LUNA_DISCORD_GUILD_CHAT_CHANNELS Per-server allowlists: guild_id:channel_id[,channel_id…]
-                                   separated by spaces. Example:
+                                   or guild_id:* / guild_id:all for every text channel in that server.
+                                   Space-separated entries. Example:
                                    1464575233783631886:1505683058601361488
+                                   1465362923428778110:*
+  LUNA_DISCORD_GUILD_CHAT_TRIGGERS  Optional per-server trigger override:
+                                   guild_id:all|mention (space-separated). Example:
+                                   1465362923428778110:all
   LUNA_DISCORD_CHAT_READ_BOTS      1 to treat other bots like users in allowed channels (default 0).
                                    Bots must still @-mention Luna or say "luna" (even if TRIGGER=all).
   LUNA_DISCORD_CHAT_BOT_IDS        Optional comma-separated bot user ids; empty = any bot (not self).
@@ -48,11 +57,12 @@ Env:
   LUNA_DISCORD_WELCOME_TODAY_SUMMARY   If 1 (default), post one daily list in the welcome channel.
   LUNA_DISCORD_WELCOME_STATE_PATH      JSON file tracking who was already welcomed.
   LUNA_DISCORD_CHAT_COOLDOWN_SEC   Min seconds between Luna replies per channel. Default 4.
-  LUNA_DISCORD_TTS                 1 to attach a TTS voice clip of Luna's reply under the
-                                   text in Discord chat (default 1). The clip is generated
-                                   per-reply and uploaded as a file; it does NOT play on
-                                   the streamer's local speakers (the VRM viewer's TTS is
-                                   skipped for Discord-originated messages).
+  LUNA_DISCORD_TTS                 1 to attach one TTS MP3 under the reply (default 1; no length cap).
+  LUNA_DISCORD_TTS_SINGLE_FILE     1 (default) = one MP3 for the full reply (3+ min ok). 0 = split files.
+  LUNA_DISCORD_TTS_MAX_CHARS       0 (default) = no truncation for Discord TTS.
+  LUNA_DISCORD_TTS_CHARS_PER_FILE  When SINGLE_FILE=0: max chars per MP3 (default 200).
+  LUNA_DISCORD_TTS_MAX_FILES       When SINGLE_FILE=0: max MP3 attachments (default 6).
+                                   Does not play on local speakers; viewer TTS is skipped for Discord.
   LUNA_DISCORD_VOICE_TTS           If 1 (default), after a chat reply Luna queues TTS in the
                                    same voice pipeline as !play (FFmpeg queue; waits behind songs).
   LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS  Optional comma-separated voice channel ids Luna may join
@@ -60,6 +70,16 @@ Env:
                                    into your current voice channel). Empty = only VCs she is
                                    already connected to.
   LUNA_DISCORD_VOICE_TTS_PAD_SEC     Extra seconds after VC TTS ends (like viewer pad; default 1.5).
+  LUNA_DISCORD_COMMUNITY_SETUP      If 1 (default), allow !setup-community (create-only layout).
+  LUNA_DISCORD_COMMUNITY_AUTO_ON_READY  If 1 (default), run setup on ready for guild ids below.
+  LUNA_DISCORD_COMMUNITY_GUILD_IDS Comma-separated guild ids (defaults to LUNA_DISCORD_WELCOME_GUILD_ID).
+  LUNA_DISCORD_COMMUNITY_STATE_PATH JSON map of created channel ids (data/discord_community_channels.json).
+  LUNA_DISCORD_ENGAGEMENT          If 1 (default), track Wolf Den activity in data/discord_engagement_state.json.
+  LUNA_DISCORD_ENGAGEMENT_GUILD_IDS  Guild ids for memory + daily posts (default: welcome/community guild).
+  LUNA_DISCORD_DAILY_POST          If 1 (default), Luna posts one themed daily message per guild per day.
+  LUNA_DISCORD_DAILY_POST_HOUR     Local hour (0–23) before posting runs (default 10).
+  LUNA_DISCORD_DAILY_CHANNEL_ID    Text channel for daily posts (default #community-chat from layout).
+  LUNA_DISCORD_ENGAGEMENT_POLL_SEC How often to check for daily post (default 900).
   Voice context                    When the author is in a voice channel, Luna's model
                                    prompt includes which VC they are in (so she can refer
                                    to it). !join replies also name that channel explicitly.
@@ -135,7 +155,8 @@ def _discord_voice_tts_pad_sec() -> float:
 # Discord hard cap is 2000 chars per message; leave a little headroom.
 _DISCORD_MSG_CHUNK = 1900
 
-# Handler may return either ``reply`` (str) or ``(reply, audio_path | None)``.
+# Handler may return ``reply`` (str) or ``(reply, audio_paths)`` where audio_paths is
+# a list of temp MP3/WAV paths (one or two files for long TTS).
 ChatHandler = Callable[..., Awaitable[Any]]
 
 
@@ -182,33 +203,78 @@ def _discord_chat_allowed_channel_ids() -> frozenset[str]:
     return frozenset(s.strip() for s in raw.replace(" ", ",").split(",") if s.strip())
 
 
-def _discord_guild_chat_channel_rules() -> dict[int, frozenset[int]]:
-    """Parse LUNA_DISCORD_GUILD_CHAT_CHANNELS → {guild_id: {channel_id, …}}."""
+def _discord_guild_chat_channel_rules() -> dict[int, frozenset[int] | None]:
+    """Parse LUNA_DISCORD_GUILD_CHAT_CHANNELS → {guild_id: channel ids or None = all channels}."""
     raw = (os.environ.get("LUNA_DISCORD_GUILD_CHAT_CHANNELS") or "").strip()
     if not raw:
         return {}
-    rules: dict[int, set[int]] = {}
+    rules: dict[int, frozenset[int] | None] = {}
     for entry in raw.replace(";", " ").split():
         entry = entry.strip()
-        if not entry or ":" not in entry:
+        if not entry:
+            continue
+        if ":" not in entry:
+            try:
+                rules[int(entry)] = None
+            except ValueError:
+                continue
             continue
         guild_s, ch_part = entry.split(":", 1)
         try:
             guild_id = int(guild_s.strip())
         except ValueError:
             continue
+        if ch_part.strip().lower() in ("*", "all", "any"):
+            rules[guild_id] = None
+            continue
         ch_ids: set[int] = set()
         for part in ch_part.replace(" ", ",").split(","):
-            part = part.strip()
-            if not part:
+            part = part.strip().lower()
+            if not part or part in ("*", "all", "any"):
+                if part:
+                    rules[guild_id] = None
                 continue
             try:
                 ch_ids.add(int(part))
             except ValueError:
                 continue
+        if rules.get(guild_id) is None:
+            continue
         if ch_ids:
-            rules[guild_id] = rules.get(guild_id, set()) | ch_ids
-    return {gid: frozenset(cids) for gid, cids in rules.items()}
+            prev = rules.get(guild_id)
+            merged = set(prev) if prev is not None else set()
+            rules[guild_id] = frozenset(merged | ch_ids)
+    return rules
+
+
+def _discord_guild_chat_triggers() -> dict[int, str]:
+    """Parse LUNA_DISCORD_GUILD_CHAT_TRIGGERS → {guild_id: 'all' | 'mention'}."""
+    raw = (os.environ.get("LUNA_DISCORD_GUILD_CHAT_TRIGGERS") or "").strip()
+    if not raw:
+        return {}
+    out: dict[int, str] = {}
+    for entry in raw.replace(";", " ").split():
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        guild_s, mode_s = entry.split(":", 1)
+        try:
+            guild_id = int(guild_s.strip())
+        except ValueError:
+            continue
+        mode = mode_s.strip().lower()
+        if mode in ("all", "mention"):
+            out[guild_id] = mode
+    return out
+
+
+def _discord_chat_trigger_mode(guild: Any | None) -> str:
+    default = (os.environ.get("LUNA_DISCORD_CHAT_TRIGGER") or "mention").strip().lower()
+    if default not in ("all", "mention"):
+        default = "mention"
+    if guild is None:
+        return default
+    return _discord_guild_chat_triggers().get(int(guild.id), default)
 
 
 def _channel_id_candidates(channel: Any) -> list[int]:
@@ -223,15 +289,60 @@ def _channel_allowed_for_chat(channel: Any, guild: Any | None) -> bool:
     """Guild-specific allowlist wins; else optional global allowlist; else all channels."""
     candidates = _channel_id_candidates(channel)
     if guild is not None:
+        from luna_discord_community import community_channel_ids_for_guild
+
+        community_ids = community_channel_ids_for_guild(int(guild.id))
+        if community_ids and any(cid in community_ids for cid in candidates):
+            return True
+
         guild_rules = _discord_guild_chat_channel_rules()
-        allowed = guild_rules.get(int(guild.id))
-        if allowed is not None:
+        gid = int(guild.id)
+        if gid in guild_rules:
+            allowed = guild_rules[gid]
+            if allowed is None:
+                return True
             return any(cid in allowed for cid in candidates)
 
     global_allowed = _discord_chat_allowed_channel_ids()
     if not global_allowed:
         return True
     return any(str(cid) in global_allowed for cid in candidates)
+
+
+def _discord_persona_channel_partner(message: Any) -> str | None:
+    """In #luna-chat / #viktor-chat / #himari-chat, route to that cast without a name mention."""
+    if message.guild is None:
+        return None
+    from luna_discord_community import persona_for_channel_id
+
+    return persona_for_channel_id(int(message.guild.id), int(message.channel.id))
+
+
+def _discord_should_reply_to_message(
+    content: str,
+    message: Any,
+    bot_user: Any | None,
+    *,
+    is_dm: bool,
+    from_other_bot: bool,
+) -> bool:
+    if is_dm:
+        return True
+    partner = _discord_persona_channel_partner(message)
+    if partner:
+        return True
+    from luna_discord_community import is_fan_gallery_channel
+
+    if message.guild and is_fan_gallery_channel(
+        int(message.guild.id), int(message.channel.id)
+    ):
+        return _discord_cast_triggered(content, message, bot_user)
+    trigger = _discord_chat_trigger_mode(message.guild)
+    if trigger == "all":
+        return True
+    if from_other_bot:
+        return _discord_cast_triggered(content, message, bot_user)
+    return _discord_cast_triggered(content, message, bot_user)
 
 
 def _discord_chat_debug() -> bool:
@@ -406,7 +517,7 @@ def _mark_welcomed_in_state(state: dict[str, Any], guild_id: int, user_id: int) 
 
 
 def _discord_luna_triggered(content: str, message: Any, bot_user: Any | None) -> bool:
-    """True when the message @-mentions Luna or contains the word luna."""
+    """True when the message @-mentions the bot or contains the word luna."""
     if bot_user is not None and bot_user in (getattr(message, "mentions", None) or []):
         return True
     lowered = (content or "").lower()
@@ -423,6 +534,23 @@ def _discord_luna_triggered(content: str, message: Any, bot_user: Any | None) ->
         if ref_author is not None and getattr(ref_author, "id", None) == bot_user.id:
             return True
     return False
+
+
+def _discord_cast_triggered(content: str, message: Any, bot_user: Any | None) -> bool:
+    """True when the message should get a cast reply (Luna, Viktor, or Himari by name)."""
+    from luna_cast import public_chat_addressees
+
+    if public_chat_addressees(content, trigger_all=False):
+        return True
+    return _discord_luna_triggered(content, message, bot_user)
+
+
+def _discord_cast_trigger_hint() -> str:
+    from himari_cohost import himari_name
+    from vampire_cohost import cohost_name
+
+    parts = ["@Luna", '"luna"', f'"{cohost_name().lower()}"', f'"{himari_name().lower()}"']
+    return "need " + ", ".join(parts) + ", or reply to the bot"
 
 
 def _chunk_discord(text: str, limit: int = _DISCORD_MSG_CHUNK) -> list[str]:
@@ -862,6 +990,16 @@ class LunaDiscordBot:
             f"(discord welcome) greeted {member.display_name} in #{ch.name} ({guild.name})",
             flush=True,
         )
+        try:
+            from luna_discord_engagement import note_new_member
+
+            await note_new_member(
+                int(guild.id),
+                int(member.id),
+                str(getattr(member, "display_name", member)),
+            )
+        except Exception:
+            pass
         return True
 
     async def members_joined_today(self, guild: Any) -> list[Any]:
@@ -952,23 +1090,28 @@ class LunaDiscordBot:
         self,
         channel: Any,
         reply_text: str,
-        audio_path: Path | None,
+        audio_paths: Path | list[Path] | None,
     ) -> None:
         """Post a Discord reply with optional TTS audio attached to the last chunk.
 
-        Sends text first so it appears in the timeline immediately; the voice
-        clip is attached to the FINAL text chunk so it renders right under
-        the text. If the reply is empty but audio exists, just sends the
-        audio. Falls back to text-only if the file upload fails.
+        Sends text first so it appears in the timeline immediately; voice clip(s)
+        attach to the FINAL text chunk (usually one full-length MP3).
+        Falls back to text-only if the file upload fails.
         """
         import discord  # local import: optional dependency
 
+        paths: list[Path] = []
+        if isinstance(audio_paths, Path):
+            paths = [audio_paths]
+        elif audio_paths:
+            paths = [p for p in audio_paths if isinstance(p, Path) and p.is_file()]
+
         chunks = _chunk_discord(reply_text) if reply_text else []
-        # No text? Just send the audio if we have it.
         if not chunks:
-            if audio_path is not None and audio_path.exists():
+            for i, path in enumerate(paths):
                 try:
-                    await channel.send(file=discord.File(str(audio_path), filename=audio_path.name))
+                    name = f"luna_tts_{i + 1}.mp3" if len(paths) > 1 else path.name
+                    await channel.send(file=discord.File(str(path), filename=name))
                 except Exception as exc:  # noqa: BLE001
                     print(f"(discord chat) audio-only send failed: {exc}", flush=True)
             return
@@ -976,14 +1119,25 @@ class LunaDiscordBot:
         for idx, part in enumerate(chunks):
             is_last = idx == len(chunks) - 1
             try:
-                if is_last and audio_path is not None and audio_path.exists():
-                    try:
-                        await channel.send(
-                            content=part,
-                            file=discord.File(str(audio_path), filename=audio_path.name),
+                if is_last and paths:
+                    files = [
+                        discord.File(
+                            str(p),
+                            filename=(
+                                f"luna_tts_{i + 1}{p.suffix or '.mp3'}"
+                                if len(paths) > 1
+                                else p.name
+                            ),
                         )
+                        for i, p in enumerate(paths)
+                    ]
+                    try:
+                        await channel.send(content=part, files=files)
                     except Exception as exc:  # noqa: BLE001
-                        print(f"(discord chat) audio attach failed, sending text only: {exc}", flush=True)
+                        print(
+                            f"(discord chat) audio attach failed, sending text only: {exc}",
+                            flush=True,
+                        )
                         await channel.send(part)
                 else:
                     await channel.send(part)
@@ -1031,16 +1185,20 @@ class LunaDiscordBot:
     async def play_reply_tts_in_voice(
         self,
         guild_id: int,
-        audio_path: Path,
+        audio_paths: Path | list[Path],
         *,
         member: Any | None = None,
         guild: Any | None = None,
     ) -> bool:
-        """Play the same reply MP3 in VC as !play (returns True if the file was queued)."""
+        """Play reply MP3(s) in VC as !play (returns True if any file was queued)."""
         if not _env_truthy("LUNA_DISCORD_VOICE_TTS", default=True):
             return False
-        if not audio_path.is_file():
-            print(f"(discord voice tts) missing mp3: {audio_path}", flush=True)
+        if isinstance(audio_paths, Path):
+            paths = [audio_paths]
+        else:
+            paths = [p for p in audio_paths if isinstance(p, Path) and p.is_file()]
+        if not paths:
+            print("(discord voice tts) missing mp3", flush=True)
             return False
 
         player = self._player(guild_id)
@@ -1060,11 +1218,20 @@ class LunaDiscordBot:
             print("(discord voice tts) could not join voice channel", flush=True)
             return False
         name = getattr(target, "name", target.id)
-        print(f"(discord voice tts) joining #{name} — playing message mp3 in VC", flush=True)
-        ok = await player.play_voice_clip(audio_path, own_file=True)
-        if not ok:
-            print("(discord voice tts) could not queue reply mp3", flush=True)
-        return ok
+        n = len(paths)
+        print(
+            f"(discord voice tts) joining #{name} — "
+            f"{'playing' if n == 1 else f'queuing {n}'} message mp3 in VC",
+            flush=True,
+        )
+        queued = False
+        for i, path in enumerate(paths):
+            title = "Luna (TTS)" if n == 1 else f"Luna (TTS {i + 1}/{n})"
+            if await player.play_voice_clip(path, title=title, own_file=True):
+                queued = True
+            else:
+                print(f"(discord voice tts) could not queue: {path.name}", flush=True)
+        return queued
 
     def _announce_text_channel(self, guild: Any) -> Any | None:
         import discord  # noqa: PLC0415
@@ -1331,16 +1498,45 @@ class LunaDiscordBot:
                     return
                 channel_label = f"#{ch_name}"
 
-            # Trigger: humans honor TRIGGER=all|mention; other bots always need @Luna / "luna".
-            trigger = (os.environ.get("LUNA_DISCORD_CHAT_TRIGGER") or "mention").strip().lower()
-            if from_other_bot or (not is_dm and trigger != "all"):
-                if not _discord_luna_triggered(content, message, me):
-                    if _discord_chat_debug():
-                        _discord_chat_log(
-                            f"skip #{ch_name}: need @Luna or 'luna' in text "
-                            f"(LUNA_DISCORD_CHAT_TRIGGER={trigger})"
+            if (
+                not is_dm
+                and message.guild is not None
+                and not from_other_bot
+            ):
+                try:
+                    from luna_discord_engagement import (
+                        engagement_enabled,
+                        engagement_guild_ids,
+                        record_message,
+                    )
+
+                    gid = int(message.guild.id)
+                    if engagement_enabled() and gid in engagement_guild_ids():
+                        await record_message(
+                            gid,
+                            channel_id=int(message.channel.id),
+                            channel_name=str(ch_name),
+                            author_id=int(message.author.id),
+                            content=content,
+                            is_bot=False,
                         )
-                    return
+                except Exception:
+                    pass
+
+            if not _discord_should_reply_to_message(
+                content, message, me, is_dm=is_dm, from_other_bot=from_other_bot
+            ):
+                if _discord_chat_debug():
+                    partner = _discord_persona_channel_partner(message)
+                    if partner:
+                        hint = f"persona channel → {partner}"
+                    else:
+                        hint = (
+                            f"{_discord_cast_trigger_hint()} "
+                            f"(LUNA_DISCORD_CHAT_TRIGGER={_discord_chat_trigger_mode(message.guild)})"
+                        )
+                    _discord_chat_log(f"skip #{ch_name}: {hint}")
+                return
 
             # Per-channel cooldown.
             try:
@@ -1370,6 +1566,7 @@ class LunaDiscordBot:
                     av = getattr(message.author, "voice", None)
                     if av and av.channel is not None:
                         voice_channel_label = f"#{av.channel.name}"
+                channel_partner = _discord_persona_channel_partner(message)
                 try:
                     async with message.channel.typing():
                         result = await outer._chat_handler(
@@ -1379,20 +1576,28 @@ class LunaDiscordBot:
                             is_dm=is_dm,
                             voice_channel_label=voice_channel_label,
                             author_is_bot=from_other_bot,
+                            channel_partner=channel_partner,
                         )
                 except Exception as exc:  # noqa: BLE001
                     print(f"(discord chat) handler error: {exc}", flush=True)
                     return
 
-                # Handler may return either a plain str or (str, audio_path|None).
-                audio_path: Path | None = None
+                # Handler may return a plain str or (str, list[Path] | Path | None).
+                audio_paths: list[Path] = []
                 if isinstance(result, tuple):
                     reply = result[0] if result else ""
                     if len(result) >= 2 and result[1] is not None:
-                        try:
-                            audio_path = Path(result[1])  # type: ignore[arg-type]
-                        except TypeError:
-                            audio_path = None
+                        raw_audio = result[1]
+                        if isinstance(raw_audio, Path):
+                            audio_paths = [raw_audio]
+                        elif isinstance(raw_audio, (list, tuple)):
+                            for item in raw_audio:
+                                try:
+                                    p = Path(item)
+                                    if p.is_file():
+                                        audio_paths.append(p)
+                                except TypeError:
+                                    continue
                 else:
                     reply = result or ""
 
@@ -1402,29 +1607,38 @@ class LunaDiscordBot:
 
                 vc_owns_mp3 = False
                 try:
-                    await outer._send_reply_with_audio(message.channel, reply, audio_path)
-                    _discord_chat_log(f"sent reply in {channel_label} ({len(reply)} chars)")
+                    await outer._send_reply_with_audio(
+                        message.channel, reply, audio_paths or None
+                    )
+                    audio_note = (
+                        f", {len(audio_paths)} audio file(s)"
+                        if audio_paths
+                        else ""
+                    )
+                    _discord_chat_log(
+                        f"sent reply in {channel_label} ({len(reply)} chars{audio_note})"
+                    )
                     if (
                         not is_dm
                         and message.guild is not None
-                        and audio_path is not None
-                        and audio_path.exists()
+                        and audio_paths
                     ):
                         try:
                             vc_owns_mp3 = await outer.play_reply_tts_in_voice(
                                 message.guild.id,
-                                audio_path,
+                                audio_paths,
                                 member=message.author,
                                 guild=message.guild,
                             )
                         except Exception as exc:  # noqa: BLE001
                             print(f"(discord voice tts) {exc}", flush=True)
                 finally:
-                    if audio_path is not None and not vc_owns_mp3:
-                        try:
-                            audio_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                    if not vc_owns_mp3:
+                        for path in audio_paths:
+                            try:
+                                path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
 
         @bot.event
         async def on_member_join(member: "discord.Member") -> None:
@@ -1494,22 +1708,41 @@ class LunaDiscordBot:
                     except ValueError:
                         print(f"(discord chat)   - invalid global id {cid_s!r}", flush=True)
 
+                guild_triggers = _discord_guild_chat_triggers()
                 for gid, ch_set in sorted(guild_rules.items()):
                     g = bot.get_guild(gid)
                     gname = g.name if g is not None else str(gid)
-                    print(
-                        f"(discord chat)   server {gname!r} id={gid}: "
-                        f"{len(ch_set)} channel(s) only",
-                        flush=True,
-                    )
-                    for cid in sorted(ch_set):
-                        await _log_channel(cid, f"{gname}")
+                    trig = guild_triggers.get(gid)
+                    trig_note = f" trigger={trig}" if trig else ""
+                    if ch_set is None:
+                        print(
+                            f"(discord chat)   server {gname!r} id={gid}: "
+                            f"ALL text channels{trig_note}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"(discord chat)   server {gname!r} id={gid}: "
+                            f"{len(ch_set)} channel(s) only{trig_note}",
+                            flush=True,
+                        )
+                        for cid in sorted(ch_set):
+                            await _log_channel(cid, f"{gname}")
 
                 print(
-                    "(discord chat) tip: @Luna or include 'luna' in each message; "
-                    "set LUNA_DISCORD_CHAT_DEBUG=1 to log skips",
+                    "(discord chat) tip: @bot, reply to bot, or say luna / viktor / himari "
+                    "(and co-host aliases); set LUNA_DISCORD_CHAT_DEBUG=1 to log skips",
                     flush=True,
                 )
+                from luna_discord_community import community_setup_enabled
+
+                if community_setup_enabled():
+                    print(
+                        "(discord community) persona channels (#luna-chat, #viktor-chat, "
+                        "#himari-chat) auto-reply; #fan-images/#fan-videos need @bot or a name. "
+                        "Owner: !setup-community (create-only, never deletes).",
+                        flush=True,
+                    )
             if _discord_welcome_enabled():
                 cid = _discord_welcome_channel_id()
                 gid = _discord_welcome_guild_id()
@@ -1533,6 +1766,65 @@ class LunaDiscordBot:
                             print(f"(discord welcome) today-join scan failed: {exc}", flush=True)
 
                     asyncio.create_task(_scan_today_joins(), name="discord-welcome-today-scan")
+
+                from luna_discord_community import (
+                    community_auto_on_ready,
+                    community_auto_setup_guild_ids,
+                    community_setup_enabled,
+                    setup_guild_community,
+                )
+
+                if community_setup_enabled() and community_auto_on_ready():
+                    ids = community_auto_setup_guild_ids()
+
+                    async def _auto_community_setup() -> None:
+                        await bot.wait_until_ready()
+                        await asyncio.sleep(6.0)
+                        for gid in ids:
+                            guild = bot.get_guild(int(gid))
+                            if guild is None:
+                                continue
+                            try:
+                                created, notes = await setup_guild_community(guild)
+                                if created:
+                                    print(
+                                        f"(discord community) {guild.name!r}: "
+                                        + ", ".join(created),
+                                        flush=True,
+                                    )
+                                for n in notes:
+                                    print(f"(discord community) {n}", flush=True)
+                            except Exception as exc:  # noqa: BLE001
+                                print(
+                                    f"(discord community) setup failed for {gid}: {exc}",
+                                    flush=True,
+                                )
+
+                    asyncio.create_task(
+                        _auto_community_setup(), name="discord-community-auto-setup"
+                    )
+                    if ids:
+                        print(
+                            f"(discord community) auto-setup on ready for guild(s): "
+                            + ", ".join(str(i) for i in sorted(ids)),
+                            flush=True,
+                        )
+
+                from luna_discord_engagement import (
+                    daily_post_enabled,
+                    engagement_enabled,
+                    engagement_guild_ids,
+                    engagement_loop,
+                )
+
+                if engagement_enabled():
+                    asyncio.create_task(engagement_loop(bot), name="discord-engagement-loop")
+                    if daily_post_enabled() and engagement_guild_ids():
+                        print(
+                            "(discord engagement) daily fan posts ON for guild(s): "
+                            + ", ".join(str(i) for i in sorted(engagement_guild_ids())),
+                            flush=True,
+                        )
             guild_id = _int_env("DISCORD_VOICE_GUILD_ID")
             channel_id = _int_env("DISCORD_VOICE_CHANNEL_ID")
             if guild_id and channel_id:
@@ -1567,6 +1859,33 @@ class LunaDiscordBot:
                 else:
                     print(f"(discord) auto-joined #{ch.name} in {guild.name!r}", flush=True)
 
+        @bot.command(name="setup-community", aliases=["community-setup", "setup-server"])
+        async def cmd_setup_community(ctx: dcommands.Context) -> None:
+            """Create Luna/Viktor/Himari chat + fan gallery channels (never deletes)."""
+            from luna_discord_community import (
+                community_setup_enabled,
+                format_setup_report,
+                setup_guild_community,
+            )
+
+            if not community_setup_enabled():
+                await ctx.reply(
+                    "Community setup is disabled (`LUNA_DISCORD_COMMUNITY_SETUP=0`)."
+                )
+                return
+            if ctx.guild is None:
+                await ctx.reply("Run this in the server you want to set up.")
+                return
+            if not _can_use_discord_dm_command(ctx.author.id):
+                await ctx.reply(
+                    "Only the streamer/owner can run this. Set `LUNA_OWNER_DISCORD_ID` in `.env`."
+                )
+                return
+            await ctx.reply("Setting up community channels (create-only, nothing deleted)…")
+            created, notes = await setup_guild_community(ctx.guild)
+            report = format_setup_report(ctx.guild, created, notes)
+            await ctx.reply(report[:1900])
+
         @bot.command(name="dm")
         async def cmd_dm(ctx: dcommands.Context, user: "discord.User", *, message: str) -> None:
             """Send a DM to a user (streamer only). Works in servers or in DM with the bot."""
@@ -1582,6 +1901,32 @@ class LunaDiscordBot:
                 return
             result = await outer.send_user_dm(user, message)
             await ctx.reply(result[:_DISCORD_MSG_CHUNK])
+
+        @bot.command(name="daily-post", aliases=["daily", "wolfden-daily"])
+        async def cmd_daily_post(ctx: dcommands.Context) -> None:
+            """Post today's Wolf Den engagement message now (owner only)."""
+            from luna_discord_engagement import daily_post_enabled, try_post_daily
+
+            if not daily_post_enabled():
+                await ctx.reply(
+                    "Daily posts are off (`LUNA_DISCORD_DAILY_POST=0` or engagement disabled)."
+                )
+                return
+            if ctx.guild is None:
+                await ctx.reply("Run this in the server you want the daily post in.")
+                return
+            if not _can_use_discord_dm_command(ctx.author.id):
+                await ctx.reply("Only the streamer/owner can run this.")
+                return
+            await ctx.reply("Writing today's Wolf Den daily…")
+            ok = await try_post_daily(bot, ctx.guild, force=True)
+            if ok:
+                await ctx.reply("Posted today's daily engagement message.")
+            else:
+                await ctx.reply(
+                    "Could not post (check bot permissions, `LUNA_DISCORD_DAILY_CHANNEL_ID`, "
+                    "or logs). If already posted today, only one automatic post runs per day."
+                )
 
         @bot.command(name="joins_today", aliases=["joined_today", "joinstoday"])
         async def cmd_joins_today(ctx: dcommands.Context) -> None:

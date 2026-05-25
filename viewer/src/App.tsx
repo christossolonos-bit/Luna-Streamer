@@ -111,6 +111,7 @@ function AppInner() {
   const [himariAvailable, setHimariAvailable] = useState(false);
   const [himariInScene, setHimariInScene] = useState(false);
   const [himariBusy, setHimariBusy] = useState(false);
+  const [castDuoBusy, setCastDuoBusy] = useState(false);
   const [himariDisplayName, setHimariDisplayName] = useState("Himari");
 
   const setChromaKey = useCallback((mode: ChromaKeyMode) => {
@@ -377,7 +378,15 @@ function AppInner() {
 
   // Bridge → avatar event listeners.
   useEffect(() => {
-    const routeAvatar = (avatar?: string) => {
+    const lipSyncAvatar = (avatar?: string) => {
+      const rt = runtimeRef.current;
+      if (!rt) return;
+      const a = (avatar || "").trim().toLowerCase();
+      if (a === "himari") rt.setActiveSpeaker("himari");
+      else if (a === "cohost" || a === "viktor") rt.setActiveSpeaker("cohost");
+      else rt.setActiveSpeaker("luna");
+    };
+    const focusAvatar = (avatar?: string) => {
       const rt = runtimeRef.current;
       if (!rt) return;
       const a = (avatar || "").trim().toLowerCase();
@@ -389,9 +398,13 @@ function AppInner() {
         cohostVrm: cohostVrmUrlRef.current,
       });
     };
-    const onActiveAvatar = (ev: Event) => {
+    const onLipSyncAvatar = (ev: Event) => {
       const ce = ev as CustomEvent<{ avatar?: string }>;
-      routeAvatar(ce.detail?.avatar);
+      lipSyncAvatar(ce.detail?.avatar);
+    };
+    const onFocusAvatar = (ev: Event) => {
+      const ce = ev as CustomEvent<{ avatar?: string }>;
+      focusAvatar(ce.detail?.avatar);
     };
     const onEmotion = (ev: Event) => {
       const ce = ev as CustomEvent<
@@ -413,7 +426,7 @@ function AppInner() {
           ? d.durationMs
           : undefined;
       if (typeof d === "object" && d && typeof d.avatar === "string") {
-        routeAvatar(d.avatar);
+        lipSyncAvatar(d.avatar);
       }
       runtimeRef.current?.triggerEmotion(String(id || "relaxed"), ms);
     };
@@ -430,7 +443,7 @@ function AppInner() {
       const active =
         typeof d === "boolean" ? d : typeof d === "object" && d ? d.value === true : false;
       if (typeof d === "object" && d && typeof d.avatar === "string") {
-        routeAvatar(d.avatar);
+        lipSyncAvatar(d.avatar);
       }
       runtimeRef.current?.setSpeaking(active);
     };
@@ -442,7 +455,7 @@ function AppInner() {
         avatar?: string;
       }>;
       const d = ce.detail || {};
-      if (typeof d.avatar === "string") routeAvatar(d.avatar);
+      if (typeof d.avatar === "string") lipSyncAvatar(d.avatar);
       runtimeRef.current?.setViseme(
         String(d.vowel || ""),
         Number.isFinite(d.intensity) ? Number(d.intensity) : 1,
@@ -457,14 +470,16 @@ function AppInner() {
       const active = ce.detail?.active === true;
       void runtimeRef.current?.setAvatarThinking(avatar, active);
     };
-    window.addEventListener("luna-active-avatar", onActiveAvatar);
+    window.addEventListener("luna-lipsync-avatar", onLipSyncAvatar);
+    window.addEventListener("luna-focus-avatar", onFocusAvatar);
     window.addEventListener("luna-avatar-emotion", onEmotion);
     window.addEventListener("luna-assistant-reply", onReply);
     window.addEventListener("luna-avatar-speaking", onSpeaking);
     window.addEventListener("luna-avatar-viseme", onViseme);
     window.addEventListener("luna-avatar-thinking", onAvatarThinking);
     return () => {
-      window.removeEventListener("luna-active-avatar", onActiveAvatar);
+      window.removeEventListener("luna-lipsync-avatar", onLipSyncAvatar);
+      window.removeEventListener("luna-focus-avatar", onFocusAvatar);
       window.removeEventListener("luna-avatar-emotion", onEmotion);
       window.removeEventListener("luna-assistant-reply", onReply);
       window.removeEventListener("luna-avatar-speaking", onSpeaking);
@@ -583,7 +598,7 @@ function AppInner() {
         const himariUrl =
           ce.detail.himariVrmUrl?.trim() || himariVrmUrlRef.current;
         if (himariUrl) himariVrmUrlRef.current = himariUrl;
-        void rt.enableDualCohostLayout(url).then(async () => {
+        void rt.enableDualCohostLayout(url, { trioWithLuna: !!ce.detail?.trioLayout }).then(async () => {
           setCohostInScene(rt.isCohostInScene());
           if (cohostThinkingUrlRef.current) {
             await rt.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
@@ -757,13 +772,22 @@ function AppInner() {
     setActiveOverlay((current) => (current === id ? null : id));
   }, []);
 
+  const notifyCastScene = useCallback(() => {
+    const rt = runtimeRef.current;
+    if (!rt) return;
+    void sendViewerCohostScene({
+      viktor: rt.isCohostInScene(),
+      himari: rt.isHimariInScene(),
+    });
+  }, [sendViewerCohostScene]);
+
   const toggleCohost = useCallback(() => {
     const rt = runtimeRef.current;
     if (!rt || cohostBusy) return;
     if (rt.isCohostInScene()) {
       rt.dismissCohost();
-      setCohostInScene(false);
-      void sendViewerCohostScene(false, "viktor");
+      setCohostInScene(rt.isCohostInScene());
+      notifyCastScene();
       return;
     }
     const url = cohostVrmUrlRef.current;
@@ -777,8 +801,9 @@ function AppInner() {
     void rt
       .summonCohost(url, label)
       .then(async () => {
-        setCohostInScene(true);
-        void sendViewerCohostScene(true, "viktor");
+        setCohostInScene(rt.isCohostInScene());
+        setReplyTo("cohost");
+        notifyCastScene();
         if (cohostThinkingUrlRef.current) {
           await rt.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
         }
@@ -791,16 +816,15 @@ function AppInner() {
         setLastError(msg);
       })
       .finally(() => setCohostBusy(false));
-  }, [cohostBusy, sendViewerCohostScene]);
+  }, [cohostBusy, notifyCastScene, setReplyTo]);
 
   const toggleHimari = useCallback(() => {
     const rt = runtimeRef.current;
     if (!rt || himariBusy) return;
     if (rt.isHimariInScene()) {
       rt.dismissHimari();
-      setHimariInScene(false);
-      void sendViewerCohostScene(false, "himari");
-      setReplyTo("luna");
+      setHimariInScene(rt.isHimariInScene());
+      notifyCastScene();
       return;
     }
     const url = himariVrmUrlRef.current;
@@ -814,9 +838,9 @@ function AppInner() {
     void rt
       .summonHimari(url, label)
       .then(async () => {
-        setHimariInScene(true);
+        setHimariInScene(rt.isHimariInScene());
         setReplyTo("himari");
-        void sendViewerCohostScene(true, "himari");
+        notifyCastScene();
         if (himariThinkingUrlRef.current) {
           await rt.setHimariThinkingMotionUrl(himariThinkingUrlRef.current);
         }
@@ -829,7 +853,57 @@ function AppInner() {
         setLastError(msg);
       })
       .finally(() => setHimariBusy(false));
-  }, [himariBusy, sendViewerCohostScene, setReplyTo]);
+  }, [himariBusy, notifyCastScene, setReplyTo]);
+
+  const toggleCastDuo = useCallback(() => {
+    const rt = runtimeRef.current;
+    if (!rt || castDuoBusy) return;
+    if (rt.isViktorHimariDuoInScene()) {
+      rt.dismissViktorHimariDuo();
+      setCohostInScene(rt.isCohostInScene());
+      setHimariInScene(rt.isHimariInScene());
+      notifyCastScene();
+      return;
+    }
+    const vUrl = cohostVrmUrlRef.current;
+    const hUrl = himariVrmUrlRef.current;
+    if (!vUrl) {
+      setLastError("No co-host VRM URL — set LUNA_COHOST_VRM in .env and restart main.py");
+      return;
+    }
+    if (!hUrl) {
+      setLastError("No Himari VRM URL — set LUNA_HIMARI_VRM in .env and restart main.py");
+      return;
+    }
+    setCastDuoBusy(true);
+    setLastError(null);
+    const vLabel = vUrl.split("/").pop() || "cohost.vrm";
+    const hLabel = hUrl.split("/").pop() || "himari.vrm";
+    void rt
+      .summonViktorHimariDuo(vUrl, hUrl, vLabel, hLabel)
+      .then(async () => {
+        setCohostInScene(rt.isCohostInScene());
+        setHimariInScene(rt.isHimariInScene());
+        notifyCastScene();
+        if (cohostThinkingUrlRef.current) {
+          await rt.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
+        }
+        if (cohostIdleUrlsRef.current.length > 0) {
+          await rt.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
+        }
+        if (himariThinkingUrlRef.current) {
+          await rt.setHimariThinkingMotionUrl(himariThinkingUrlRef.current);
+        }
+        if (himariIdleUrlsRef.current.length > 0) {
+          await rt.setHimariIdleMotionUrls(himariIdleUrlsRef.current);
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        setLastError(msg);
+      })
+      .finally(() => setCastDuoBusy(false));
+  }, [castDuoBusy, notifyCastScene]);
 
   const connLabel =
     conn === "open" ? "● live" : conn === "connecting" ? "◌ connecting…" : "○ offline";
@@ -1032,6 +1106,10 @@ function AppInner() {
         himariName={himariDisplayName}
         himariBusy={himariBusy}
         onToggleHimari={toggleHimari}
+        castDuoAvailable={cohostAvailable && himariAvailable}
+        castDuoInScene={cohostInScene && himariInScene}
+        castDuoBusy={castDuoBusy}
+        onToggleCastDuo={toggleCastDuo}
       />
     </div>
   );

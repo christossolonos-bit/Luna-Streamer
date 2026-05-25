@@ -37,6 +37,17 @@ _STUTTER_HYPHEN_RE = re.compile(
     r"(?![a-z0-9])"
 )
 _LONG_HYPHEN_STUTTER_RE = re.compile(r"(?i)([a-z])(?:-\1){2,}")
+# Flustered blush text faces (e.g. >///<, >\\<) — keep in chat, strip for TTS.
+_HIMARI_BLUSH_KAOMOJI_RE = re.compile(r">\s*(?:[/\\|]){1,6}\s*<")
+
+
+def strip_himari_blush_kaomoji(text: str) -> str:
+    """Remove >///< style blush emoticons so Edge TTS does not read punctuation."""
+    s = (text or "")
+    if not s:
+        return s
+    s = _HIMARI_BLUSH_KAOMOJI_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def himari_enabled() -> bool:
@@ -133,7 +144,7 @@ def build_himari_banter_persona_block() -> str:
 
 def sanitize_himari_speech_text(text: str) -> str:
     """Collapse model stutter spam so Edge TTS gets speakable lines."""
-    s = (text or "").strip()
+    s = strip_himari_blush_kaomoji((text or "").strip())
     if not s:
         return s
     prev = None
@@ -171,7 +182,27 @@ def himari_banter_line_broken(text: str) -> bool:
     return False
 
 
-def build_himari_chat_system() -> str:
+def _himari_chat_system_tail(*, for_creator_panel: bool) -> str:
+    if for_creator_panel:
+        from luna_creator import creator_display_name
+
+        cn = creator_display_name()
+        return (
+            f"**{cn}** (your creator) is speaking to you on the local viewer mic or panel — "
+            "not anonymous live chat. Reply in your voice as plain spoken text for TTS. "
+            "First person only (I/me/my); she/her for yourself. "
+            "No stage directions, no third-person narration about yourself."
+        )
+    return (
+        "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, "
+        "they want **you** — not Luna. Reply in your voice only, as plain text for TTS. "
+        "You are a woman; use she/her about yourself. "
+        "Keep it to one short paragraph or a few sentences unless they asked for more. "
+        "Do not prefix with your name or a role tag."
+    )
+
+
+def build_himari_chat_system(*, for_creator_panel: bool = False) -> str:
     """System prompt when Himari answers chat directly."""
     from luna_persona import build_luna_system_prompt
     from vampire_cohost import build_vampire_system_prompt, cohost_enabled, cohost_name
@@ -191,11 +222,7 @@ def build_himari_chat_system() -> str:
         f"{chr(10).join(cast_lines)}\n"
         f"{viktor_block}\n"
         f"Luna (context only):\n{luna_ctx}\n\n"
-        "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, "
-        "they want **you** — not Luna. Reply in your voice only, as plain text for TTS. "
-        "You are a woman; use she/her about yourself. "
-        "Keep it to one short paragraph or a few sentences unless they asked for more. "
-        "Do not prefix with your name or a role tag."
+        f"{_himari_chat_system_tail(for_creator_panel=for_creator_panel)}"
     )
 
 

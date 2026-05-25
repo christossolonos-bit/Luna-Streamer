@@ -3,6 +3,7 @@ import {
   ChatIcon,
   CohostSummonIcon,
   HimariSummonIcon,
+  ViktorHimariDuoIcon,
   MicIcon,
   ScreenIcon,
   SettingsIcon,
@@ -49,6 +50,11 @@ type Props = {
   himariName?: string;
   himariBusy?: boolean;
   onToggleHimari?: () => void;
+  /** Viktor + Himari banter pair (both on stage). */
+  castDuoAvailable?: boolean;
+  castDuoInScene?: boolean;
+  castDuoBusy?: boolean;
+  onToggleCastDuo?: () => void;
 };
 
 type DockBtnProps = {
@@ -113,9 +119,15 @@ export function FloatingDock({
   himariName = "Himari",
   himariBusy = false,
   onToggleHimari,
+  castDuoAvailable = false,
+  castDuoInScene = false,
+  castDuoBusy = false,
+  onToggleCastDuo,
 }: Props) {
   const showCohostRow =
-    (cohostAvailable && onToggleCohost) || (himariAvailable && onToggleHimari);
+    (cohostAvailable && onToggleCohost) ||
+    (himariAvailable && onToggleHimari) ||
+    (castDuoAvailable && onToggleCastDuo);
 
   return (
     <div className="dock" role="toolbar" aria-label="Luna controls">
@@ -171,8 +183,8 @@ export function FloatingDock({
                 cohostBusy
                   ? `Loading ${cohostName}…`
                   : cohostInScene
-                    ? `Dismiss ${cohostName} from scene`
-                    : `Summon ${cohostName} into scene`
+                    ? `Dismiss ${cohostName} from cast`
+                    : `Summon Luna + ${cohostName}`
               }
               active={cohostInScene}
               disabled={cohostBusy}
@@ -188,8 +200,8 @@ export function FloatingDock({
                 himariBusy
                   ? `Loading ${himariName}…`
                   : himariInScene
-                    ? `Dismiss ${himariName} from scene`
-                    : `Summon ${himariName} into scene`
+                    ? `Dismiss ${himariName} from cast`
+                    : `Summon Luna + ${himariName}`
               }
               active={himariInScene}
               disabled={himariBusy}
@@ -197,6 +209,23 @@ export function FloatingDock({
               onClick={onToggleHimari}
             >
               <HimariSummonIcon />
+            </DockBtn>
+          ) : null}
+          {castDuoAvailable && onToggleCastDuo ? (
+            <DockBtn
+              label={
+                castDuoBusy
+                  ? `Loading ${cohostName} + ${himariName}…`
+                  : castDuoInScene
+                    ? `Dismiss ${cohostName} + ${himariName} from cast`
+                    : `Summon ${cohostName} + ${himariName} for co-host banter`
+              }
+              active={castDuoInScene}
+              disabled={castDuoBusy}
+              className="dock-btn--cast-duo"
+              onClick={onToggleCastDuo}
+            >
+              <ViktorHimariDuoIcon />
             </DockBtn>
           ) : null}
         </div>

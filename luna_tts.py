@@ -272,7 +272,10 @@ def _is_action_phrase(phrase: str) -> bool:
 
 def _split_tts_chunks(text: str, target_chars: int) -> list[str]:
     target = max(60, target_chars)
-    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    normalized = re.sub(r"\n{2,}", ". ", (text or "").replace("\n", " "))
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", normalized) if p.strip()]
+    if not parts:
+        parts = [p.strip() for p in re.split(r"\n+", text or "") if p.strip()]
     if not parts:
         return [text] if text else []
     out: list[str] = []
@@ -304,12 +307,29 @@ def _split_tts_chunks(text: str, target_chars: int) -> list[str]:
     return final
 
 
-def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
+def _reply_text_before_tts_clean(reply_text: str, voice: str | None = None) -> str:
+    """Himari-specific decorations (blush kaomoji, stutter collapse) before shared TTS clean."""
+    edge_voice = (voice or "").strip()
+    if not edge_voice:
+        return reply_text
+    try:
+        from himari_cohost import himari_edge_voice, sanitize_himari_speech_text
+
+        if edge_voice == himari_edge_voice():
+            return sanitize_himari_speech_text(reply_text)
+    except ImportError:
+        pass
+    return reply_text
+
+
+def _clean_text_for_tts(reply_text: str, *, max_chars: int | None = None) -> tuple[str, str]:
     """Clean a reply for synthesis.
 
     Returns ``(cleaned_text, emotion)``. ``cleaned_text`` may be empty if the
     reply was entirely emojis / decoration, in which case callers should skip
     synthesis. ``emotion`` is the detected emotion label used for prosody.
+
+    Pass ``max_chars=0`` for no length cap (Discord long single MP3).
     """
     text = (reply_text or "").strip()
     # Remove common ASCII emoticons/smiley faces before TTS.
@@ -335,9 +355,11 @@ def _clean_text_for_tts(reply_text: str) -> tuple[str, str]:
     text = re.sub(r"\(([^()]+)\)", lambda m: _action_sound(m.group(1)), text)
     text = re.sub(r"[*_`]+", "", text)
     text = re.sub(r"\s+", " ", text)
-    max_chars = int(os.environ.get("LUNA_TTS_MAX_CHARS", "2500").strip() or "2500")
-    if len(text) > max_chars:
-        text = text[: max_chars - 3].rstrip() + "..."
+    limit = max_chars
+    if limit is None:
+        limit = int(os.environ.get("LUNA_TTS_MAX_CHARS", "2500").strip() or "2500")
+    if limit > 0 and len(text) > limit:
+        text = text[: limit - 3].rstrip() + "..."
     if not text:
         return "", ""
     text = _enhance_interjections_for_tts(text)
@@ -370,11 +392,11 @@ def synthesize_playback_bundle(
     """Synthesize reply audio + lip-sync timeline for the VRM viewer (no local playback)."""
     if not tts_enabled():
         return None
-    text, emotion = _clean_text_for_tts(reply_text)
+    edge_voice = (voice or "").strip() or get_effective_speaker()
+    text, emotion = _clean_text_for_tts(_reply_text_before_tts_clean(reply_text, edge_voice))
     if not text:
         return None
     rate, pitch = _prosody_for_emotion(emotion)
-    edge_voice = (voice or "").strip() or get_effective_speaker()
     backend = _backend()
     with _tts_play_lock:
         try:
@@ -515,7 +537,8 @@ def maybe_speak(
     """Synthesize and PLAY a reply on local speakers (when ``LUNA_TTS_PLAY_TARGET`` includes ``local``)."""
     if not tts_enabled() or not tts_play_locally():
         return
-    text, emotion = _clean_text_for_tts(reply_text)
+    edge_voice = (voice or "").strip() or get_effective_speaker()
+    text, emotion = _clean_text_for_tts(_reply_text_before_tts_clean(reply_text, edge_voice))
     if not text:
         return
     rate, pitch = _prosody_for_emotion(emotion)
@@ -552,7 +575,6 @@ def maybe_speak(
             mp3_out = Path(tmp)
             wav_out = mp3_out.with_suffix(".wav")
             try:
-                edge_voice = (voice or "").strip() or get_effective_speaker()
                 cues_edge = _synthesize_edge_to_mp3(
                     text,
                     mp3_out,
@@ -577,97 +599,398 @@ def maybe_speak(
             print(f"(LUNA_TTS {backend} synthesis failed: {exc})", flush=True)
 
 
-def synthesize_reply_to_file(reply_text: str) -> Path | None:
-    """Synthesize a reply to a standalone audio file without playing it.
+def _edge_tts_chunk_chars() -> int:
+    raw = (os.environ.get("LUNA_TTS_CHUNK_CHARS", "220").strip() or "220")
+    try:
+        return max(80, min(400, int(raw)))
+    except ValueError:
+        return 220
 
-    Returns the path to an MP3 (Edge backend) or WAV (Chatterbox). The caller
-    owns the file and should delete it when finished (e.g. after uploading to
-    Discord). Returns None if TTS is disabled or the reply is empty.
-    """
-    if not tts_enabled():
-        return None
-    text, emotion = _clean_text_for_tts(reply_text)
-    if not text:
-        return None
-    rate, pitch = _prosody_for_emotion(emotion)
 
-    backend = _backend()
+def _synthesize_edge_to_mp3_file(
+    text: str,
+    mp3_out: Path,
+    *,
+    voice: str,
+    rate: str,
+    pitch: str,
+) -> None:
+    """Edge TTS export for Discord/files — chunks long replies so nothing is cut off."""
+    chunk_chars = _edge_tts_chunk_chars()
+    chunks = _split_tts_chunks(text, chunk_chars) or [text]
+    # Edge often truncates single requests; always concat when text is non-trivial.
+    if len(chunks) <= 1 and len(text) <= chunk_chars:
+        _synthesize_edge_to_mp3(text, mp3_out, voice=voice, rate=rate, pitch=pitch)
+        return
+
+    wav_parts: list[Path] = []
+    try:
+        for i, part in enumerate(chunks):
+            fd_p, p_tmp = tempfile.mkstemp(suffix=".mp3", prefix=f"luna_edge_file_{i}_")
+            os.close(fd_p)
+            mp3_part = Path(p_tmp)
+            wav_part = mp3_part.with_suffix(".wav")
+            _synthesize_edge_to_mp3(part, mp3_part, voice=voice, rate=rate, pitch=pitch)
+            _mp3_to_wav(mp3_part, wav_part)
+            wav_parts.append(wav_part)
+            try:
+                mp3_part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_edge_file_combined_")
+        os.close(fd)
+        combined_wav = Path(tmp)
+        try:
+            _concat_audio_with_ffmpeg(wav_parts, combined_wav)
+            _wav_to_mp3(combined_wav, mp3_out)
+        finally:
+            try:
+                combined_wav.unlink(missing_ok=True)
+            except OSError:
+                pass
+    finally:
+        for p in wav_parts:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _env_truthy(key: str, default: bool = False) -> bool:
+    raw = (os.environ.get(key, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+def discord_tts_single_file() -> bool:
+    """Discord replies use one MP3 (default). Set LUNA_DISCORD_TTS_SINGLE_FILE=0 to split."""
+    return _env_truthy("LUNA_DISCORD_TTS_SINGLE_FILE", default=True)
+
+
+def _discord_tts_max_chars() -> int:
+    """Character cap for Discord TTS text; 0 = no limit (full reply, any duration)."""
+    raw = (os.environ.get("LUNA_DISCORD_TTS_MAX_CHARS") or "0").strip()
+    if raw.lower() in ("0", "none", "unlimited", "off"):
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _discord_tts_chars_per_file() -> int:
+    raw = (os.environ.get("LUNA_DISCORD_TTS_CHARS_PER_FILE") or "").strip()
+    if raw:
+        try:
+            return max(100, min(400, int(raw)))
+        except ValueError:
+            pass
+    return 200
+
+
+def _discord_tts_max_files() -> int:
+    raw = (os.environ.get("LUNA_DISCORD_TTS_MAX_FILES") or "6").strip()
+    try:
+        return max(2, min(10, int(raw)))
+    except ValueError:
+        return 6
+
+
+def _find_text_break(s: str, ideal: int, start: int, end: int) -> int:
+    """Return split index in ``[start, end]`` closest to ``ideal``."""
+    window = s[start:end]
+    if not window:
+        return end
+    local_ideal = ideal - start
+    best = -1
+    for sep in (". ", "! ", "? ", "; ", ", ", "\n"):
+        idx = window.rfind(sep, 0, local_ideal + 40)
+        if idx >= 0:
+            cut = start + idx + len(sep)
+            if cut > best:
+                best = cut
+    if best > start:
+        return best
+    idx = window.rfind(" ", max(0, local_ideal - 50), local_ideal + 50)
+    if idx > 0:
+        return start + idx
+    return min(end, ideal)
+
+
+def _split_text_for_discord_files(text: str) -> list[str]:
+    """Split cleaned reply into multiple MP3-sized parts (each <= chars per file)."""
+    s = (text or "").strip()
+    if not s:
+        return []
+    per_file = _discord_tts_chars_per_file()
+    if len(s) <= per_file:
+        return [s]
+
+    max_files = _discord_tts_max_files()
+    n = min(max_files, max(2, (len(s) + per_file - 1) // per_file))
+    parts: list[str] = []
+    start = 0
+    size = len(s)
+    for i in range(n - 1):
+        remaining_parts = n - i
+        remaining_len = size - start
+        target_len = max(per_file, remaining_len // remaining_parts)
+        ideal = start + target_len
+        end_bound = min(size, start + per_file + 40)
+        cut = _find_text_break(s, ideal, start + max(20, per_file // 3), end_bound)
+        if cut <= start:
+            cut = min(size, start + per_file)
+        chunk = s[start:cut].strip()
+        if chunk:
+            parts.append(chunk)
+        start = cut
+    tail = s[start:].strip()
+    if tail:
+        parts.append(tail)
+    # Hard-cap any oversized slice (break logic can overshoot slightly).
+    capped: list[str] = []
+    for part in parts:
+        c = part
+        while len(c) > per_file:
+            split_at = c.rfind(" ", 0, per_file + 1)
+            if split_at < 40:
+                split_at = per_file
+            capped.append(c[:split_at].strip())
+            c = c[split_at:].strip()
+        if c:
+            capped.append(c)
+    return [p for p in capped if p]
+
+
+def _synthesize_discord_part_to_file(
+    part: str,
+    *,
+    edge_voice: str,
+    rate: str,
+    pitch: str,
+    backend: str,
+    emotion: str,
+) -> Path | None:
+    if not (part or "").strip():
+        return None
     try:
         if backend == "chatterbox":
-            chunk_chars = int(os.environ.get("LUNA_CHATTERBOX_CHUNK_CHARS", "120").strip() or "120")
-            chunks = _split_tts_chunks(text, chunk_chars) or [text]
-            # Chatterbox needs to render each chunk; concatenate to a single WAV.
-            fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_chatter_out_")
+            chunk_chars = int(
+                os.environ.get("LUNA_CHATTERBOX_CHUNK_CHARS", "120").strip() or "120"
+            )
+            chunks = _split_tts_chunks(part, chunk_chars) or [part]
+            fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_chatter_discord_")
             os.close(fd)
-            combined = Path(tmp)
+            out = Path(tmp)
             if len(chunks) == 1:
-                _synthesize_chatterbox_to_wav(chunks[0], combined, emotion=emotion)
-                return combined
-            # Multi-chunk: synth each to temp, then concat with ffmpeg.
+                _synthesize_chatterbox_to_wav(chunks[0], out, emotion=emotion)
+                return out
             tmp_parts: list[Path] = []
             try:
-                for i, part in enumerate(chunks):
-                    fd_p, p_tmp = tempfile.mkstemp(suffix=".wav", prefix=f"luna_chatter_part_{i}_")
+                for i, chunk in enumerate(chunks):
+                    fd_p, p_tmp = tempfile.mkstemp(
+                        suffix=".wav", prefix=f"luna_chatter_discord_{i}_"
+                    )
                     os.close(fd_p)
                     p = Path(p_tmp)
-                    _synthesize_chatterbox_to_wav(part, p, emotion=emotion)
+                    _synthesize_chatterbox_to_wav(chunk, p, emotion=emotion)
                     tmp_parts.append(p)
-                _concat_audio_with_ffmpeg(tmp_parts, combined)
+                _concat_audio_with_ffmpeg(tmp_parts, out)
             finally:
                 for p in tmp_parts:
                     try:
                         p.unlink(missing_ok=True)
                     except OSError:
                         pass
-            return combined
+            return out
 
-        # Edge: single MP3 output.
         fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_discord_")
         os.close(fd)
         mp3_out = Path(tmp)
-        _synthesize_edge_to_mp3(text, mp3_out, voice=get_effective_speaker(), rate=rate, pitch=pitch)
+        _synthesize_edge_to_mp3_file(
+            part,
+            mp3_out,
+            voice=edge_voice,
+            rate=rate,
+            pitch=pitch,
+        )
         return mp3_out
     except Exception as exc:
-        print(f"(LUNA_TTS {backend} file synth failed: {exc})", flush=True)
+        print(f"(LUNA_TTS {backend} discord part failed: {exc})", flush=True)
         return None
 
 
-def _concat_audio_with_ffmpeg(parts: list[Path], out_path: Path) -> None:
-    """Concatenate multiple WAV files into one via ffmpeg's concat demuxer."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        # Fallback: just copy the first one so we still have a usable file.
-        if parts:
-            out_path.write_bytes(parts[0].read_bytes())
-        return
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, prefix="luna_concat_"
-    ) as listfile:
-        for p in parts:
-            listfile.write(f"file '{str(p).replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'\n")
-        list_path = listfile.name
+def synthesize_discord_reply_files(
+    reply_text: str, *, voice: str | None = None
+) -> list[Path]:
+    """Synthesize Discord reply audio.
+
+    Default: **one MP3** for the full reply (no length cap; 3+ minutes ok).
+    Edge chunks are stitched inside that file. Set ``LUNA_DISCORD_TTS_SINGLE_FILE=0``
+    to attach multiple smaller MP3s instead.
+    """
+    if not tts_enabled():
+        return []
+    edge_voice = (voice or "").strip() or get_effective_speaker()
+    raw_len = len((reply_text or "").strip())
+    text, emotion = _clean_text_for_tts(
+        _reply_text_before_tts_clean(reply_text, edge_voice),
+        max_chars=_discord_tts_max_chars(),
+    )
+    if not text:
+        return []
+    rate, pitch = _prosody_for_emotion(emotion)
+    backend = _backend()
+
+    if discord_tts_single_file():
+        parts = [text]
+    else:
+        parts = _split_text_for_discord_files(text)
+
+    paths: list[Path] = []
+    for part in parts:
+        p = _synthesize_discord_part_to_file(
+            part,
+            edge_voice=edge_voice,
+            rate=rate,
+            pitch=pitch,
+            backend=backend,
+            emotion=emotion,
+        )
+        if p is not None:
+            paths.append(p)
+
+    if paths:
+        durs = [_probe_audio_duration_sec(p) for p in paths]
+        dur_note = f", ~{sum(durs):.0f}s audio" if any(durs) else ""
+        print(
+            f"(discord tts) {len(text)} chars (raw {raw_len}) -> {len(paths)} mp3"
+            f"{dur_note}",
+            flush=True,
+        )
+    return paths
+
+
+def _probe_audio_duration_sec(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not path.is_file():
+        return 0.0
     try:
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-v",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            list_path,
-            "-c",
-            "copy",
-            str(out_path),
-        ]
-        subprocess.run(cmd, capture_output=True, text=True, check=False)
-    finally:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return max(0.0, float(proc.stdout.strip()))
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        pass
+    return 0.0
+
+
+def synthesize_reply_to_file(reply_text: str, *, voice: str | None = None) -> Path | None:
+    """Synthesize a reply to a standalone audio file without playing it.
+
+    Returns the path to an MP3 (Edge backend) or WAV (Chatterbox). The caller
+    owns the file and should delete it when finished (e.g. after uploading to
+    Discord). Returns None if TTS is disabled or the reply is empty.
+
+    Prefer ``synthesize_discord_reply_files`` for Discord (may return two files).
+    """
+    files = synthesize_discord_reply_files(reply_text, voice=voice)
+    return files[0] if files else None
+
+
+def _concat_audio_pydub(parts: list[Path], out_path: Path) -> bool:
+    try:
+        from pydub import AudioSegment
+    except ImportError:
+        return False
+    if not parts:
+        return False
+    try:
+        combined = AudioSegment.empty()
+        for p in parts:
+            combined += AudioSegment.from_file(str(p))
+        fmt = "wav" if out_path.suffix.lower() == ".wav" else out_path.suffix.lstrip(".") or "wav"
+        combined.export(str(out_path), format=fmt)
+        return out_path.is_file() and out_path.stat().st_size > 32
+    except Exception as exc:
+        print(f"(LUNA_TTS concat pydub) failed: {exc}", flush=True)
+        return False
+
+
+def _concat_audio_with_ffmpeg(parts: list[Path], out_path: Path) -> None:
+    """Concatenate multiple WAV (or audio) files into one."""
+    if not parts:
+        return
+    if len(parts) == 1:
+        out_path.write_bytes(parts[0].read_bytes())
+        return
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".txt",
+            delete=False,
+            prefix="luna_concat_",
+            encoding="utf-8",
+        ) as listfile:
+            for p in parts:
+                # Windows paths: forward slashes + escaped single quotes for concat demuxer.
+                path_str = str(p.resolve()).replace("\\", "/").replace("'", "'\\''")
+                listfile.write(f"file '{path_str}'\n")
+            list_path = listfile.name
         try:
-            os.unlink(list_path)
-        except OSError:
-            pass
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                list_path,
+                "-c",
+                "copy",
+                str(out_path),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode == 0 and out_path.is_file() and out_path.stat().st_size > 32:
+                return
+            err = (proc.stderr or proc.stdout or "").strip()
+            if err:
+                print(f"(LUNA_TTS concat ffmpeg) {err[:300]}", flush=True)
+        finally:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+
+    if _concat_audio_pydub(parts, out_path):
+        return
+
+    print(
+        f"(LUNA_TTS concat) WARNING: stitched only chunk 1/{len(parts)} — "
+        "install ffmpeg on PATH or fix concat; speech may be cut off",
+        flush=True,
+    )
+    out_path.write_bytes(parts[0].read_bytes())
 
 
 def _word_to_vowel_viseme(word: str) -> str:
@@ -807,6 +1130,30 @@ def _mp3_to_wav(src: Path, dst: Path) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0 or not dst.exists() or dst.stat().st_size < 256:
         err = (proc.stderr or "").strip() or "ffmpeg mp3->wav failed"
+        raise RuntimeError(err)
+
+
+def _wav_to_mp3(src: Path, dst: Path) -> None:
+    """Convert WAV → MP3 for Discord file attachments."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg required for WAV→MP3 export")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        str(src),
+        "-codec:a",
+        "libmp3lame",
+        "-q:a",
+        "4",
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0 or not dst.exists() or dst.stat().st_size < 32:
+        err = (proc.stderr or "").strip() or "ffmpeg wav->mp3 failed"
         raise RuntimeError(err)
 
 

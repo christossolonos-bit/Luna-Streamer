@@ -39,11 +39,21 @@ function normalizeViewerAvatar(avatar?: string): ViewerAvatarId | undefined {
   return undefined;
 }
 
-function dispatchAvatarRoute(avatar?: string) {
+/** Lip-sync / TTS only — do not reload idle or reframe the stage (avoids head shake). */
+function dispatchLipSyncAvatar(avatar?: string) {
   const target = normalizeViewerAvatar(avatar);
   if (!target) return;
   window.dispatchEvent(
-    new CustomEvent("luna-active-avatar", { detail: { avatar: target } }),
+    new CustomEvent("luna-lipsync-avatar", { detail: { avatar: target } }),
+  );
+}
+
+/** Creator tab / explicit scene focus — show that VRM on stage. */
+function dispatchFocusAvatar(avatar?: string) {
+  const target = normalizeViewerAvatar(avatar);
+  if (!target) return;
+  window.dispatchEvent(
+    new CustomEvent("luna-focus-avatar", { detail: { avatar: target } }),
   );
 }
 
@@ -300,7 +310,7 @@ export function useChatBridge(enabled: boolean) {
         return;
       }
       if (msg.name === "avatar_emotion") {
-        dispatchAvatarRoute(msg.avatar);
+        dispatchLipSyncAvatar(msg.avatar);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-emotion", {
             detail: {
@@ -313,7 +323,7 @@ export function useChatBridge(enabled: boolean) {
         return;
       }
       if (msg.name === "avatar_speaking") {
-        dispatchAvatarRoute(msg.avatar);
+        dispatchLipSyncAvatar(msg.avatar);
         setAvatarSpeaking(msg.value);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-speaking", {
@@ -336,7 +346,7 @@ export function useChatBridge(enabled: boolean) {
         return;
       }
       if (msg.name === "avatar_viseme") {
-        dispatchAvatarRoute(msg.avatar);
+        dispatchLipSyncAvatar(msg.avatar);
         window.dispatchEvent(
           new CustomEvent("luna-avatar-viseme", {
             detail: {
@@ -375,7 +385,7 @@ export function useChatBridge(enabled: boolean) {
           activeSpeaker === "cohost" ||
           activeSpeaker === "himari"
         ) {
-          dispatchAvatarRoute(activeSpeaker);
+          dispatchFocusAvatar(activeSpeaker);
         }
         window.dispatchEvent(
           new CustomEvent("luna-cohost-avatar", {
@@ -414,7 +424,7 @@ export function useChatBridge(enabled: boolean) {
           return;
         }
         const driveAvatar = msg.drive_avatar !== false;
-        dispatchAvatarRoute(speaker);
+        dispatchLipSyncAvatar(speaker);
         if (speaker === "cohost" || speaker === "himari") {
           window.dispatchEvent(
             new CustomEvent("luna-cohost-avatar", {
@@ -676,7 +686,7 @@ export function useChatBridge(enabled: boolean) {
     } catch {
       /* ignore */
     }
-    dispatchAvatarRoute(target);
+    dispatchFocusAvatar(target);
   }, []);
 
   const setSpeak = useCallback((enabledValue: boolean) => {
@@ -948,18 +958,19 @@ export function useChatBridge(enabled: boolean) {
   }, []);
 
   const sendViewerCohostScene = useCallback(
-    async (inScene: boolean, partner?: "viktor" | "himari") => {
+    async (cast: { viktor: boolean; himari: boolean }) => {
       let ws: WebSocket | null = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         ws = await waitForOpenWebSocket(wsRef, 4000);
       }
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-      const payload: { type: string; in_scene: boolean; partner?: string } = {
-        type: "viewer_cohost_scene",
-        in_scene: inScene,
-      };
-      if (partner) payload.partner = partner;
-      ws.send(JSON.stringify(payload));
+      ws.send(
+        JSON.stringify({
+          type: "viewer_cohost_scene",
+          in_scene: cast.viktor || cast.himari,
+          cast: { viktor: cast.viktor, himari: cast.himari },
+        }),
+      );
       return true;
     },
     [],

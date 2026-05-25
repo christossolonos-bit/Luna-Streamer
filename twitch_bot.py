@@ -116,7 +116,8 @@ Environment (or use CLI flags where noted):
   LUNA_DISCORD_VOICE_TTS    If 1 (default), play Luna's Discord reply TTS in the connected VC when idle (see luna_discord_bot.py).
   LUNA_DISCORD_VOICE_TTS_CHANNEL_IDS  Optional allowlist of voice channel ids for VC TTS (empty = any VC).
   LUNA_DISCORD_VOICE_TTS_PAD_SEC     Extra seconds after VC reply audio (default 1.5; like viewer pad).
-  LUNA_DISCORD_GUILD_CHAT_CHANNELS  Per-server text channel allowlists (guild_id:channel_id, …).
+  LUNA_DISCORD_GUILD_CHAT_CHANNELS  Per-server allowlists (guild_id:channel_id or guild_id:*).
+  LUNA_DISCORD_GUILD_CHAT_TRIGGERS  Per-server trigger override (guild_id:all|mention).
   LUNA_DISCORD_CHAT_READ_BOTS  If 1, reply to other bots (must @Luna / say luna).
   LUNA_DISCORD_CHAT_BOT_IDS    Optional allowlist of bot user ids (empty = any bot except Luna herself).
   LUNA_DISCORD_WELCOME         If 1, post LUNA_DISCORD_WELCOME_MESSAGE when someone joins (Members intent).
@@ -166,8 +167,8 @@ from luna_tts import (
     maybe_speak,
     prewarm_edge_tts,
     set_selected_speaker,
+    synthesize_discord_reply_files,
     synthesize_playback_bundle,
-    synthesize_reply_to_file,
     tts_enabled,
     tts_play_locally,
     tts_play_to_viewer,
@@ -1937,6 +1938,19 @@ class LunaTwitchBot(commands.Bot):
             (question or "").strip(), self._cast_scene
         )
 
+    @staticmethod
+    def _discord_cohost_chat_enabled() -> bool:
+        """Discord text may route to Viktor/Himari when their names appear (like Twitch)."""
+        raw = (os.environ.get("LUNA_DISCORD_COHOST_CHAT") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        from himari_cohost import himari_enabled
+        from vampire_cohost import cohost_chat_personas_enabled
+
+        return cohost_chat_personas_enabled() or himari_enabled()
+
     def _creator_panel_reply_partner(
         self, question: str, *, creator_reply_to: str | None = None
     ) -> str:
@@ -1957,13 +1971,14 @@ class LunaTwitchBot(commands.Bot):
     def _cohost_for_chat_reply(self, question: str = "") -> bool:
         return self._chat_reply_partner(question) != "luna"
 
-    def _partner_chat_system(self, partner_id: str) -> str:
+    def _partner_chat_system(self, partner_id: str, *, for_creator_panel: bool = False) -> str:
         from himari_cohost import build_himari_chat_system, build_himari_system_prompt, himari_enabled
-        from luna_cast import format_cast_roster_block, partner_cast_line
+        from luna_cast import format_cast_roster_block, partner_cast_line, partner_display_name
+        from luna_creator import creator_chat_system_block, creator_display_name, creator_partner_mic_block
         from vampire_cohost import build_vampire_system_prompt, cohost_name
 
         if partner_id == "himari":
-            base = build_himari_chat_system()
+            base = build_himari_chat_system(for_creator_panel=for_creator_panel)
         else:
             vn = cohost_name()
             luna_ctx = build_luna_system_prompt()
@@ -1974,17 +1989,35 @@ class LunaTwitchBot(commands.Bot):
                     f"Himari (context only — never reply as her):\n"
                     f"{build_himari_system_prompt()}\n"
                 )
+            if for_creator_panel:
+                cn = creator_display_name()
+                tail = (
+                    f"**{cn}** (your creator) is speaking to you on the local viewer mic or panel — "
+                    "not anonymous live chat. Reply in your voice as plain spoken text for TTS. "
+                    "First person only (I/me/my); he/him for yourself. "
+                    "No stage directions, no third-person narration about yourself."
+                )
+            else:
+                tail = (
+                    "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, "
+                    "they want **you** — not Luna. Reply in your voice only, as plain text for TTS. "
+                    "Use he/him for yourself. "
+                    "Keep it to one short paragraph or a few sentences unless they asked for more. "
+                    "Do not prefix with your name or a role tag."
+                )
             base = (
                 f"You are {vn}, the male vampire co-host on stream with Luna.\n\n"
                 f"{build_vampire_system_prompt()}"
                 f"{cast_extra}"
                 f"\n\nLuna (your co-host — context only; never reply as Luna):\n{luna_ctx}\n\n"
-                "A viewer sent a Twitch, YouTube Live, or TikTok Live chat message. If they used your name, "
-                "they want **you** — not Luna. Reply in your voice only, as plain text for TTS. "
-                "Use he/him for yourself. "
-                "Keep it to one short paragraph or a few sentences unless they asked for more. "
-                "Do not prefix with your name or a role tag."
+                f"{tail}"
             )
+        if for_creator_panel:
+            pn = partner_display_name(partner_id)
+            base = (
+                f"{base}\n\n{creator_chat_system_block()}\n\n"
+                f"{creator_partner_mic_block(partner_name=pn, partner_id=partner_id)}"
+            ).strip()
         roster = format_cast_roster_block(self._cast_scene)
         return f"{base}\n\n{roster}".strip() if roster else base
 
@@ -2484,7 +2517,9 @@ class LunaTwitchBot(commands.Bot):
 
         messages: list[dict] = []
         if as_cohost:
-            system_content = self._partner_chat_system(partner)
+            system_content = self._partner_chat_system(
+                partner, for_creator_panel=is_creator_panel
+            )
         else:
             system_content = self._system
             roster = format_cast_roster_block(self._cast_scene)
@@ -2511,7 +2546,7 @@ class LunaTwitchBot(commands.Bot):
             system_content = self._append_cohost_dynamics_to_system(
                 system_content, as_cohost=as_cohost
             )
-        if partner in ("viktor", "himari"):
+        if partner in ("viktor", "himari") and not is_creator_panel:
             cast_block = self._cast_consciousness.block_for_partner_chat(
                 partner, as_cohost=as_cohost
             )
@@ -2904,6 +2939,7 @@ class LunaTwitchBot(commands.Bot):
         is_dm: bool,
         voice_channel_label: str | None = None,
         author_is_bot: bool = False,
+        channel_partner: str | None = None,
     ) -> tuple[str, "Path | None"]:
         """Entry point for Discord text messages.
 
@@ -2927,6 +2963,26 @@ class LunaTwitchBot(commands.Bot):
                     "ts": ts,
                 }
             )
+        allow_cohost_persona = self._discord_cohost_chat_enabled()
+        from luna_cast import partner_display_name, resolve_chat_reply_partner
+
+        forced = (channel_partner or "").strip().lower()
+        if forced in ("luna", "viktor", "himari"):
+            partner = forced
+            print(
+                f"(discord) persona channel → {partner_display_name(partner)}",
+                flush=True,
+            )
+        else:
+            partner = "luna"
+            if allow_cohost_persona:
+                partner = resolve_chat_reply_partner(question, self._cast_scene)
+                if partner != "luna":
+                    print(
+                        f"(discord) routing reply → {partner_display_name(partner)}",
+                        flush=True,
+                    )
+
         reply = await self._generate_and_dispatch_reply(
             channel_name=source,
             author=author,
@@ -2936,18 +2992,31 @@ class LunaTwitchBot(commands.Bot):
             local_speak=False,
             discord_voice_channel=voice_channel_label,
             author_is_bot=author_is_bot,
+            allow_cohost_persona=allow_cohost_persona,
+            force_speaker=partner
+            if (allow_cohost_persona or channel_partner)
+            else None,
         )
 
-        audio_path: Path | None = None
+        audio_paths: list[Path] = []
         want_chat_mp3 = _env_truthy("LUNA_DISCORD_TTS", default=True)
         want_vc_mp3 = _env_truthy("LUNA_DISCORD_VOICE_TTS", default=True) and not is_dm
         if reply and tts_enabled() and (want_chat_mp3 or want_vc_mp3):
             try:
-                audio_path = await asyncio.to_thread(synthesize_reply_to_file, reply)
+                from luna_cast import partner_edge_voice
+
+                voice_override = (
+                    partner_edge_voice(partner) if partner != "luna" else None
+                )
+                audio_paths = await asyncio.to_thread(
+                    synthesize_discord_reply_files,
+                    reply,
+                    voice=voice_override,
+                )
             except Exception as exc:
                 print(f"(discord tts) synth failed: {exc}", flush=True)
-                audio_path = None
-        return reply, audio_path
+                audio_paths = []
+        return reply, audio_paths
 
     @commands.command(name="ai", aliases=["luna"])
     async def cmd_ai(self, ctx: commands.Context, *, question: str | None = None) -> None:

@@ -280,6 +280,19 @@
   box-shadow: 0 0 0 2px rgba(255, 182, 193, 0.55);
 }
 
+.dock-btn--cast-duo.dock-btn--active {
+  color: #e8b4ff;
+  border-color: rgba(200, 120, 255, 0.7);
+  background: linear-gradient(
+    135deg,
+    rgba(120, 60, 200, 0.2),
+    rgba(255, 140, 180, 0.15)
+  );
+  box-shadow:
+    0 0 16px rgba(180, 100, 255, 0.4),
+    0 0 8px rgba(255, 160, 200, 0.25);
+}
+
 .dock-btn--cohost-opts.dock-btn--active,
 .dock-cohost-cluster--open .dock-btn--cohost-opts {
   color: #c9a0ff;

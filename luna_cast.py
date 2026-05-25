@@ -319,14 +319,22 @@ def resolve_creator_reply_partner(
         return "luna"
 
     target = (explicit_target or "").strip().lower()
+    if target == "luna":
+        return "luna"
     if target in ("cohost", "viktor"):
         if scene.viktor_in_scene or cohost_enabled():
             return "viktor"
     elif target == "himari":
         if scene.himari_in_scene or himari_enabled():
             return "himari"
-    elif target == "luna":
-        return "luna"
+
+    on_stage = scene.idle_partner_ids()
+    if (
+        not target
+        and len(on_stage) == 1
+        and not chat_directed_at_luna(text)
+    ):
+        return on_stage[0]
 
     fallback = resolve_chat_reply_partner(text, scene)
     if fallback != "luna":

@@ -54,7 +54,10 @@ export class VrmRuntime {
   private readonly _stageCenterScratch = new THREE.Vector3();
   private himariInScene = false;
   private activeAvatar: "luna" | "cohost" | "himari" = "luna";
-  private dualLayoutEnabled = false;
+  /** Viktor summoned from the dock (on stage for cast / banter). */
+  private cohostInScene = false;
+  /** Bot banter trio: Luna + Viktor + Himari (not Viktor+Himari dock pair). */
+  private castTrioWithLuna = false;
   private static readonly COHOST_SIDE_GAP = 0.18;
   /** At dismiss: co-host root minus Luna root (world), so re-summon can place Viktor without moving Luna. */
   private readonly _savedCohostOffsetFromLuna = new THREE.Vector3();
@@ -398,6 +401,8 @@ export class VrmRuntime {
 
   private _applyJawBeforeHumanoidUpdate() {
     // Called after vrm.update so idle/body animation does not overwrite jaw quaternions.
+    // Viktor/Himari: jaw bone rotation fights VRMA neck/head and causes visible shaking.
+    if (this.activeAvatar !== "luna") return;
     const model = this.activeVrm();
     if (!model || !this._jawRestQuat) return;
     const jaw = model.humanoid.getNormalizedBoneNode(VRMHumanBoneName.Jaw);
@@ -705,6 +710,38 @@ export class VrmRuntime {
     }
   }
 
+  private _layoutCastMemberBesideAnchor(
+    anchorVrm: VRM,
+    anchorPivot: THREE.Group,
+    partnerVrm: VRM,
+    partnerPivot: THREE.Group,
+    side: "left" | "right",
+  ): void {
+    anchorPivot.updateMatrixWorld(true);
+    const anchorBox = this._worldBounds(anchorVrm, anchorPivot).clone();
+
+    partnerPivot.position.copy(anchorPivot.position);
+    partnerPivot.rotation.set(0, 0, 0);
+    partnerPivot.updateMatrixWorld(true);
+    const partnerAtAnchor = this._worldBounds(partnerVrm, partnerPivot).clone();
+
+    const gap = VrmRuntime.COHOST_SIDE_GAP;
+    const offsetX =
+      side === "right"
+        ? anchorBox.max.x + gap - partnerAtAnchor.min.x
+        : anchorBox.min.x - gap - partnerAtAnchor.max.x;
+    const anchorCenterZ = (anchorBox.min.z + anchorBox.max.z) * 0.5;
+    const partnerCenterZ = (partnerAtAnchor.min.z + partnerAtAnchor.max.z) * 0.5;
+    const anchorCenterY = (anchorBox.min.y + anchorBox.max.y) * 0.5;
+    const partnerCenterY = (partnerAtAnchor.min.y + partnerAtAnchor.max.y) * 0.5;
+    const offsetY = anchorCenterY - partnerCenterY;
+
+    partnerPivot.position.x += offsetX;
+    partnerPivot.position.y += offsetY;
+    partnerPivot.position.z += anchorCenterZ - partnerCenterZ;
+    partnerPivot.updateMatrixWorld(true);
+  }
+
   /**
    * Place a co-host beside Luna using the same math as Viktor (right side).
    * Himari uses the mirrored left-side formula with identical Y/Z alignment.
@@ -715,30 +752,13 @@ export class VrmRuntime {
     side: "left" | "right",
   ): void {
     if (!this.vrm || !this.lunaPivot) return;
-
-    this.lunaPivot.updateMatrixWorld(true);
-    const lunaBox = this._worldBounds(this.vrm, this.lunaPivot).clone();
-
-    partnerPivot.position.copy(this.lunaPivot.position);
-    partnerPivot.rotation.set(0, 0, 0);
-    partnerPivot.updateMatrixWorld(true);
-    const partnerAtLuna = this._worldBounds(partnerVrm, partnerPivot).clone();
-
-    const gap = VrmRuntime.COHOST_SIDE_GAP;
-    const offsetX =
-      side === "right"
-        ? lunaBox.max.x + gap - partnerAtLuna.min.x
-        : lunaBox.min.x - gap - partnerAtLuna.max.x;
-    const lunaCenterZ = (lunaBox.min.z + lunaBox.max.z) * 0.5;
-    const partnerCenterZ = (partnerAtLuna.min.z + partnerAtLuna.max.z) * 0.5;
-    const lunaCenterY = (lunaBox.min.y + lunaBox.max.y) * 0.5;
-    const partnerCenterY = (partnerAtLuna.min.y + partnerAtLuna.max.y) * 0.5;
-    const offsetY = lunaCenterY - partnerCenterY;
-
-    partnerPivot.position.x += offsetX;
-    partnerPivot.position.y += offsetY;
-    partnerPivot.position.z += lunaCenterZ - partnerCenterZ;
-    partnerPivot.updateMatrixWorld(true);
+    this._layoutCastMemberBesideAnchor(
+      this.vrm,
+      this.lunaPivot,
+      partnerVrm,
+      partnerPivot,
+      side,
+    );
   }
 
   private _layoutCohostBesideLuna() {
@@ -761,8 +781,95 @@ export class VrmRuntime {
   private _cohostVisibleOnStage(): boolean {
     return !!(
       this.cohostVrm?.scene.visible &&
-      (this.dualLayoutEnabled || this._chatReplyTakeover)
+      (this.cohostInScene || this._chatReplyTakeover)
     );
+  }
+
+  /** Dock cast layout: Luna+Viktor, Luna+Himari, Viktor+Himari (both toggles), or Luna solo. */
+  private _syncCastStageLayout(): void {
+    if (!this.vrm) return;
+    const viktor = this.cohostInScene && !!this.cohostVrm;
+    const himari = this.himariInScene && !!this.himariVrm;
+
+    if (!viktor && !himari) {
+      this.vrm.scene.visible = true;
+      if (this.cohostVrm) this.cohostVrm.scene.visible = false;
+      if (this.himariVrm) this.himariVrm.scene.visible = false;
+      this._applyDefaultStageFraming(this.lunaPivot!, this.vrm);
+      this._orientAvatarTowardCamera(this.vrm);
+      this.cb.onSceneStatus("Luna solo");
+      return;
+    }
+
+    if (viktor && himari) {
+      if (this.castTrioWithLuna) {
+        this.vrm.scene.visible = true;
+        this.himariVrm!.scene.visible = true;
+        this.cohostVrm!.scene.visible = true;
+        this._applyCastLayoutPositions();
+        this.cb.onSceneStatus("Cast on stage: Luna + Viktor + Himari");
+        return;
+      }
+      this.vrm.scene.visible = false;
+      this.himariVrm!.scene.visible = true;
+      this.cohostVrm!.scene.visible = true;
+      this._applyDefaultStageFraming(this.himariPivot!, this.himariVrm!);
+      this._orientAvatarTowardCamera(this.himariVrm!);
+      this._layoutCastMemberBesideAnchor(
+        this.himariVrm!,
+        this.himariPivot!,
+        this.cohostVrm!,
+        this.cohostPivot!,
+        "right",
+      );
+      this._centerCastGroupOnScreen();
+      this.cb.onSceneStatus("Co-host duo on stage: Viktor + Himari");
+      return;
+    }
+
+    this.vrm.scene.visible = true;
+    if (viktor && this.cohostVrm) {
+      this.cohostVrm.scene.visible = true;
+    } else if (this.cohostVrm) {
+      this.cohostVrm.scene.visible = false;
+    }
+    if (himari && this.himariVrm) {
+      this.himariVrm.scene.visible = true;
+    } else if (this.himariVrm) {
+      this.himariVrm.scene.visible = false;
+    }
+
+    if (viktor) {
+      if (
+        this._haveSavedCohostRelativePlacement &&
+        this.lunaPivot &&
+        this.cohostPivot
+      ) {
+        this.cohostPivot.position
+          .copy(this.lunaPivot.position)
+          .add(this._savedCohostOffsetFromLuna);
+        this._haveSavedCohostRelativePlacement = false;
+      } else {
+        this._layoutCohostBesideLuna();
+      }
+      this._centerCastGroupOnScreen();
+      this.cb.onSceneStatus("Cast on stage: Luna + Viktor");
+    } else {
+      if (
+        this._haveSavedHimariRelativePlacement &&
+        this.lunaPivot &&
+        this.himariPivot
+      ) {
+        this.himariPivot.position
+          .copy(this.lunaPivot.position)
+          .add(this._savedHimariOffsetFromLuna);
+        this._haveSavedHimariRelativePlacement = false;
+      } else {
+        this._layoutHimariBesideLuna();
+      }
+      this._centerCastGroupOnScreen();
+      this.cb.onSceneStatus("Cast on stage: Luna + Himari");
+    }
   }
 
   /** Shift every visible cast pivot so the group bbox center sits on the orbit target. */
@@ -843,7 +950,10 @@ export class VrmRuntime {
     for (const [k, aliases] of Object.entries(mapping)) {
       this._trySetExpression(mgr, aliases, k === vowel ? a : 0);
     }
-    this._lipJawTarget = a;
+    // Jaw bone drive is Luna-only; co-hosts use blend shapes to avoid head shake.
+    if (this.activeAvatar === "luna") {
+      this._lipJawTarget = a;
+    }
   }
 
   constructor(
@@ -1679,7 +1789,7 @@ export class VrmRuntime {
   }
 
   isCohostInScene(): boolean {
-    return this.cohostVrm !== null && this.dualLayoutEnabled;
+    return this.cohostInScene && this.cohostVrm !== null;
   }
 
   isCohostSoloMode(): boolean {
@@ -1696,11 +1806,57 @@ export class VrmRuntime {
     if (!this.cohostVrm) {
       await this.loadCohostVrmFromUrl(trimmed, label, { enableLayout: false });
     }
-    await this.enableDualCohostLayout();
+    this.cohostInScene = true;
+    this.castTrioWithLuna = false;
+    this._syncCastStageLayout();
+    this._ensureCohostIdlePlaying();
   }
 
   isHimariInScene(): boolean {
     return this.himariInScene && this.himariVrm !== null;
+  }
+
+  isViktorHimariDuoInScene(): boolean {
+    return this.isCohostInScene() && this.isHimariInScene();
+  }
+
+  async summonViktorHimariDuo(
+    viktorUrl: string,
+    himariUrl: string,
+    viktorLabel = "cohost.vrm",
+    himariLabel = "himari.vrm",
+  ): Promise<void> {
+    this._creatorPanelFocus = null;
+    setCohostSoloMode(false);
+    const vUrl = viktorUrl.trim();
+    const hUrl = himariUrl.trim();
+    if (!vUrl) {
+      throw new Error("Co-host VRM URL is missing (check LUNA_COHOST_VRM in .env).");
+    }
+    if (!hUrl) {
+      throw new Error("Himari VRM URL is missing (check LUNA_HIMARI_VRM in .env).");
+    }
+    if (!this.cohostVrm) {
+      await this.loadCohostVrmFromUrl(vUrl, viktorLabel, { enableLayout: false });
+    }
+    if (!this.himariVrm) {
+      await this.loadHimariVrmFromUrl(hUrl, himariLabel);
+    }
+    this.cohostInScene = true;
+    this.himariInScene = true;
+    this.castTrioWithLuna = false;
+    this._syncCastStageLayout();
+    this._ensureCohostIdlePlaying();
+    await this._ensureHimariIdleForAppearance();
+  }
+
+  dismissViktorHimariDuo(): void {
+    if (this.cohostInScene) {
+      this.dismissCohost();
+    }
+    if (this.himariInScene) {
+      this.dismissHimari();
+    }
   }
 
   async summonHimari(url: string, label = "himari.vrm"): Promise<void> {
@@ -1713,23 +1869,9 @@ export class VrmRuntime {
       await this.loadHimariVrmFromUrl(trimmed, label);
     }
     this.himariInScene = true;
-    this.himariVrm!.scene.visible = true;
-    if (this.vrm) {
-      if (
-        this._haveSavedHimariRelativePlacement &&
-        this.himariVrm
-      ) {
-        this.himariPivot!.position
-          .copy(this.lunaPivot!.position)
-          .add(this._savedHimariOffsetFromLuna);
-        this._haveSavedHimariRelativePlacement = false;
-      } else {
-        this._applyCastLayoutPositions();
-      }
-    }
-    this.cb.onSceneStatus(
-      `${label} on stage · left-drag on body: rotate · right-drag on body: move`,
-    );
+    this.castTrioWithLuna = false;
+    this._syncCastStageLayout();
+    await this._ensureHimariIdleForAppearance();
   }
 
   dismissHimari(): void {
@@ -1744,14 +1886,16 @@ export class VrmRuntime {
       this._haveSavedHimariRelativePlacement = false;
     }
     this.himariInScene = false;
-    this.himariVrm.scene.visible = false;
+    if (!this.cohostInScene) {
+      this.castTrioWithLuna = false;
+    }
     if (this.activeAvatar === "himari") {
       this.activeAvatar = "luna";
       this._resetMouth(this.vrm);
       this._resetMouth(this.himariVrm);
       this._captureJawRestPose();
     }
-    this.cb.onSceneStatus("Himari dismissed");
+    this._syncCastStageLayout();
   }
 
   async loadHimariVrmFromUrl(url: string, label = "himari.vrm"): Promise<void> {
@@ -1779,12 +1923,16 @@ export class VrmRuntime {
   }
 
   dismissCohost(): void {
-    setCohostSoloMode(true);
     stopViewerTts();
     window.dispatchEvent(
       new CustomEvent("luna-avatar-speaking", { detail: false }),
     );
-    if (!this.cohostVrm) return;
+    if (!this.cohostVrm) {
+      this.cohostInScene = false;
+      this.castTrioWithLuna = false;
+      this._syncCastStageLayout();
+      return;
+    }
     if (this.lunaPivot && this.cohostPivot) {
       this._savedCohostOffsetFromLuna
         .copy(this.cohostPivot.position)
@@ -1797,14 +1945,19 @@ export class VrmRuntime {
     this.avatarDragMove = null;
     this.interactionPointerId = null;
     this.controls.enabled = true;
-    this.dualLayoutEnabled = false;
-    this.clearCohostVrm();
-    this._resetMouth(this.vrm);
-    this._lipJawTarget = 0;
-    this._lipJawSmoothed = 0;
-    this.activeAvatar = "luna";
-    this._captureJawRestPose();
-    this.cb.onSceneStatus("Luna solo — summon co-host when you want them back");
+    this.cohostInScene = false;
+    if (!this.himariInScene) {
+      this.castTrioWithLuna = false;
+    }
+    if (this.activeAvatar === "cohost") {
+      this._resetMouth(this.vrm);
+      this._resetMouth(this.cohostVrm);
+      this._lipJawTarget = 0;
+      this._lipJawSmoothed = 0;
+      this.activeAvatar = "luna";
+      this._captureJawRestPose();
+    }
+    this._syncCastStageLayout();
   }
 
   private _prepareVrmScene(vrm: VRM) {
@@ -1853,8 +2006,11 @@ export class VrmRuntime {
     }
   }
 
-  /** Both avatars on screen; lip-sync follows ``setActiveSpeaker`` only. */
-  async enableDualCohostLayout(vrmUrl?: string): Promise<void> {
+  /** Bot / bridge: put Viktor on stage (optionally Luna+Viktor+Himari trio). */
+  async enableDualCohostLayout(
+    vrmUrl?: string,
+    opts?: { trioWithLuna?: boolean },
+  ): Promise<void> {
     this._creatorPanelFocus = null;
     if (getCohostSoloMode()) {
       return;
@@ -1864,28 +2020,15 @@ export class VrmRuntime {
     }
     if (!this.cohostVrm) return;
 
-    const alreadySideBySide = this.dualLayoutEnabled;
-    this.dualLayoutEnabled = true;
-    if (this.vrm) this.vrm.scene.visible = true;
-    this.cohostVrm.scene.visible = true;
-
-    if (alreadySideBySide) {
-      /* Bot may resend dual_layout while both are already up — keep user-placed roots. */
-    } else if (this._haveSavedCohostRelativePlacement && this.vrm && this.cohostVrm) {
-      /* Re-summon after dismiss: keep Luna where she is; restore Viktor relative to her. */
-      this.cohostPivot!.position
-        .copy(this.lunaPivot!.position)
-        .add(this._savedCohostOffsetFromLuna);
-      this._haveSavedCohostRelativePlacement = false;
-    } else {
-      this._applyCastLayoutPositions();
+    setCohostSoloMode(false);
+    this.cohostInScene = true;
+    if (opts?.trioWithLuna) {
+      this.castTrioWithLuna = true;
     }
-
+    this._syncCastStageLayout();
+    this._ensureCohostIdlePlaying();
     this.activeAvatar = "luna";
     this._captureJawRestPose();
-    this.cb.onSceneStatus(
-      "Cast on stage · left-drag on a body: rotate · right-drag on a body: move · right-drag empty: pan · scroll: zoom",
-    );
   }
 
   setActiveSpeaker(speaker: "luna" | "cohost" | "himari" | "viktor") {
@@ -2080,6 +2223,13 @@ export class VrmRuntime {
       return;
     }
 
+    if (this.cohostInScene) {
+      this.setActiveSpeaker("cohost");
+      await this._ensureCohostIdleForAppearance();
+      this.cb.onSceneStatus("Viktor (Twitch/YouTube chat reply)");
+      return;
+    }
+
     await this.enableDualCohostLayout(url || undefined);
     this.setActiveSpeaker("cohost");
     await this._ensureCohostIdleForAppearance();
@@ -2105,7 +2255,7 @@ export class VrmRuntime {
       }
       return;
     }
-    if (this.dualLayoutEnabled && this.activeAvatar === "cohost") {
+    if (this.cohostInScene && this.activeAvatar === "cohost") {
       this.setActiveSpeaker("luna");
     }
   }

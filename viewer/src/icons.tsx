@@ -149,6 +149,21 @@ export function CohostSummonIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+/** Viktor + Himari co-host banter pair (both on stage, Luna off). */
+export function ViktorHimariDuoIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <circle cx="7.5" cy="9" r="2.2" />
+      <path d="M3.5 18.5v-1.4a4 4 0 0 1 8 0V18.5" />
+      <path d="M11.5 7.5V6h5v1.5" />
+      <path d="M10 7.5h8" />
+      <circle cx="17" cy="11.5" r="2" />
+      <path d="M13 18.5v-1.3a3.5 3.5 0 0 1 8 0V18.5" />
+      <path d="M12 12h2" strokeWidth={2.5} />
+    </svg>
+  );
+}
+
 /** Shrine maiden co-host (Himari) — torii + figure. */
 export function HimariSummonIcon(props: SVGProps<SVGSVGElement>) {
   return (

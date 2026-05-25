@@ -111,6 +111,22 @@ def cohost_replies_to_creator_enabled() -> bool:
     return cohost_chat_personas_enabled() or himari_enabled()
 
 
+def creator_partner_mic_block(*, partner_name: str, partner_id: str) -> str:
+    """Extra rules when Viktor/Himari answer the creator on panel or enrolled mic."""
+    pn = (partner_name or "").strip() or "Co-host"
+    pron = "she/her" if (partner_id or "").strip().lower() == "himari" else "he/him"
+    return (
+        f"## Speaking to your creator on mic\n"
+        f"You are **{pn}**. The streamer is talking to **you** directly (viewer mic or panel), "
+        "not a random Twitch chatter.\n"
+        f"- Reply in **first person** only (I, me, my) — never narrate yourself in third person "
+        f"(no \"{pn} says\", \"she/he does\", or \"{pn} is blushing\").\n"
+        f"- No stage directions or action lines (*blushes*, *fidgets*, *looks away*) — spoken dialogue only.\n"
+        f"- Use {pron} for yourself when needed; keep it natural for TTS.\n"
+        f"- The chat UI labels your line as **{pn}** — do not open with your name every time."
+    )
+
+
 def creator_chat_system_block(*, name: str | None = None) -> str:
     """Injected into Luna/Viktor system prompts when the creator is speaking."""
     n = (name or creator_display_name()).strip() or "Creator"
