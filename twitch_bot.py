@@ -38,7 +38,7 @@ Environment (or use CLI flags where noted):
   LUNA_TTS_SPEAKER   Initial voice id
   LUNA_TTS_VOICES    CSV voice list (voice or voice:Label) for viewer menu
   LUNA_VIEWER_VOICE_BLOCK_AFTER_TTS_SEC  Seconds after TTS ends before mic STT (default 1.5; 0=off).
-  LUNA_TTS_VIEWER_WAIT_MAX_SEC       Max seconds live chat blocks on viewer TTS (default 18).
+  LUNA_TTS_VIEWER_WAIT_MAX_SEC       Max seconds to wait for viewer TTS to finish (default 120).
   LUNA_CREATOR_TTS_BLOCK_UNTIL_DONE    If 1, panel/voice waits for TTS (default 0).
   LUNA_STT_LOCAL_MODEL  faster-whisper size (default tiny); LUNA_STT_LOCAL_DEVICE cpu|cuda (unset = auto GPU if available)
   LUNA_SPEAKER_ONLY  If 1, viewer mic clips must match the enrolled voice (see chat panel "Enroll my voice")
@@ -342,13 +342,17 @@ def _speaker_state_control_message() -> dict:
     }
 
 
-def viewer_avatar_id(partner_id: str | None = None, *, speaker: str = "luna") -> str:
+def viewer_avatar_id(partner_id: str | None = None, *, speaker: str | None = None) -> str:
     """Map cast partner / banter speaker to viewer lip-sync target (``luna`` | ``cohost`` | ``himari``)."""
-    if speaker == "luna":
+    sp = (speaker or "").strip().lower()
+    pid = (partner_id or "").strip().lower()
+    if sp == "luna":
         return "luna"
-    if (partner_id or "").strip().lower() == "himari":
+    if pid == "himari":
         return "himari"
-    return "cohost"
+    if pid in ("viktor", "cohost") or sp in ("cohost", "viktor"):
+        return "cohost"
+    return "luna"
 
 
 def detect_avatar_emotion(text: str) -> str:
@@ -884,23 +888,25 @@ class LunaTwitchBot(commands.Bot):
         )
 
     def _viewer_tts_wait_max_sec(self) -> float:
-        raw = (os.environ.get("LUNA_TTS_VIEWER_WAIT_MAX_SEC") or "18").strip() or "18"
+        raw = (os.environ.get("LUNA_TTS_VIEWER_WAIT_MAX_SEC") or "120").strip() or "120"
         try:
             cap = float(raw)
         except ValueError:
-            cap = 18.0
-        return max(4.0, min(cap, 120.0))
+            cap = 120.0
+        return max(8.0, min(cap, 600.0))
 
     def _creator_tts_blocks_until_done(self) -> bool:
         return _env_truthy("LUNA_CREATOR_TTS_BLOCK_UNTIL_DONE", default=False)
 
     def _viewer_tts_wait_seconds(self, bundle: object, text: str) -> float:
-        pad = float(os.environ.get("LUNA_TTS_VIEWER_WAIT_PAD_SEC", "1.5").strip() or "1.5")
+        """How long to wait for ``viewer_tts_ended`` before assuming playback done."""
+        pad = float(os.environ.get("LUNA_TTS_VIEWER_WAIT_PAD_SEC", "2").strip() or "2")
+        pad = max(0.0, min(pad, 15.0))
         dur_ms = int(getattr(bundle, "duration_ms", 0) or 0)
         audio_sec = max(0.0, dur_ms / 1000.0)
-        char_est = len((text or "").strip()) * 0.07
-        est = max(3.0, audio_sec + pad, char_est + 1.0)
-        return min(self._viewer_tts_wait_max_sec(), est)
+        char_est = len((text or "").strip()) * 0.08
+        est = max(4.0, audio_sec + pad, char_est + 1.5)
+        return min(est, self._viewer_tts_wait_max_sec())
 
     async def _wait_viewer_tts_done(self, timeout_sec: float) -> None:
         self._viewer_tts_done.clear()

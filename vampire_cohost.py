@@ -161,6 +161,12 @@ def build_vampire_system_prompt() -> str:
     return raw if raw else _DEFAULT_VAMPIRE_PERSONA
 
 
+def viewer_viktor_persona_blurb() -> str:
+    from luna_persona import persona_blurb_for_viewer
+
+    return persona_blurb_for_viewer(build_vampire_system_prompt())
+
+
 def cohost_after_chat_sec() -> float:
     """Quiet time after any Twitch/YouTube chat (or reply) before idle banter resumes."""
     raw = (os.environ.get("LUNA_COHOST_AFTER_CHAT_SEC") or "10").strip() or "10"

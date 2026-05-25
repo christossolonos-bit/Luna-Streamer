@@ -180,5 +180,29 @@ class EdgeVisemeIntegrationTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
 
+class ViewerAvatarIdTests(unittest.TestCase):
+    def test_partner_only_himari(self) -> None:
+        from twitch_bot import viewer_avatar_id
+
+        self.assertEqual(viewer_avatar_id("himari"), "himari")
+
+    def test_partner_only_viktor(self) -> None:
+        from twitch_bot import viewer_avatar_id
+
+        self.assertEqual(viewer_avatar_id("viktor"), "cohost")
+
+    def test_explicit_luna_speaker(self) -> None:
+        from twitch_bot import viewer_avatar_id
+
+        self.assertEqual(viewer_avatar_id("himari", speaker="luna"), "luna")
+        self.assertEqual(viewer_avatar_id("viktor", speaker="luna"), "luna")
+
+    def test_banter_speakers(self) -> None:
+        from twitch_bot import viewer_avatar_id
+
+        self.assertEqual(viewer_avatar_id("himari", speaker="himari"), "himari")
+        self.assertEqual(viewer_avatar_id("viktor", speaker="cohost"), "cohost")
+
+
 if __name__ == "__main__":
     unittest.main()

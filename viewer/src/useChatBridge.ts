@@ -676,6 +676,7 @@ export function useChatBridge(enabled: boolean) {
     } catch {
       /* ignore */
     }
+    dispatchAvatarRoute(target);
   }, []);
 
   const setSpeak = useCallback((enabledValue: boolean) => {

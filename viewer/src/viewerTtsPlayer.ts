@@ -42,14 +42,20 @@ export function stopViewerTts() {
   }
 }
 
-function safetyTimeoutMs(audio: HTMLAudioElement, payload: ViewerTtsPayload): number {
-  const fromMeta =
-    Number.isFinite(audio.duration) && audio.duration > 0
-      ? audio.duration * 1000 + 3000
-      : 0;
-  const fromPayload = (payload.duration_ms || 0) * 1.25 + 2500;
-  const charEst = 8000;
-  return Math.min(120_000, Math.max(6000, fromMeta, fromPayload, charEst));
+/** Generous ceiling — real end is ``ended`` / timeupdate, not this timer alone. */
+function safetyBudgetMs(payload: ViewerTtsPayload): number {
+  const fromPayload = (payload.duration_ms || 0) * 1.6 + 5000;
+  return Math.min(300_000, Math.max(12_000, fromPayload));
+}
+
+function playbackStillGoing(audio: HTMLAudioElement): boolean {
+  if (audio.ended) return false;
+  const d = audio.duration;
+  const t = audio.currentTime;
+  if (Number.isFinite(d) && d > 0.05) {
+    return t < d - 0.15;
+  }
+  return !audio.paused && !audio.ended;
 }
 
 /** Play TTS in the browser (OBS window / Browser Source audio). */
@@ -71,6 +77,8 @@ export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
 
   let finished = false;
   let safetyTimer = 0;
+  const playStartedAt = performance.now();
+  const budgetMs = safetyBudgetMs(payload);
 
   const finish = () => {
     if (finished || gen !== playGeneration) return;
@@ -87,11 +95,26 @@ export function playViewerTts(payload: ViewerTtsPayload, onEnded: () => void) {
   const armSafety = () => {
     if (finished || gen !== playGeneration) return;
     if (safetyTimer) window.clearTimeout(safetyTimer);
-    safetyTimer = window.setTimeout(() => finish(), safetyTimeoutMs(audio, payload));
+    safetyTimer = window.setTimeout(() => {
+      if (finished || gen !== playGeneration) return;
+      if (playbackStillGoing(audio)) {
+        armSafety();
+        return;
+      }
+      if (performance.now() - playStartedAt < budgetMs * 0.85) {
+        armSafety();
+        return;
+      }
+      finish();
+    }, 400);
   };
 
   audio.addEventListener("loadedmetadata", armSafety, { once: true });
   audio.addEventListener("durationchange", armSafety, { once: true });
+  audio.addEventListener("timeupdate", () => {
+    if (finished || gen !== playGeneration) return;
+    if (audio.ended) finish();
+  });
 
   void audio.play().then(() => {
     armSafety();

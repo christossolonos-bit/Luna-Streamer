@@ -120,6 +120,12 @@ def build_himari_system_prompt() -> str:
     return raw if raw else _DEFAULT_HIMARI_PERSONA
 
 
+def viewer_himari_persona_blurb() -> str:
+    from luna_persona import persona_blurb_for_viewer
+
+    return persona_blurb_for_viewer(build_himari_system_prompt())
+
+
 def build_himari_banter_persona_block() -> str:
     """Persona for idle banter scripts — keeps shy voice without TTS-breaking stutter spam."""
     return f"{build_himari_system_prompt()}\n\n{_BANTER_TTS_RULE}"

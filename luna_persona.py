@@ -29,6 +29,28 @@ _DEFAULT_LUNA_PERSONA = (
 )
 
 
+def persona_blurb_for_viewer(text: str, max_chars: int = 320) -> str:
+    """One paragraph for the viewer chat tabs (truncate long custom personas)."""
+    t = " ".join((text or "").split())
+    if not t:
+        return ""
+    if len(t) <= max_chars:
+        return t
+    cut = t[:max_chars]
+    for sep in (". ", "; ", " — ", " - "):
+        last = cut.rfind(sep)
+        if last >= max_chars // 2:
+            return cut[: last + len(sep.rstrip())].strip()
+    return cut.rstrip() + "…"
+
+
+def viewer_luna_persona_blurb() -> str:
+    """Short Luna persona for the VRM viewer (TWITCH_SYSTEM + LUNA_PERSONA)."""
+    tw = (os.environ.get("TWITCH_SYSTEM") or "").strip() or _DEFAULT_TWITCH_SYSTEM
+    pe = (os.environ.get("LUNA_PERSONA") or "").strip() or _DEFAULT_LUNA_PERSONA
+    return persona_blurb_for_viewer(f"{tw} {pe}")
+
+
 def build_luna_system_prompt() -> str:
     """TWITCH_SYSTEM + LUNA_PERSONA + LUNA_VOICE_RULES (each has a code default if unset)."""
     parts: list[str] = []

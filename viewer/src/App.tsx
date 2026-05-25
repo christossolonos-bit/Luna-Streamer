@@ -19,6 +19,7 @@ import { CloseIcon } from "./icons";
 import { useMicSession } from "./useMicSession";
 import { VrmRuntime, type ChromaKeyMode } from "./vrmRuntime";
 import { wsUrl } from "./useChatBridge";
+import type { ViewerAvatarId } from "./chatTypes";
 
 const CHROMA_STORAGE_KEY = "luna.chromaKey.v1";
 const CAPTIONS_STORAGE_KEY = "luna.captions.v1";
@@ -79,6 +80,7 @@ function AppInner() {
     liveSocialTitlePrompt,
     sendCohostIdleFullScriptPreference,
     sendViewerCohostScene,
+    replyTo,
     setReplyTo,
   } = useBridge();
   const mic = useMicSession();
@@ -379,9 +381,13 @@ function AppInner() {
       const rt = runtimeRef.current;
       if (!rt) return;
       const a = (avatar || "").trim().toLowerCase();
-      if (a === "luna") rt.setActiveSpeaker("luna");
-      else if (a === "himari") rt.setActiveSpeaker("himari");
-      else if (a === "cohost" || a === "viktor") rt.setActiveSpeaker("cohost");
+      let target: ViewerAvatarId = "luna";
+      if (a === "himari") target = "himari";
+      else if (a === "cohost" || a === "viktor") target = "cohost";
+      void rt.focusCreatorChatTarget(target, {
+        himariVrm: himariVrmUrlRef.current,
+        cohostVrm: cohostVrmUrlRef.current,
+      });
     };
     const onActiveAvatar = (ev: Event) => {
       const ce = ev as CustomEvent<{ avatar?: string }>;
@@ -467,6 +473,16 @@ function AppInner() {
     };
   }, [avatarSpeaking, ttsEnabled]);
 
+  // Creator chat tab → solo VRM on stage for the selected cast member.
+  useEffect(() => {
+    const rt = runtimeRef.current;
+    if (!rt || loadPct < 100) return;
+    void rt.focusCreatorChatTarget(replyTo, {
+      himariVrm: himariVrmUrlRef.current,
+      cohostVrm: cohostVrmUrlRef.current,
+    });
+  }, [replyTo, loadPct]);
+
   // VRM runtime boot.
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -521,6 +537,19 @@ function AppInner() {
     himariThinkingUrlRef.current = params.get("himari_thinking")?.trim() || "";
     const himariSkip = parseIdleSkip(params.get("himari_idle_skip_sec"));
     if (himariSkip != null) runtime.setHimariIdleSkipSec(himariSkip);
+
+    if (cohostThinkingUrlRef.current) {
+      void runtime.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
+    }
+    if (cohostIdleUrlsRef.current.length > 0) {
+      void runtime.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
+    }
+    if (himariThinkingUrlRef.current) {
+      void runtime.setHimariThinkingMotionUrl(himariThinkingUrlRef.current);
+    }
+    if (himariIdleUrlsRef.current.length > 0) {
+      void runtime.setHimariIdleMotionUrls(himariIdleUrlsRef.current);
+    }
 
     const onCohostAvatar = (ev: Event) => {
       const ce = ev as CustomEvent<{
@@ -615,6 +644,10 @@ function AppInner() {
             runtime.dismissCohost();
             setCohostInScene(false);
           }
+          void runtime.focusCreatorChatTarget(replyTo, {
+            himariVrm: himariVrmUrlRef.current,
+            cohostVrm: cohostVrmUrlRef.current,
+          });
         })
         .catch((err: unknown) => {
           const msg = err instanceof Error ? err.message : String(err);

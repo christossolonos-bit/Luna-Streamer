@@ -546,33 +546,33 @@ class _GuildPlayer:
         path: Path | None,
         duration_sec: float,
     ) -> None:
-        """Hold the queue until the reply MP3 has had time to finish (viewer-style pad)."""
+        """Hold the queue until the reply MP3 has played through (ffprobe length + pad)."""
         pad = _discord_voice_tts_pad_sec()
         probed = _probe_media_duration_sec(path) if path and path.is_file() else 0.0
-        min_play = max(duration_sec, probed, 0.5)
-        target = min(300.0, max(6.0, min_play + pad))
-        deadline = time.monotonic() + target + 8.0
-        seen_playing = False
-        play_start = 0.0
+        min_play = max(float(duration_sec or 0), probed, 0.5)
+        play_start = time.monotonic()
+        hard_deadline = play_start + min_play + pad + 45.0
 
-        while time.monotonic() < deadline:
+        while time.monotonic() < hard_deadline:
             vc = self.voice
-            playing = bool(vc and (vc.is_playing() or vc.is_paused()))
-            if playing:
-                if not seen_playing:
-                    play_start = time.monotonic()
-                seen_playing = True
-            elif seen_playing:
-                elapsed = time.monotonic() - play_start
-                if elapsed >= min_play * 0.9:
-                    break
-            await asyncio.sleep(0.12)
+            still_playing = bool(vc and (vc.is_playing() or vc.is_paused()))
+            elapsed = time.monotonic() - play_start
+            if not still_playing and elapsed >= min_play - 0.12:
+                break
+            await asyncio.sleep(0.1)
 
-        if seen_playing and play_start > 0:
-            remaining = min_play - (time.monotonic() - play_start)
-            if remaining > 0:
-                await asyncio.sleep(remaining)
+        while True:
+            vc = self.voice
+            if not (vc and (vc.is_playing() or vc.is_paused())):
+                break
+            if time.monotonic() - play_start > min_play + pad + 90.0:
+                break
+            await asyncio.sleep(0.1)
 
+        elapsed = time.monotonic() - play_start
+        tail = min_play + pad - elapsed
+        if tail > 0:
+            await asyncio.sleep(tail)
         await asyncio.sleep(pad)
 
     async def _finish_local_playback(

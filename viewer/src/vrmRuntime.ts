@@ -51,6 +51,7 @@ export class VrmRuntime {
   private himariVrm: VRM | null = null;
   private himariPivot: THREE.Group | null = null;
   private readonly _bellyPivotScratch = new THREE.Vector3();
+  private readonly _stageCenterScratch = new THREE.Vector3();
   private himariInScene = false;
   private activeAvatar: "luna" | "cohost" | "himari" = "luna";
   private dualLayoutEnabled = false;
@@ -63,6 +64,8 @@ export class VrmRuntime {
   /** Viktor answering Twitch/YouTube while Luna solo — temporary on-screen takeover. */
   private _chatReplyTakeover = false;
   private _himariChatReplyTakeover = false;
+  /** Creator panel Luna / Himari / Viktor tab — solo view of who you are talking to. */
+  private _creatorPanelFocus: "luna" | "cohost" | "himari" | null = null;
   private static readonly AVATAR_ROT_YAW_PER_PX = 0.008;
   private static readonly AVATAR_ROT_PITCH_PER_PX = 0.005;
   private static readonly AVATAR_ROT_PITCH_MIN = -0.75;
@@ -126,7 +129,42 @@ export class VrmRuntime {
   private readonly cohostAnimPhase = Math.random();
   private readonly himariAnimPhase = Math.random();
   /** Minimum seconds to play each one-shot idle clip before advancing (avoids rapid clip cycling). */
-  private static readonly MIN_IDLE_PLAY_SEC = 1.75;
+  private static readonly MIN_IDLE_PLAY_SEC = 2.75;
+  /** Blend time for co-host / Himari idle ↔ idle and thinking handoffs. */
+  private static readonly ANIM_CROSSFADE_SEC = (() => {
+    const raw = import.meta.env.VITE_ANIM_CROSSFADE_SEC;
+    if (typeof raw === "string" && raw.trim()) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0) return Math.min(3, n);
+    }
+    return 1;
+  })();
+  /** Luna idle transitions (slower default — readable on stream). */
+  private static readonly LUNA_ANIM_CROSSFADE_SEC = (() => {
+    const raw =
+      import.meta.env.VITE_LUNA_ANIM_CROSSFADE_SEC ??
+      import.meta.env.VITE_ANIM_CROSSFADE_SEC;
+    if (typeof raw === "string" && raw.trim()) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n >= 0) return Math.min(4, n);
+    }
+    return 1.5;
+  })();
+
+  private _crossfadeSecFor(avatar: "luna" | "cohost" | "himari"): number {
+    // Viktor uses the same idle loop timing as Luna.
+    return avatar === "luna" || avatar === "cohost"
+      ? VrmRuntime.LUNA_ANIM_CROSSFADE_SEC
+      : VrmRuntime.ANIM_CROSSFADE_SEC;
+  }
+
+  private _idleActionActive(action: THREE.AnimationAction | null): boolean {
+    return !!(
+      action?.isRunning() &&
+      action.getEffectiveWeight() >= 0.85 &&
+      !action.paused
+    );
+  }
   private raf = 0;
   private lastFrame = performance.now();
   private fpsAccum = 0;
@@ -149,6 +187,10 @@ export class VrmRuntime {
   private readonly _jawWorkQuat = new THREE.Quaternion();
   /** Max jaw rotation (rad) around local X on normalized jaw — many VRMs open this way. */
   private static readonly JAW_OPEN_MAX_RAD = 0.42;
+  /** World point the camera looks at — model bbox center is placed here. */
+  private static readonly STAGE_TARGET_Y = 1.05;
+  private static readonly STAGE_CAMERA_Z_MIN = 1.7;
+  private static readonly STAGE_CAMERA_Z_MAX = 3.6;
   private readonly onCanvasContextMenu = (e: Event) => {
     e.preventDefault();
   };
@@ -268,30 +310,68 @@ export class VrmRuntime {
     return this._pivotForAvatar(avatar);
   }
 
-  /** Local Y of hips/waist so pivot origin sits at the belly, not the feet. */
+  /** Local Y of waist so pivot origin sits at the belly (bbox-based — stable across VRM1 rigs). */
   private _computeBellyPivotLocalY(vrm: VRM): number {
     vrm.scene.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(vrm.scene);
+    if (!box.isEmpty()) {
+      const h = box.max.y - box.min.y;
+      if (h > 0.2) {
+        return box.min.y + h * 0.48;
+      }
+    }
     const hips = vrm.humanoid?.getNormalizedBoneNode(VRMHumanBoneName.Hips);
     if (hips) {
       hips.getWorldPosition(this._bellyPivotScratch);
       vrm.scene.worldToLocal(this._bellyPivotScratch);
       if (this._bellyPivotScratch.y > 0.05) {
-        return this._bellyPivotScratch.y;
+        const h = box.isEmpty() ? 1.6 : box.max.y - box.min.y;
+        const maxWaist = box.isEmpty()
+          ? this._bellyPivotScratch.y
+          : box.min.y + h * 0.62;
+        return Math.min(this._bellyPivotScratch.y, maxWaist);
       }
-    }
-    const box = new THREE.Box3().setFromObject(vrm.scene);
-    if (!box.isEmpty()) {
-      return box.min.y + (box.max.y - box.min.y) * 0.55;
     }
     return 0.9;
   }
 
-  private _createAvatarPivot(vrm: VRM): THREE.Group {
+  /** Place model bbox center on the orbit target (screen center). */
+  private _applyDefaultStageFraming(pivot: THREE.Group, vrm: VRM): void {
+    pivot.position.set(0, 0, 0);
+    pivot.rotation.set(0, 0, 0);
+    vrm.scene.updateMatrixWorld(true);
+    pivot.updateMatrixWorld(true);
+    const box = this._layoutBox.setFromObject(vrm.scene);
+    if (box.isEmpty()) return;
+    const h = box.max.y - box.min.y;
+    if (h < 0.25) return;
+
+    box.getCenter(this._stageCenterScratch);
+    pivot.position.x = -this._stageCenterScratch.x;
+    pivot.position.y = VrmRuntime.STAGE_TARGET_Y - this._stageCenterScratch.y;
+    pivot.position.z = -this._stageCenterScratch.z;
+
+    const fovRad = (this.camera.fov * Math.PI) / 180;
+    const fitZ = (h * 0.52) / Math.tan(fovRad / 2);
+    const z = THREE.MathUtils.clamp(
+      fitZ,
+      VrmRuntime.STAGE_CAMERA_Z_MIN,
+      VrmRuntime.STAGE_CAMERA_Z_MAX,
+    );
+    this.controls.target.set(0, VrmRuntime.STAGE_TARGET_Y, 0);
+    this.camera.position.set(0, VrmRuntime.STAGE_TARGET_Y, z);
+    this.controls.update();
+  }
+
+  private _createAvatarPivot(vrm: VRM, frameOnStage = true): THREE.Group {
     const pivot = new THREE.Group();
     const bellyY = this._computeBellyPivotLocalY(vrm);
     vrm.scene.position.set(0, -bellyY, 0);
     vrm.scene.rotation.set(0, 0, 0);
     pivot.add(vrm.scene);
+    if (frameOnStage) {
+      this._applyDefaultStageFraming(pivot, vrm);
+    }
     return pivot;
   }
 
@@ -346,7 +426,10 @@ export class VrmRuntime {
     return this.lunaAnimPhase;
   }
 
-  /** Stagger idle start; always leave enough time before clip end (phase near 1.0 used to finish instantly). */
+  /**
+   * Where to begin a one-shot idle (after skipSec bind-pose lead-in).
+   * Ensures at least ~85% of the clip (or MIN_IDLE_PLAY_SEC) plays before the end.
+   */
   private _idleStartTime(
     clip: THREE.AnimationClip,
     skipSec: number,
@@ -354,15 +437,26 @@ export class VrmRuntime {
   ): number {
     const dur = clip.duration;
     if (dur <= 0) return 0;
+    const endPad = 0.05;
     const minPlay = Math.min(
-      dur * 0.85,
-      Math.max(0.35, VrmRuntime.MIN_IDLE_PLAY_SEC),
+      dur - endPad,
+      Math.max(
+        Math.max(0.35, VrmRuntime.MIN_IDLE_PLAY_SEC),
+        dur * 0.85,
+      ),
     );
     const maxStart = Math.max(0, dur - minPlay);
     const skip = Math.min(Math.max(0, skipSec), maxStart);
     const span = Math.max(0, maxStart - skip);
     const t = skip + (this._animPhase(avatar) % 1) * span;
-    return Math.min(Math.max(0, t), Math.max(0, dur - 0.02));
+    return Math.min(Math.max(0, t), Math.max(0, dur - endPad));
+  }
+
+  /** Ignore mixer ``finished`` if the action has not reached the clip tail yet. */
+  private _idleReachedClipEnd(action: THREE.AnimationAction): boolean {
+    const clip = action.getClip();
+    if (!clip || clip.duration <= 0) return true;
+    return action.time >= clip.duration - 0.12;
   }
 
   /** Offset within a repeating thinking clip (full period — avoids a tiny first cycle then repeat). */
@@ -380,6 +474,97 @@ export class VrmRuntime {
     return Math.floor((this._animPhase(avatar) % 1) * clipCount) % clipCount;
   }
 
+  /** Stop a faded-out action after the blend completes (prevents stray ``finished`` events). */
+  private _stopActionAfterFade(action: THREE.AnimationAction, fadeSec: number): void {
+    if (fadeSec <= 0) {
+      action.stop();
+      return;
+    }
+    window.setTimeout(() => {
+      action.stop();
+    }, fadeSec * 1000 + 90);
+  }
+
+  /**
+   * Blend idle → idle after ``previous`` finished (held on last frame).
+   * ``crossFadeTo`` from a finished LoopOnce action drops weights and flashes bind T-pose;
+   * parallel fadeOut / fadeIn keeps at least one clip driving bones.
+   */
+  private _handoffFromFinishedIdle(
+    previous: THREE.AnimationAction,
+    next: THREE.AnimationAction,
+    fadeSec = VrmRuntime.ANIM_CROSSFADE_SEC,
+  ): void {
+    if (fadeSec <= 0) {
+      previous.stop();
+      this._startFreshIdleAction(next);
+      return;
+    }
+    previous.fadeOut(fadeSec);
+    next.enabled = true;
+    next.paused = false;
+    next.play();
+    next.fadeIn(fadeSec);
+    this._stopActionAfterFade(previous, fadeSec);
+    window.setTimeout(() => {
+      if (next.getEffectiveWeight() < 0.99) {
+        next.setEffectiveWeight(1);
+      }
+    }, fadeSec * 1000 + 50);
+  }
+
+  /** Gentle fade-in when no prior clip (manual VRMA load, etc.). */
+  private _fadeInAction(
+    action: THREE.AnimationAction,
+    fadeSec = VrmRuntime.ANIM_CROSSFADE_SEC,
+  ): void {
+    action.enabled = true;
+    if (fadeSec <= 0) {
+      action.setEffectiveWeight(1);
+      action.play();
+      return;
+    }
+    action.setEffectiveWeight(0);
+    action.play();
+    action.fadeIn(fadeSec);
+  }
+
+  /** First idle on load — weight must be 1 immediately or VRM stays in bind T-pose. */
+  private _startFreshIdleAction(action: THREE.AnimationAction): void {
+    action.enabled = true;
+    action.setEffectiveWeight(1);
+    action.paused = false;
+    action.play();
+  }
+
+  /** Interrupt blend (e.g. idle ↔ thinking while a clip is still moving). */
+  private _crossfadeInterrupt(
+    previous: THREE.AnimationAction | null,
+    next: THREE.AnimationAction,
+    fadeSec = VrmRuntime.ANIM_CROSSFADE_SEC,
+  ): void {
+    if (!previous || previous === next) {
+      this._fadeInAction(next, fadeSec);
+      return;
+    }
+    if (fadeSec <= 0) {
+      previous.stop();
+      this._startFreshIdleAction(next);
+      return;
+    }
+    previous.fadeOut(fadeSec);
+    next.enabled = true;
+    next.paused = false;
+    next.play();
+    next.fadeIn(fadeSec);
+    this._stopActionAfterFade(previous, fadeSec);
+    window.setTimeout(() => {
+      if (next.getEffectiveWeight() < 0.99) {
+        next.setEffectiveWeight(1);
+      }
+    }, fadeSec * 1000 + 50);
+  }
+
   /** Start a one-shot idle clip; holds last frame until the next clip (no bind-pose flash). */
   private _beginIdleClipAction(
     mixer: THREE.AnimationMixer,
@@ -387,19 +572,33 @@ export class VrmRuntime {
     previous: THREE.AnimationAction | null,
     skipSec: number,
     avatar: "luna" | "cohost" | "himari",
+    blend: "finished" | "interrupt" | "fresh" = "fresh",
   ): THREE.AnimationAction {
-    if (previous) {
-      previous.stop();
-    }
     const action = mixer.clipAction(clip);
-    action.reset();
-    action.enabled = true;
+    // reset() snaps to t=0 bind pose; after a finished clip use stop() + seek instead.
+    if (blend === "finished") {
+      action.stop();
+    } else {
+      action.reset();
+    }
     action.setLoop(THREE.LoopOnce, 1);
     action.clampWhenFinished = true;
     if (clip.duration > 0) {
       action.time = this._idleStartTime(clip, skipSec, avatar);
     }
-    action.play();
+    const fadeSec = this._crossfadeSecFor(avatar);
+    if (previous && previous !== action) {
+      if (blend === "finished") {
+        this._handoffFromFinishedIdle(previous, action, fadeSec);
+      } else {
+        this._crossfadeInterrupt(previous, action, fadeSec);
+      }
+    } else if (previous === action) {
+      // mixer.clipAction() returns the same instance for a clip — restart in place.
+      this._startFreshIdleAction(action);
+    } else {
+      this._startFreshIdleAction(action);
+    }
     return action;
   }
 
@@ -409,17 +608,13 @@ export class VrmRuntime {
     previous: THREE.AnimationAction | null,
     avatar: "luna" | "cohost" | "himari",
   ): THREE.AnimationAction {
-    if (previous) {
-      previous.stop();
-    }
     const action = mixer.clipAction(clip);
     action.reset();
-    action.enabled = true;
     action.setLoop(THREE.LoopRepeat, Infinity);
     if (clip.duration > 0) {
       action.time = this._thinkingStartTime(clip, avatar);
     }
-    action.play();
+    this._crossfadeInterrupt(previous, action, this._crossfadeSecFor(avatar));
     return action;
   }
 
@@ -476,7 +671,8 @@ export class VrmRuntime {
     return null;
   }
 
-  private _worldBounds(vrm: VRM): THREE.Box3 {
+  private _worldBounds(vrm: VRM, pivot?: THREE.Group | null): THREE.Box3 {
+    pivot?.updateMatrixWorld(true);
     vrm.scene.updateMatrixWorld(true);
     return this._layoutBox.setFromObject(vrm.scene);
   }
@@ -509,50 +705,126 @@ export class VrmRuntime {
     }
   }
 
-  /** Places co-host to Luna's side in world space. Does not move Luna (keeps summon/manual placement). */
-  private _layoutCohostBesideLuna() {
-    if (!this.vrm || !this.cohostVrm || !this.lunaPivot || !this.cohostPivot) return;
+  /**
+   * Place a co-host beside Luna using the same math as Viktor (right side).
+   * Himari uses the mirrored left-side formula with identical Y/Z alignment.
+   */
+  private _layoutCastMemberBesideLuna(
+    partnerVrm: VRM,
+    partnerPivot: THREE.Group,
+    side: "left" | "right",
+  ): void {
+    if (!this.vrm || !this.lunaPivot) return;
 
-    const lunaBox = this._worldBounds(this.vrm).clone();
-    this.cohostPivot.position.copy(this.lunaPivot.position);
-    this.cohostPivot.rotation.set(0, 0, 0);
-    const cohostAtLuna = this._worldBounds(this.cohostVrm).clone();
+    this.lunaPivot.updateMatrixWorld(true);
+    const lunaBox = this._worldBounds(this.vrm, this.lunaPivot).clone();
+
+    partnerPivot.position.copy(this.lunaPivot.position);
+    partnerPivot.rotation.set(0, 0, 0);
+    partnerPivot.updateMatrixWorld(true);
+    const partnerAtLuna = this._worldBounds(partnerVrm, partnerPivot).clone();
 
     const gap = VrmRuntime.COHOST_SIDE_GAP;
-    const offsetX = lunaBox.max.x + gap - cohostAtLuna.min.x;
+    const offsetX =
+      side === "right"
+        ? lunaBox.max.x + gap - partnerAtLuna.min.x
+        : lunaBox.min.x - gap - partnerAtLuna.max.x;
     const lunaCenterZ = (lunaBox.min.z + lunaBox.max.z) * 0.5;
-    const cohostCenterZ = (cohostAtLuna.min.z + cohostAtLuna.max.z) * 0.5;
-    const offsetY = lunaBox.min.y - cohostAtLuna.min.y;
+    const partnerCenterZ = (partnerAtLuna.min.z + partnerAtLuna.max.z) * 0.5;
+    const lunaCenterY = (lunaBox.min.y + lunaBox.max.y) * 0.5;
+    const partnerCenterY = (partnerAtLuna.min.y + partnerAtLuna.max.y) * 0.5;
+    const offsetY = lunaCenterY - partnerCenterY;
 
-    this.cohostPivot.position.x += offsetX;
-    this.cohostPivot.position.y += offsetY;
-    this.cohostPivot.position.z += lunaCenterZ - cohostCenterZ;
+    partnerPivot.position.x += offsetX;
+    partnerPivot.position.y += offsetY;
+    partnerPivot.position.z += lunaCenterZ - partnerCenterZ;
+    partnerPivot.updateMatrixWorld(true);
+  }
+
+  private _layoutCohostBesideLuna() {
+    if (!this.cohostVrm || !this.cohostPivot) return;
+    this._layoutCastMemberBesideLuna(this.cohostVrm, this.cohostPivot, "right");
   }
 
   private _layoutHimariBesideLuna() {
-    if (!this.vrm || !this.himariVrm || !this.lunaPivot || !this.himariPivot) return;
-    const lunaBox = this._worldBounds(this.vrm).clone();
-    this.himariPivot.position.copy(this.lunaPivot.position);
-    this.himariPivot.rotation.set(0, 0, 0);
-    const himariAtLuna = this._worldBounds(this.himariVrm).clone();
-    const gap = VrmRuntime.COHOST_SIDE_GAP;
-    const offsetX = lunaBox.min.x - gap - himariAtLuna.max.x;
-    const lunaCenterZ = (lunaBox.min.z + lunaBox.max.z) * 0.5;
-    const himariCenterZ = (himariAtLuna.min.z + himariAtLuna.max.z) * 0.5;
-    const offsetY = lunaBox.min.y - himariAtLuna.min.y;
-    this.himariPivot.position.x += offsetX;
-    this.himariPivot.position.y += offsetY;
-    this.himariPivot.position.z += lunaCenterZ - himariCenterZ;
+    if (!this.himariVrm || !this.himariPivot) return;
+    this._layoutCastMemberBesideLuna(this.himariVrm, this.himariPivot, "left");
   }
 
-  /** Place every visible cast member (Himari left, Viktor right of Luna). */
+  private _himariVisibleOnStage(): boolean {
+    return !!(
+      this.himariVrm?.scene.visible &&
+      (this.himariInScene || this._himariChatReplyTakeover)
+    );
+  }
+
+  private _cohostVisibleOnStage(): boolean {
+    return !!(
+      this.cohostVrm?.scene.visible &&
+      (this.dualLayoutEnabled || this._chatReplyTakeover)
+    );
+  }
+
+  /** Shift every visible cast pivot so the group bbox center sits on the orbit target. */
+  private _centerCastGroupOnScreen(): void {
+    const union = new THREE.Box3();
+    const addVisible = (vrm: VRM | null, visible: boolean) => {
+      if (!vrm || !visible) return;
+      vrm.scene.updateMatrixWorld(true);
+      union.union(this._layoutBox.setFromObject(vrm.scene));
+    };
+    const lunaVisible = !!(this.vrm?.scene.visible && this.lunaPivot);
+    addVisible(this.vrm, lunaVisible);
+    addVisible(this.himariVrm, this._himariVisibleOnStage());
+    addVisible(this.cohostVrm, this._cohostVisibleOnStage());
+    if (union.isEmpty()) return;
+
+    union.getCenter(this._stageCenterScratch);
+    const dx = -this._stageCenterScratch.x;
+    const dy = VrmRuntime.STAGE_TARGET_Y - this._stageCenterScratch.y;
+    const dz = -this._stageCenterScratch.z;
+
+    const shiftPivot = (pivot: THREE.Group | null) => {
+      if (!pivot) return;
+      pivot.position.x += dx;
+      pivot.position.y += dy;
+      pivot.position.z += dz;
+    };
+    if (lunaVisible) {
+      shiftPivot(this.lunaPivot);
+    }
+    if (this._himariVisibleOnStage()) {
+      shiftPivot(this.himariPivot);
+    }
+    if (this._cohostVisibleOnStage()) {
+      shiftPivot(this.cohostPivot);
+    }
+
+    union.getSize(this._bellyPivotScratch);
+    const span = Math.max(this._bellyPivotScratch.x, this._bellyPivotScratch.y);
+    const fovRad = (this.camera.fov * Math.PI) / 180;
+    const fitZ = (span * 0.58) / Math.tan(fovRad / 2);
+    const z = THREE.MathUtils.clamp(
+      fitZ,
+      VrmRuntime.STAGE_CAMERA_Z_MIN,
+      VrmRuntime.STAGE_CAMERA_Z_MAX,
+    );
+    this.controls.target.set(0, VrmRuntime.STAGE_TARGET_Y, 0);
+    this.camera.position.set(0, VrmRuntime.STAGE_TARGET_Y, z);
+    this.controls.update();
+  }
+
+  /** Himari left, Viktor right of Luna; then center the whole cast on screen. */
   private _applyCastLayoutPositions() {
     if (!this.vrm) return;
-    if (this.himariInScene && this.himariVrm?.scene.visible) {
+    if (this._himariVisibleOnStage()) {
       this._layoutHimariBesideLuna();
     }
-    if (this.dualLayoutEnabled && this.cohostVrm?.scene.visible) {
+    if (this._cohostVisibleOnStage()) {
       this._layoutCohostBesideLuna();
+    }
+    if (this._himariVisibleOnStage() || this._cohostVisibleOnStage()) {
+      this._centerCastGroupOnScreen();
     }
   }
 
@@ -615,10 +887,10 @@ export class VrmRuntime {
     this.scene.fog = this.sceneFog;
 
     this.camera = new THREE.PerspectiveCamera(30, 1, 0.05, 50);
-    this.camera.position.set(0, 1.35, 2.15);
+    this.camera.position.set(0, VrmRuntime.STAGE_TARGET_Y, 2.35);
 
     this.controls = new OrbitControls(this.camera, this.canvas);
-    this.controls.target.set(0, 1, 0);
+    this.controls.target.set(0, VrmRuntime.STAGE_TARGET_Y, 0);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.06;
     this.controls.minDistance = 0.8;
@@ -711,21 +983,22 @@ export class VrmRuntime {
     if (this.disposed) return;
     this.raf = requestAnimationFrame(this.loop);
 
-    if (typeof document !== "undefined" && document.hidden) {
-      return;
-    }
+    const tabHidden =
+      typeof document !== "undefined" && document.hidden;
 
     const now = performance.now();
     const dt = (now - this.lastFrame) / 1000;
     this.lastFrame = now;
 
-    this.fpsAccum += dt;
-    this.fpsFrames += 1;
-    if (this.fpsAccum >= 0.5) {
-      const fps = this.fpsFrames / this.fpsAccum;
-      this.cb.onFps(fps);
-      this.fpsAccum = 0;
-      this.fpsFrames = 0;
+    if (!tabHidden) {
+      this.fpsAccum += dt;
+      this.fpsFrames += 1;
+      if (this.fpsAccum >= 0.5) {
+        const fps = this.fpsFrames / this.fpsAccum;
+        this.cb.onFps(fps);
+        this.fpsAccum = 0;
+        this.fpsFrames = 0;
+      }
     }
 
     const delta = this.clock.getDelta();
@@ -737,19 +1010,23 @@ export class VrmRuntime {
       const lipTarget = this._lipJawTarget;
       this._lipJawSmoothed += (lipTarget - this._lipJawSmoothed) * Math.min(1, delta * 18);
     }
-    this.controls.update();
-    this._faceVisibleAvatarsTowardCamera();
+    if (!tabHidden) {
+      this.controls.update();
+      this._faceVisibleAvatarsTowardCamera();
+    }
     if (this.vrm) this.vrm.update(delta);
     if (this.cohostVrm) this.cohostVrm.update(delta);
     if (this.himariVrm) this.himariVrm.update(delta);
-    if (this.activeVrm()) {
+    if (!tabHidden && this.activeVrm()) {
       // After VRM/humanoid update so VRMA does not stomp TTS jaw/visemes.
       this._applyJawBeforeHumanoidUpdate();
       if (this._forceSpeaking || performance.now() < this._visemeUntil) {
         this._reapplyActiveLipMorphs();
       }
     }
-    this.renderer.render(this.scene, this.camera);
+    if (!tabHidden) {
+      this.renderer.render(this.scene, this.camera);
+    }
   }
 
   private _ensureMixerForCurrentVrm() {
@@ -760,20 +1037,32 @@ export class VrmRuntime {
   }
 
   private _onActionFinished = (event: THREE.Event & { action?: THREE.AnimationAction }) => {
-    if (event.action !== this.action) return;
+    const finished = event.action;
+    if (!finished || finished !== this.action) return;
     if (this.lunaThinkingActive || !this.idleModeEnabled || this.idleClips.length === 0) {
       return;
     }
-    this._playIdleAt(this.idleClipIndex % this.idleClips.length);
+    if (!this._idleReachedClipEnd(finished)) return;
+    finished.setEffectiveWeight(1);
+    this._playIdleAt(
+      this.idleClipIndex % this.idleClips.length,
+      finished,
+      "finished",
+    );
   };
 
   private _onCohostIdleFinished = (event: THREE.Event & { action?: THREE.AnimationAction }) => {
-    if (event.action !== this.cohostIdleAction) return;
+    const finished = event.action;
+    if (!finished || finished !== this.cohostIdleAction) return;
     if (this.cohostThinkingActive || !this.cohostIdleModeEnabled || this.cohostIdleClips.length === 0) {
       return;
     }
+    if (!this._idleReachedClipEnd(finished)) return;
+    finished.setEffectiveWeight(1);
     this._playCohostIdleAt(
       this.cohostIdleClipIndex % this.cohostIdleClips.length,
+      finished,
+      "finished",
     );
   };
 
@@ -784,7 +1073,11 @@ export class VrmRuntime {
     this.cohostMixer.addEventListener("finished", this._onCohostIdleFinished);
   }
 
-  private _playCohostIdleAt(index: number) {
+  private _playCohostIdleAt(
+    index: number,
+    fadeFrom: THREE.AnimationAction | null = null,
+    blend: "finished" | "interrupt" | "fresh" = "fresh",
+  ) {
     if (this.cohostThinkingActive || !this.cohostMixer || this.cohostIdleClips.length === 0) {
       return;
     }
@@ -793,12 +1086,15 @@ export class VrmRuntime {
       this.cohostIdleClips.length;
     this.cohostIdleClipIndex = (normalized + 1) % this.cohostIdleClips.length;
     const clip = this.cohostIdleClips[normalized];
+    const previous =
+      blend === "fresh" ? null : fadeFrom ?? this.cohostIdleAction;
     this.cohostIdleAction = this._beginIdleClipAction(
       this.cohostMixer,
       clip,
-      this.cohostIdleAction,
+      previous,
       this.cohostIdleSkipSec,
       "cohost",
+      blend,
     );
   }
 
@@ -808,30 +1104,48 @@ export class VrmRuntime {
 
   async setCohostIdleMotionUrls(urls: string[]): Promise<void> {
     this.cohostIdleSourceUrls = [...urls];
+    if (this.cohostIdleAction) {
+      this.cohostIdleAction.stop();
+      this.cohostIdleAction = null;
+    }
     this.cohostIdleClips = [];
     this.cohostIdleClipIndex = 0;
     this.cohostIdleModeEnabled = false;
     if (!this.cohostVrm) return;
     this._ensureMixerForCohost();
-    for (const url of urls) {
-      try {
-        const clip = await this._loadVrmaClipForVrm(this.cohostVrm, url);
-        this.cohostIdleClips.push(clip);
-      } catch {
-        /* skip bad files */
-      }
+
+    let { clips, failed } = await this._loadIdleClipsForVrm(this.cohostVrm, urls);
+    let usedFallback = false;
+    if (clips.length === 0 && this.idleSourceUrls.length > 0) {
+      const fb = await this._loadIdleClipsForVrm(this.cohostVrm, this.idleSourceUrls);
+      clips = fb.clips;
+      failed += fb.failed;
+      usedFallback = clips.length > 0;
     }
-    if (this.cohostIdleClips.length > 0) {
+
+    if (clips.length === 0) {
+      this.cb.onSceneStatus(
+        failed > 0
+          ? `Viktor idle: no clips loaded (${failed} failed) — add VRMA for this VRM in expressions1`
+          : "Viktor idle: no motion URLs configured",
+      );
+      return;
+    }
+
+    this.cohostIdleClips = clips;
+    if (!this.cohostThinkingActive) {
       this.cohostIdleModeEnabled = true;
       this.cohostIdleClipIndex = this._initialIdleClipIndex(
         this.cohostIdleClips.length,
         "cohost",
       );
-      this._playCohostIdleAt(this.cohostIdleClipIndex);
-      this.cb.onSceneStatus(
-        `Co-host idle loop (${this.cohostIdleClips.length} clip${this.cohostIdleClips.length === 1 ? "" : "s"})`,
-      );
+      this._playCohostIdleAt(this.cohostIdleClipIndex, null, "fresh");
+      this._kickIdleMixer(this.cohostVrm, this.cohostMixer);
     }
+    const note = usedFallback ? " (Luna motions retargeted)" : "";
+    this.cb.onSceneStatus(
+      `Viktor idle loop (${this.cohostIdleClips.length} clip${this.cohostIdleClips.length === 1 ? "" : "s"})${note}`,
+    );
   }
 
   private _stopCohostThinkingMotion() {
@@ -859,14 +1173,16 @@ export class VrmRuntime {
   async setCohostThinking(active: boolean): Promise<void> {
     if (!this.cohostVrm) return;
     if (!active) {
-      this._stopCohostThinkingMotion();
-      if (
-        this.cohostIdleClips.length > 0 &&
-        (this.dualLayoutEnabled || this._chatReplyTakeover)
-      ) {
+      this.cohostThinkingActive = false;
+      const fadeFrom = this.cohostThinkingAction;
+      this.cohostThinkingAction = null;
+      if (this.cohostIdleClips.length > 0) {
         this.cohostIdleModeEnabled = true;
         this._ensureMixerForCohost();
-        this._playCohostIdleAt(this.cohostIdleClipIndex);
+        this._playCohostIdleAt(this.cohostIdleClipIndex, fadeFrom, "interrupt");
+        this._kickIdleMixer(this.cohostVrm, this.cohostMixer);
+      } else if (fadeFrom) {
+        fadeFrom.fadeOut(this._crossfadeSecFor("cohost"));
       }
       return;
     }
@@ -876,17 +1192,12 @@ export class VrmRuntime {
     if (!this.cohostThinkingClip) return;
     this._ensureMixerForCohost();
     this.cohostThinkingActive = true;
-    if (this.cohostIdleAction) {
-      this.cohostIdleAction.stop();
-      this.cohostIdleAction = null;
-    }
-    if (this.cohostThinkingAction) {
-      this.cohostThinkingAction.stop();
-    }
+    const fadeFrom = this.cohostIdleAction ?? this.cohostThinkingAction;
+    this.cohostIdleAction = null;
     this.cohostThinkingAction = this._beginThinkingClipAction(
       this.cohostMixer!,
       this.cohostThinkingClip,
-      this.cohostThinkingAction,
+      fadeFrom,
       "cohost",
     );
   }
@@ -908,11 +1219,16 @@ export class VrmRuntime {
   }
 
   private _onHimariIdleFinished = (event: THREE.Event & { action?: THREE.AnimationAction }) => {
-    if (event.action !== this.himariIdleAction) return;
+    const finished = event.action;
+    if (!finished || finished !== this.himariIdleAction) return;
     if (this.himariThinkingActive || !this.himariIdleModeEnabled) return;
     if (this.himariIdleClips.length === 0) return;
+    if (!this._idleReachedClipEnd(finished)) return;
+    finished.setEffectiveWeight(1);
     this._playHimariIdleAt(
       this.himariIdleClipIndex % this.himariIdleClips.length,
+      finished,
+      "finished",
     );
   };
 
@@ -923,7 +1239,11 @@ export class VrmRuntime {
     this.himariMixer.addEventListener("finished", this._onHimariIdleFinished);
   }
 
-  private _playHimariIdleAt(index: number) {
+  private _playHimariIdleAt(
+    index: number,
+    fadeFrom: THREE.AnimationAction | null = null,
+    blend: "finished" | "interrupt" | "fresh" = "fresh",
+  ) {
     if (this.himariThinkingActive || !this.himariMixer || this.himariIdleClips.length === 0) {
       return;
     }
@@ -932,12 +1252,15 @@ export class VrmRuntime {
       this.himariIdleClips.length;
     this.himariIdleClipIndex = (normalized + 1) % this.himariIdleClips.length;
     const clip = this.himariIdleClips[normalized];
+    const previous =
+      blend === "fresh" ? null : fadeFrom ?? this.himariIdleAction;
     this.himariIdleAction = this._beginIdleClipAction(
       this.himariMixer,
       clip,
-      this.himariIdleAction,
+      previous,
       this.himariIdleSkipSec,
       "himari",
+      blend,
     );
   }
 
@@ -955,26 +1278,25 @@ export class VrmRuntime {
 
   async setHimariIdleMotionUrls(urls: string[]): Promise<void> {
     this.himariIdleSourceUrls = [...urls];
+    if (this.himariIdleAction) {
+      this.himariIdleAction.stop();
+      this.himariIdleAction = null;
+    }
     this.himariIdleClips = [];
     this.himariIdleClipIndex = 0;
     this.himariIdleModeEnabled = false;
     if (!this.himariVrm) return;
     this._ensureMixerForHimari();
-    for (const url of urls) {
-      try {
-        const clip = await this._loadVrmaClipForVrm(this.himariVrm, url);
-        this.himariIdleClips.push(clip);
-      } catch {
-        /* skip bad files */
-      }
-    }
+    const { clips } = await this._loadIdleClipsForVrm(this.himariVrm, urls);
+    this.himariIdleClips = clips;
     if (this.himariIdleClips.length > 0 && !this.himariThinkingActive) {
       this.himariIdleModeEnabled = true;
       this.himariIdleClipIndex = this._initialIdleClipIndex(
         this.himariIdleClips.length,
         "himari",
       );
-      this._playHimariIdleAt(this.himariIdleClipIndex);
+      this._playHimariIdleAt(this.himariIdleClipIndex, null, "fresh");
+      this._kickIdleMixer(this.himariVrm, this.himariMixer);
       this.cb.onSceneStatus(
         `Himari idle loop (${this.himariIdleClips.length} clip${this.himariIdleClips.length === 1 ? "" : "s"})`,
       );
@@ -1012,11 +1334,15 @@ export class VrmRuntime {
   async setHimariThinking(active: boolean): Promise<void> {
     if (!this.himariVrm || !this.himariInScene) return;
     if (!active) {
-      this._stopHimariThinkingMotion();
+      this.himariThinkingActive = false;
+      const fadeFrom = this.himariThinkingAction;
+      this.himariThinkingAction = null;
       if (this.himariIdleClips.length > 0) {
         this.himariIdleModeEnabled = true;
         this._ensureMixerForHimari();
-        this._playHimariIdleAt(this.himariIdleClipIndex);
+        this._playHimariIdleAt(this.himariIdleClipIndex, fadeFrom, "interrupt");
+      } else if (fadeFrom) {
+        fadeFrom.fadeOut(VrmRuntime.ANIM_CROSSFADE_SEC);
       }
       return;
     }
@@ -1026,17 +1352,12 @@ export class VrmRuntime {
     if (!this.himariThinkingClip) return;
     this._ensureMixerForHimari();
     this.himariThinkingActive = true;
-    if (this.himariIdleAction) {
-      this.himariIdleAction.stop();
-      this.himariIdleAction = null;
-    }
-    if (this.himariThinkingAction) {
-      this.himariThinkingAction.stop();
-    }
+    const fadeFrom = this.himariIdleAction ?? this.himariThinkingAction;
+    this.himariIdleAction = null;
     this.himariThinkingAction = this._beginThinkingClipAction(
       this.himariMixer!,
       this.himariThinkingClip,
-      this.himariThinkingAction,
+      fadeFrom,
       "himari",
     );
   }
@@ -1045,7 +1366,11 @@ export class VrmRuntime {
     this.lunaIdleSkipSec = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
   }
 
-  private _playIdleAt(index: number) {
+  private _playIdleAt(
+    index: number,
+    fadeFrom: THREE.AnimationAction | null = null,
+    blend: "finished" | "interrupt" | "fresh" = "fresh",
+  ) {
     if (
       this.lunaThinkingActive ||
       !this.mixer ||
@@ -1059,12 +1384,14 @@ export class VrmRuntime {
       this.idleClips.length;
     this.idleClipIndex = (normalized + 1) % this.idleClips.length;
     const clip = this.idleClips[normalized];
+    const previous = blend === "fresh" ? null : fadeFrom ?? this.action;
     this.action = this._beginIdleClipAction(
       this.mixer,
       clip,
-      this.action,
+      previous,
       this.lunaIdleSkipSec,
       "luna",
+      blend,
     );
   }
 
@@ -1154,36 +1481,37 @@ export class VrmRuntime {
       throw new Error("Load a VRM avatar first.");
     }
     const clip = await this._loadVrmaClipFromUrl(url);
-    if (this.action) {
-      this.action.stop();
-      this.action = null;
+    const previous = this.action;
+    const next = this.mixer.clipAction(clip);
+    next.reset();
+    next.setLoop(THREE.LoopRepeat, Infinity);
+    if (previous && previous !== next) {
+      this._crossfadeInterrupt(previous, next);
+    } else {
+      this._fadeInAction(next);
     }
-    this.action = this.mixer.clipAction(clip);
-    this.action.reset();
-    this.action.setLoop(THREE.LoopRepeat, Infinity);
-    this.action.play();
+    this.action = next;
     this.cb.onSceneStatus(`Motion loaded: ${label}`);
   }
 
   async setIdleMotionUrls(urls: string[]): Promise<void> {
     this.idleSourceUrls = [...urls];
+    if (this.action) {
+      this.action.stop();
+      this.action = null;
+    }
     this.idleClips = [];
     this.idleClipIndex = 0;
     this.idleModeEnabled = false;
     if (!this.vrm) return;
     this._ensureMixerForCurrentVrm();
-    for (const url of urls) {
-      try {
-        const clip = await this._loadVrmaClipForVrm(this.vrm, url);
-        this.idleClips.push(clip);
-      } catch {
-        // ignore invalid files and continue with remaining clips
-      }
-    }
+    const { clips } = await this._loadIdleClipsForVrm(this.vrm, urls);
+    this.idleClips = clips;
     if (this.idleClips.length > 0 && !this.lunaThinkingActive) {
       this.idleModeEnabled = true;
       this.idleClipIndex = this._initialIdleClipIndex(this.idleClips.length, "luna");
-      this._playIdleAt(this.idleClipIndex);
+      this._playIdleAt(this.idleClipIndex, null, "fresh");
+      this._kickIdleMixer(this.vrm, this.mixer);
       this.cb.onSceneStatus(`Idle motion loop active (${this.idleClips.length} clip${this.idleClips.length === 1 ? "" : "s"})`);
     }
   }
@@ -1205,15 +1533,15 @@ export class VrmRuntime {
   async setLunaThinking(active: boolean): Promise<void> {
     if (!this.vrm) return;
     if (!active) {
-      if (this.lunaThinkingAction) {
-        this.lunaThinkingAction.stop();
-        this.lunaThinkingAction = null;
-      }
+      const fadeFrom = this.lunaThinkingAction;
+      this.lunaThinkingAction = null;
       this.lunaThinkingActive = false;
       if (this.idleClips.length > 0) {
         this.idleModeEnabled = true;
         this._ensureMixerForCurrentVrm();
-        this._playIdleAt(this.idleClipIndex);
+        this._playIdleAt(this.idleClipIndex, fadeFrom, "interrupt");
+      } else if (fadeFrom) {
+        fadeFrom.fadeOut(this._crossfadeSecFor("luna"));
       }
       return;
     }
@@ -1223,17 +1551,12 @@ export class VrmRuntime {
     if (!this.lunaThinkingClip) return;
     this._ensureMixerForCurrentVrm();
     this.lunaThinkingActive = true;
-    if (this.action) {
-      this.action.stop();
-      this.action = null;
-    }
-    if (this.lunaThinkingAction) {
-      this.lunaThinkingAction.stop();
-    }
+    const fadeFrom = this.action ?? this.lunaThinkingAction;
+    this.action = null;
     this.lunaThinkingAction = this._beginThinkingClipAction(
       this.mixer!,
       this.lunaThinkingClip,
-      this.lunaThinkingAction,
+      fadeFrom,
       "luna",
     );
   }
@@ -1264,6 +1587,38 @@ export class VrmRuntime {
     }
     const vrmAnimation = animations[0] as VRMAnimation;
     return createVRMAnimationClip(vrmAnimation, vrm);
+  }
+
+  private _idleClipUsable(clip: THREE.AnimationClip): boolean {
+    return clip.duration > 0.05 && clip.tracks.length > 0;
+  }
+
+  /** Load VRMA clips retargeted to a VRM; skip empty or incompatible files. */
+  private async _loadIdleClipsForVrm(
+    vrm: VRM,
+    urls: string[],
+  ): Promise<{ clips: THREE.AnimationClip[]; failed: number }> {
+    const clips: THREE.AnimationClip[] = [];
+    let failed = 0;
+    for (const url of urls) {
+      try {
+        const clip = await this._loadVrmaClipForVrm(vrm, url);
+        if (!this._idleClipUsable(clip)) {
+          failed += 1;
+          continue;
+        }
+        clips.push(clip);
+      } catch {
+        failed += 1;
+      }
+    }
+    return { clips, failed };
+  }
+
+  private _kickIdleMixer(vrm: VRM | null, mixer: THREE.AnimationMixer | null): void {
+    if (!vrm || !mixer) return;
+    mixer.update(0);
+    vrm.update(0);
   }
 
   private async _loadVrmaClipFromUrl(url: string): Promise<THREE.AnimationClip> {
@@ -1332,6 +1687,7 @@ export class VrmRuntime {
   }
 
   async summonCohost(url: string, label = "cohost.vrm"): Promise<void> {
+    this._creatorPanelFocus = null;
     setCohostSoloMode(false);
     const trimmed = url.trim();
     if (!trimmed) {
@@ -1348,6 +1704,7 @@ export class VrmRuntime {
   }
 
   async summonHimari(url: string, label = "himari.vrm"): Promise<void> {
+    this._creatorPanelFocus = null;
     const trimmed = url.trim();
     if (!trimmed) {
       throw new Error("Himari VRM URL is missing (check LUNA_HIMARI_VRM in .env).");
@@ -1409,7 +1766,7 @@ export class VrmRuntime {
     VRMUtils.combineMorphs(vrm);
     this._prepareVrmScene(vrm);
     this.himariVrm = vrm;
-    this.himariPivot = this._createAvatarPivot(vrm);
+    this.himariPivot = this._createAvatarPivot(vrm, false);
     this._addVrmToScene(vrm, this.himariPivot);
     vrm.scene.visible = false;
     this.cb.onSceneStatus(`Himari model ready: ${label}`);
@@ -1463,6 +1820,9 @@ export class VrmRuntime {
     opts?: { enableLayout?: boolean },
   ): Promise<void> {
     if (this.cohostVrm) {
+      if (this.cohostIdleSourceUrls.length > 0) {
+        await this.setCohostIdleMotionUrls(this.cohostIdleSourceUrls);
+      }
       if (opts?.enableLayout !== false) {
         await this.enableDualCohostLayout();
       }
@@ -1478,7 +1838,7 @@ export class VrmRuntime {
     VRMUtils.combineMorphs(vrm);
     this._prepareVrmScene(vrm);
     this.cohostVrm = vrm;
-    this.cohostPivot = this._createAvatarPivot(vrm);
+    this.cohostPivot = this._createAvatarPivot(vrm, false);
     this._addVrmToScene(vrm, this.cohostPivot);
     vrm.scene.visible = false;
     this.cb.onSceneStatus(`Co-host model ready: ${label}`);
@@ -1495,6 +1855,7 @@ export class VrmRuntime {
 
   /** Both avatars on screen; lip-sync follows ``setActiveSpeaker`` only. */
   async enableDualCohostLayout(vrmUrl?: string): Promise<void> {
+    this._creatorPanelFocus = null;
     if (getCohostSoloMode()) {
       return;
     }
@@ -1538,6 +1899,111 @@ export class VrmRuntime {
     this._captureJawRestPose();
   }
 
+  /**
+   * Creator chat tab — show only the selected cast member centered on stage.
+   */
+  async focusCreatorChatTarget(
+    target: "luna" | "cohost" | "himari",
+    urls?: { himariVrm?: string; cohostVrm?: string },
+  ): Promise<void> {
+    this._creatorPanelFocus = target;
+    this.setActiveSpeaker(target === "cohost" ? "cohost" : target);
+
+    if (target === "luna") {
+      if (this.cohostVrm) this.cohostVrm.scene.visible = false;
+      if (this.himariVrm) this.himariVrm.scene.visible = false;
+      if (this.vrm && this.lunaPivot) {
+        this.vrm.scene.visible = true;
+        this._applyDefaultStageFraming(this.lunaPivot, this.vrm);
+        this._orientAvatarTowardCamera(this.vrm);
+      }
+      this.cb.onSceneStatus("Talking to Luna");
+      return;
+    }
+
+    if (target === "cohost") {
+      const url = (urls?.cohostVrm || "").trim();
+      if (!this.cohostVrm && url) {
+        await this.loadCohostVrmFromUrl(url, "cohost.vrm", { enableLayout: false });
+      }
+      if (!this.cohostVrm || !this.cohostPivot) {
+        this.cb.onSceneStatus("Viktor VRM not loaded — check LUNA_COHOST_VRM in .env");
+        return;
+      }
+      if (this.vrm) this.vrm.scene.visible = false;
+      if (this.himariVrm) this.himariVrm.scene.visible = false;
+      this.cohostVrm.scene.visible = true;
+      this._applyDefaultStageFraming(this.cohostPivot, this.cohostVrm);
+      this._orientAvatarTowardCamera(this.cohostVrm);
+      if (this.cohostIdleSourceUrls.length > 0) {
+        await this.setCohostIdleMotionUrls(this.cohostIdleSourceUrls);
+      } else {
+        this._ensureCohostIdlePlaying();
+      }
+      this.cb.onSceneStatus("Talking to Viktor");
+      return;
+    }
+
+    const himariUrl = (urls?.himariVrm || "").trim();
+    if (!this.himariVrm && himariUrl) {
+      await this.loadHimariVrmFromUrl(himariUrl, "himari.vrm");
+    }
+    if (!this.himariVrm || !this.himariPivot) {
+      this.cb.onSceneStatus("Himari VRM not loaded — check LUNA_HIMARI_VRM in .env");
+      return;
+    }
+    if (this.vrm) this.vrm.scene.visible = false;
+    if (this.cohostVrm) this.cohostVrm.scene.visible = false;
+    this.himariVrm.scene.visible = true;
+    this._applyDefaultStageFraming(this.himariPivot, this.himariVrm);
+    this._orientAvatarTowardCamera(this.himariVrm);
+    await this._ensureHimariIdleForAppearance();
+    this.cb.onSceneStatus("Talking to Himari");
+  }
+
+  getCreatorPanelFocus(): "luna" | "cohost" | "himari" | null {
+    return this._creatorPanelFocus;
+  }
+
+  private _ensureCohostIdlePlaying(): void {
+    if (!this.cohostVrm || this.cohostThinkingActive) return;
+    if (this.cohostIdleClips.length === 0) return;
+    this.cohostIdleModeEnabled = true;
+    this._ensureMixerForCohost();
+    if (this._idleActionActive(this.cohostIdleAction)) return;
+    const idx =
+      ((this.cohostIdleClipIndex % this.cohostIdleClips.length) +
+        this.cohostIdleClips.length) %
+      this.cohostIdleClips.length;
+    this._playCohostIdleAt(idx, null, "fresh");
+    this._kickIdleMixer(this.cohostVrm, this.cohostMixer);
+  }
+
+  private async _ensureCohostIdleForAppearance(): Promise<void> {
+    if (this.cohostIdleSourceUrls.length > 0 && this.cohostIdleClips.length === 0) {
+      await this.setCohostIdleMotionUrls(this.cohostIdleSourceUrls);
+      return;
+    }
+    this._ensureCohostIdlePlaying();
+  }
+
+  private _ensureHimariIdlePlaying(): void {
+    if (!this.himariVrm || this.himariThinkingActive) return;
+    if (this.himariIdleClips.length === 0) return;
+    if (this.himariIdleAction?.isRunning()) return;
+    this.himariIdleModeEnabled = true;
+    this._ensureMixerForHimari();
+    this._playHimariIdleAt(this.himariIdleClipIndex);
+  }
+
+  private async _ensureHimariIdleForAppearance(): Promise<void> {
+    if (this.himariIdleSourceUrls.length > 0 && this.himariIdleClips.length === 0) {
+      await this.setHimariIdleMotionUrls(this.himariIdleSourceUrls);
+      return;
+    }
+    this._ensureHimariIdlePlaying();
+  }
+
   /** Twitch/YouTube @Himari reply — lip-sync even when dismissed from scene. */
   async prepareHimariChatReply(vrmUrl?: string): Promise<void> {
     const url = (vrmUrl || "").trim();
@@ -1547,7 +2013,11 @@ export class VrmRuntime {
     if (!this.himariVrm) return;
 
     if (this.himariInScene) {
+      if (this.vrm?.scene.visible) {
+        this._applyCastLayoutPositions();
+      }
       this.setActiveSpeaker("himari");
+      await this._ensureHimariIdleForAppearance();
       this.cb.onSceneStatus("Himari (Twitch/YouTube chat reply)");
       return;
     }
@@ -1555,10 +2025,12 @@ export class VrmRuntime {
     this._himariChatReplyTakeover = true;
     this.himariVrm.scene.visible = true;
     if (this.vrm) {
+      this.vrm.scene.visible = true;
       this._applyCastLayoutPositions();
     }
     this._orientAvatarTowardCamera(this.himariVrm);
     this.setActiveSpeaker("himari");
+    await this._ensureHimariIdleForAppearance();
     this.cb.onSceneStatus("Himari (Twitch/YouTube chat reply)");
   }
 
@@ -1568,6 +2040,10 @@ export class VrmRuntime {
       if (this.himariVrm) {
         this._resetMouth(this.himariVrm);
         this.himariVrm.scene.visible = false;
+      }
+      if (this._creatorPanelFocus === "himari") {
+        void this.focusCreatorChatTarget("himari");
+        return;
       }
       if (this.activeAvatar === "himari") {
         this.activeAvatar = "luna";
@@ -1599,12 +2075,14 @@ export class VrmRuntime {
       this._orientAvatarTowardCamera(this.cohostVrm);
       this.activeAvatar = "cohost";
       this._captureJawRestPose();
+      await this._ensureCohostIdleForAppearance();
       this.cb.onSceneStatus("Viktor (Twitch/YouTube chat reply)");
       return;
     }
 
     await this.enableDualCohostLayout(url || undefined);
     this.setActiveSpeaker("cohost");
+    await this._ensureCohostIdleForAppearance();
   }
 
   /** After Viktor chat TTS — hide temporary takeover or hand lip-sync back to Luna. */
@@ -1614,6 +2092,10 @@ export class VrmRuntime {
       if (this.cohostVrm) {
         this._resetMouth(this.cohostVrm);
         this.cohostVrm.scene.visible = false;
+      }
+      if (this._creatorPanelFocus === "cohost") {
+        void this.focusCreatorChatTarget("cohost");
+        return;
       }
       if (this.vrm) {
         this.vrm.scene.visible = true;
