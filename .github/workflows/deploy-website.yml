@@ -29,6 +29,9 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
 
+      - name: Refresh YouTube video list
+        run: python scripts/fetch_youtube_videos.py
+
       - name: Install and build
         working-directory: website
         env:

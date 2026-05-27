@@ -36,7 +36,7 @@ build/
 
 # ── Runtime state and caches (per-user, not source) ──────────────────────────
 .cache/
-data/
+/data/
 checkpoints/
 logs/
 *.log
