@@ -3,13 +3,10 @@ name: Deploy website to GitHub Pages
 on:
   push:
     branches: [main, master]
-    paths:
-      - "website/**"
-      - ".github/workflows/deploy-website.yml"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -45,9 +42,17 @@ jobs:
           npm ci
           npm run build
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Upload Pages artifact (GitHub Actions source)
+        uses: actions/upload-pages-artifact@v3
         with:
           path: website/dist
+
+      - name: Publish to gh-pages branch (branch source fallback)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: website/dist
+          force_orphan: true
 
   deploy:
     needs: build

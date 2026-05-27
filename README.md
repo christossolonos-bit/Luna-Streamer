@@ -1,7 +1,7 @@
 # Luna Streamer
 
 > **Public marketing site:** [christossolonos-bit.github.io/Luna-Streamer](https://christossolonos-bit.github.io/Luna-Streamer/) — video player, Discord invite, cast bios (`website/`).  
-> If that URL shows *this* README instead, fix Pages: [website/GITHUB-PAGES.md](website/GITHUB-PAGES.md) (Source must be **GitHub Actions**, not branch/root).
+> If that URL shows *this* README instead, fix Pages: [website/GITHUB-PAGES.md](website/GITHUB-PAGES.md) (use **GitHub Actions** or **`gh-pages`** branch — not **main** / root).
 
 > *You're reading our repo. We're reading you back—once you run `main.py`.*
 
