@@ -10,7 +10,9 @@ Env:
   LUNA_EDGE_PITCH         Pitch adjustment, e.g. +0Hz / -2Hz
   LUNA_TTS_SPEAKER        Optional alias from LUNA_TTS_VOICES; falls back to LUNA_EDGE_VOICE.
   LUNA_TTS_VOICES         Optional CSV list of voice ids or id:Label entries.
-  LUNA_TTS_MAX_CHARS      Truncate cleaned text for TTS (default 500).
+  LUNA_TTS_MAX_CHARS      Truncate for legacy/local paths (default 2500).
+  LUNA_VIEWER_TTS_MAX_CHARS  Viewer/VRM cap; unset = same as LUNA_DISCORD_TTS_MAX_CHARS (0 = unlimited).
+  LUNA_DISCORD_TTS_MAX_CHARS Discord cap; 0 = unlimited single MP3 with internal Edge chunks.
   LUNA_CHATTERBOX_DEVICE  cpu/cuda (default auto)
   LUNA_CHATTERBOX_RANGE         expressive range control (alias of exaggeration), default 0.5
   LUNA_CHATTERBOX_EXAGGERATION  default 0.5
@@ -389,143 +391,70 @@ def synthesize_playback_bundle(
     *,
     voice: str | None = None,
 ) -> TtsPlaybackBundle | None:
-    """Synthesize reply audio + lip-sync timeline for the VRM viewer (no local playback)."""
+    """Synthesize one combined clip + lip-sync for the VRM viewer (same stitch as Discord)."""
     if not tts_enabled():
         return None
     edge_voice = (voice or "").strip() or get_effective_speaker()
-    text, emotion = _clean_text_for_tts(_reply_text_before_tts_clean(reply_text, edge_voice))
+    raw_len = len((reply_text or "").strip())
+    text, emotion = _clean_text_for_tts(
+        _reply_text_before_tts_clean(reply_text, edge_voice),
+        max_chars=_viewer_tts_max_chars(),
+    )
     if not text:
         return None
     rate, pitch = _prosody_for_emotion(emotion)
     backend = _backend()
     with _tts_play_lock:
+        audio_path: Path | None = None
+        wav_probe: Path | None = None
         try:
-            if backend == "chatterbox":
-                chunk_chars = int(os.environ.get("LUNA_CHATTERBOX_CHUNK_CHARS", "120").strip() or "120")
-                chunks = _split_tts_chunks(text, chunk_chars)
-                if not chunks:
-                    return None
-                fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_viewer_")
-                os.close(fd)
-                wav_out = Path(tmp)
-                try:
-                    if len(chunks) == 1:
-                        _synthesize_chatterbox_to_wav(chunks[0], wav_out, emotion=emotion)
-                    else:
-                        tmp_parts: list[Path] = []
-                        try:
-                            for i, part in enumerate(chunks):
-                                fd_p, p_tmp = tempfile.mkstemp(
-                                    suffix=".wav", prefix=f"luna_viewer_part_{i}_"
-                                )
-                                os.close(fd_p)
-                                p = Path(p_tmp)
-                                _synthesize_chatterbox_to_wav(part, p, emotion=emotion)
-                                tmp_parts.append(p)
-                            _concat_audio_with_ffmpeg(tmp_parts, wav_out)
-                        finally:
-                            for p in tmp_parts:
-                                try:
-                                    p.unlink(missing_ok=True)
-                                except OSError:
-                                    pass
-                    cues = _resolve_viseme_timeline(wav_out, [])
-                    audio = wav_out.read_bytes()
-                    dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
-                    return TtsPlaybackBundle(
-                        audio=audio,
-                        mime="audio/wav",
-                        duration_ms=dur_ms,
-                        visemes=_visemes_for_timeline(cues),
-                    )
-                finally:
-                    try:
-                        wav_out.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
-            chunk_chars = int(os.environ.get("LUNA_TTS_CHUNK_CHARS", "380").strip() or "380")
-            chunks = _split_tts_chunks(text, chunk_chars)
-            if len(chunks) <= 1:
-                fd, tmp = tempfile.mkstemp(suffix=".mp3", prefix="luna_viewer_")
-                os.close(fd)
-                mp3_out = Path(tmp)
-                wav_out = mp3_out.with_suffix(".wav")
-                try:
-                    cues_edge = _synthesize_edge_to_mp3(
-                        text,
-                        mp3_out,
-                        voice=edge_voice,
-                        rate=rate,
-                        pitch=pitch,
-                    )
-                    _mp3_to_wav(mp3_out, wav_out)
-                    cues = _resolve_viseme_timeline(wav_out, cues_edge)
-                    audio = mp3_out.read_bytes()
-                    dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
-                    visemes = _visemes_for_timeline(cues)
-                    return TtsPlaybackBundle(
-                        audio=audio,
-                        mime="audio/mpeg",
-                        duration_ms=dur_ms,
-                        visemes=visemes,
-                    )
-                finally:
-                    try:
-                        mp3_out.unlink(missing_ok=True)
-                        wav_out.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
-            fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="luna_viewer_long_")
-            os.close(fd)
-            wav_out = Path(tmp)
-            tmp_parts: list[Path] = []
-            try:
-                for i, part in enumerate(chunks):
-                    fd_p, p_tmp = tempfile.mkstemp(
-                        suffix=".mp3", prefix=f"luna_viewer_edge_{i}_"
-                    )
-                    os.close(fd_p)
-                    mp3_part = Path(p_tmp)
-                    wav_part = mp3_part.with_suffix(".wav")
-                    _synthesize_edge_to_mp3(
-                        part,
-                        mp3_part,
-                        voice=edge_voice,
-                        rate=rate,
-                        pitch=pitch,
-                    )
-                    _mp3_to_wav(mp3_part, wav_part)
-                    tmp_parts.append(wav_part)
-                    try:
-                        mp3_part.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                _concat_audio_with_ffmpeg(tmp_parts, wav_out)
-                cues = _resolve_viseme_timeline(wav_out, [])
-                audio = wav_out.read_bytes()
-                dur_ms = max(1, int(_wav_duration_sec(wav_out) * 1000))
-                return TtsPlaybackBundle(
-                    audio=audio,
-                    mime="audio/wav",
-                    duration_ms=dur_ms,
-                    visemes=_visemes_for_timeline(cues),
-                )
-            finally:
-                for p in tmp_parts:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                try:
-                    wav_out.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            audio_path = _synthesize_discord_part_to_file(
+                text,
+                edge_voice=edge_voice,
+                rate=rate,
+                pitch=pitch,
+                backend=backend,
+                emotion=emotion,
+            )
+            if audio_path is None or not audio_path.is_file():
+                return None
+            if audio_path.suffix.lower() == ".mp3":
+                wav_probe = audio_path.with_suffix(".viewer_probe.wav")
+                _mp3_to_wav(audio_path, wav_probe)
+                mime = "audio/mpeg"
+                audio_bytes = audio_path.read_bytes()
+            else:
+                wav_probe = audio_path
+                mime = "audio/wav"
+                audio_bytes = audio_path.read_bytes()
+            cues = _resolve_viseme_timeline(wav_probe, [])
+            dur_ms = max(1, int(_wav_duration_sec(wav_probe) * 1000))
+            dur_sec = dur_ms / 1000.0
+            print(
+                f"(viewer tts) {len(text)} chars (raw {raw_len}) -> 1 clip"
+                f", ~{dur_sec:.0f}s {mime}",
+                flush=True,
+            )
+            return TtsPlaybackBundle(
+                audio=audio_bytes,
+                mime=mime,
+                duration_ms=dur_ms,
+                visemes=_visemes_for_timeline(cues),
+            )
         except Exception as exc:
             print(f"(LUNA_TTS {backend} viewer bundle failed: {exc})", flush=True)
             return None
-    return None
+        finally:
+            if wav_probe is not None and wav_probe != audio_path:
+                try:
+                    wav_probe.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if audio_path is not None:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def maybe_speak(
@@ -668,15 +597,27 @@ def discord_tts_single_file() -> bool:
     return _env_truthy("LUNA_DISCORD_TTS_SINGLE_FILE", default=True)
 
 
-def _discord_tts_max_chars() -> int:
-    """Character cap for Discord TTS text; 0 = no limit (full reply, any duration)."""
-    raw = (os.environ.get("LUNA_DISCORD_TTS_MAX_CHARS") or "0").strip()
-    if raw.lower() in ("0", "none", "unlimited", "off"):
+def _parse_tts_max_chars(raw: str) -> int:
+    s = (raw or "").strip()
+    if s.lower() in ("0", "none", "unlimited", "off"):
         return 0
     try:
-        return max(0, int(raw))
+        return max(0, int(s))
     except ValueError:
         return 0
+
+
+def _discord_tts_max_chars() -> int:
+    """Character cap for Discord TTS text; 0 = no limit (full reply, any duration)."""
+    return _parse_tts_max_chars(os.environ.get("LUNA_DISCORD_TTS_MAX_CHARS") or "0")
+
+
+def _viewer_tts_max_chars() -> int:
+    """Viewer/VRM TTS length cap — defaults to Discord (0 = unlimited, stitched MP3)."""
+    raw = os.environ.get("LUNA_VIEWER_TTS_MAX_CHARS")
+    if raw is not None and raw.strip() != "":
+        return _parse_tts_max_chars(raw)
+    return _discord_tts_max_chars()
 
 
 def _discord_tts_chars_per_file() -> int:

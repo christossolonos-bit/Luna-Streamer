@@ -821,15 +821,17 @@ class LunaTwitchBot(commands.Bot):
         self._cast_scene = scene if scene is not None else load_cast_scene()
         self._viewer_cohost_in_scene = self._cast_scene.any_in_scene()
 
-    async def _broadcast_avatar_thinking(self, partner: str, active: bool) -> None:
+    async def _broadcast_avatar_thinking(
+        self, partner: str, active: bool, *, creator_panel: bool = False
+    ) -> None:
         """Viewer VRMA (``thinking.vrma``) while the LLM composes a reply."""
         pid = (partner or "").strip().lower()
         if pid in ("viktor", "cohost"):
-            if not self._cast_scene.viktor_in_scene:
+            if not creator_panel and not self._cast_scene.viktor_in_scene:
                 return
             avatar = "cohost"
         elif pid == "himari":
-            if not self._cast_scene.himari_in_scene:
+            if not creator_panel and not self._cast_scene.himari_in_scene:
                 return
             avatar = "himari"
         elif pid == "luna":
@@ -1318,6 +1320,11 @@ class LunaTwitchBot(commands.Bot):
         except asyncio.CancelledError:
             print("(cohost) banter cancelled (chat or dismissed)", flush=True)
             raise
+        except Exception as exc:
+            # This runs in a background task; never let transient model/network
+            # errors bubble up as "Task exception was never retrieved".
+            self._block_cohost_banter_after_fail(got_lines=0, need_lines=min_lines)
+            print(f"(cohost) banter skipped: {exc}", flush=True)
         finally:
             if self._chat_hub and self._viewer_cohost_in_scene:
                 await self._chat_hub.broadcast(
@@ -2720,12 +2727,18 @@ class LunaTwitchBot(commands.Bot):
         thinking_partner: str | None = None
         if partner == "luna":
             thinking_partner = "luna"
-        elif partner == "himari" and self._cast_scene.himari_in_scene:
+        elif partner == "himari" and (
+            self._cast_scene.himari_in_scene or is_creator_panel
+        ):
             thinking_partner = "himari"
-        elif partner == "viktor" and self._cast_scene.viktor_in_scene:
+        elif partner == "viktor" and (
+            self._cast_scene.viktor_in_scene or is_creator_panel
+        ):
             thinking_partner = "cohost"
         if thinking_partner:
-            await self._broadcast_avatar_thinking(thinking_partner, True)
+            await self._broadcast_avatar_thinking(
+                thinking_partner, True, creator_panel=is_creator_panel
+            )
         try:
             async with self._ollama_lock:
                 if stream_ws and not use_or_buffer:
@@ -2744,7 +2757,9 @@ class LunaTwitchBot(commands.Bot):
                     )
         finally:
             if thinking_partner:
-                await self._broadcast_avatar_thinking(thinking_partner, False)
+                await self._broadcast_avatar_thinking(
+                    thinking_partner, False, creator_panel=is_creator_panel
+                )
         reply_stripped = strip_think_blocks(reply).strip()
         self._last_assistant_reply = reply_stripped
         if self._memory_turns > 0:
@@ -2804,7 +2819,9 @@ class LunaTwitchBot(commands.Bot):
                 if channel:
                     await channel.send(part[:500])
 
-        cohost_route_viewer = as_cohost and (is_public_chat or is_creator_panel)
+        # Live @Himari/@Viktor chat uses chat_reply takeover in the viewer; creator
+        # panel tabs already use focusCreatorChatTarget (solo cast, no Luna beside).
+        cohost_route_viewer = as_cohost and is_public_chat
         if self._chat_hub:
             ts = int(time.time() * 1000)
             if (

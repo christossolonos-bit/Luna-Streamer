@@ -19,6 +19,95 @@ from pathlib import Path
 DEFAULT_VRM = Path(r"D:\Luna streamer\Luna.vrm")
 
 
+def _brave_executable() -> Path | None:
+    """Resolve Brave browser binary (Windows-focused; common install paths)."""
+    env_path = (os.environ.get("LUNA_VIEWER_BRAVE_PATH") or "").strip()
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_file():
+            return p
+
+    candidates: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        candidates.append(
+            Path(local)
+            / "BraveSoftware"
+            / "Brave-Browser"
+            / "Application"
+            / "brave.exe"
+        )
+    for prefix in (
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ):
+        if prefix:
+            candidates.append(
+                Path(prefix) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe"
+            )
+
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _open_viewer_in_browser(url: str) -> bool:
+    """Open the viewer URL (default: Brave). Set LUNA_VIEWER_BROWSER=default for OS default."""
+    choice = (os.environ.get("LUNA_VIEWER_BROWSER") or "brave").strip().lower()
+    if choice in ("0", "false", "no", "off", "none"):
+        return False
+    if choice in ("default", "system", "os"):
+        webbrowser.open(url)
+        return True
+
+    if choice in ("brave", "brave-browser"):
+        brave = _brave_executable()
+        if brave is not None:
+            try:
+                subprocess.Popen(
+                    [str(brave), url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                print(f"Opened in Brave: {url}", flush=True)
+                return True
+            except OSError as exc:
+                print(f"(viewer) Brave launch failed: {exc}", flush=True)
+        try:
+            webbrowser.get("brave").open(url)
+            print(f"Opened in Brave: {url}", flush=True)
+            return True
+        except (webbrowser.Error, AttributeError):
+            print(
+                "(viewer) Brave not found — install Brave or set LUNA_VIEWER_BRAVE_PATH. "
+                "Falling back to default browser.",
+                flush=True,
+            )
+
+    if choice == "chrome":
+        for name in ("chrome", "google-chrome", "google-chrome-stable"):
+            try:
+                webbrowser.get(name).open(url)
+                print(f"Opened in {name}: {url}", flush=True)
+                return True
+            except webbrowser.Error:
+                continue
+
+    if choice == "edge":
+        try:
+            webbrowser.get("windows-default" if sys.platform == "win32" else "edge").open(url)
+            print(f"Opened: {url}", flush=True)
+            return True
+        except webbrowser.Error:
+            pass
+
+    webbrowser.open(url)
+    return True
+
+
 def _url_alive(url: str, timeout: float = 0.8) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout):
@@ -142,12 +231,12 @@ def _start_viewer_static(dist_dir: Path, port: int) -> http.server.ThreadingHTTP
     return server
 
 
-def _start_viewer_vite(viewer_dir: Path, port: int) -> subprocess.Popen[str]:
-    """Run `vite` dev server (HMR). Requires Node and viewer/node_modules."""
+def _start_vite_app(app_dir: Path, port: int, *, label: str) -> subprocess.Popen[str]:
+    """Run `vite` dev server (HMR). Requires Node and app_dir/node_modules."""
     if sys.platform == "win32":
-        vite = viewer_dir / "node_modules" / ".bin" / "vite.cmd"
+        vite = app_dir / "node_modules" / ".bin" / "vite.cmd"
     else:
-        vite = viewer_dir / "node_modules" / ".bin" / "vite"
+        vite = app_dir / "node_modules" / ".bin" / "vite"
     if vite.is_file():
         cmd: list[str] = [
             str(vite),
@@ -168,15 +257,26 @@ def _start_viewer_vite(viewer_dir: Path, port: int) -> subprocess.Popen[str]:
             str(port),
             "--strictPort",
         ]
-    print(f"Starting Vite dev server in {viewer_dir} (hot reload; pass --static for dist/) ...")
+    print(f"Starting Vite dev server for {label} in {app_dir} ...")
     return subprocess.Popen(
         cmd,
-        cwd=str(viewer_dir),
+        cwd=str(app_dir),
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
         text=True,
     )
+
+
+def _start_viewer_vite(viewer_dir: Path, port: int) -> subprocess.Popen[str]:
+    return _start_vite_app(viewer_dir, port, label="viewer")
+
+
+def _website_page_url(port: int, chat_ws: str | None) -> str:
+    if chat_ws:
+        query = urllib.parse.urlencode({"chat_ws": chat_ws})
+        return f"http://127.0.0.1:{port}/?{query}"
+    return f"http://127.0.0.1:{port}/"
 
 
 def _start_twitch_bot(root_dir: Path) -> subprocess.Popen[str]:
@@ -218,7 +318,7 @@ def main() -> None:
     parser.add_argument(
         "--no-open",
         action="store_true",
-        help="Do not open browser automatically.",
+        help="Do not open the viewer in a browser (default opens Brave).",
     )
     parser.add_argument(
         "--with-bot",
@@ -234,6 +334,22 @@ def main() -> None:
         "--viewer-only",
         action="store_true",
         help="Start only the viewer, even if --with-bot is set.",
+    )
+    parser.add_argument(
+        "--website",
+        action="store_true",
+        help="Open the marketing site (website/) instead of the VRM viewer.",
+    )
+    parser.add_argument(
+        "--website-port",
+        type=int,
+        default=5180,
+        help="Marketing site port when using --website (default 5180).",
+    )
+    parser.add_argument(
+        "--with-viewer",
+        action="store_true",
+        help="With --website, also start the VRM viewer on --port.",
     )
     parser.add_argument(
         "--expressions-dir",
@@ -259,31 +375,54 @@ def main() -> None:
     root_dir = Path(__file__).resolve().parent
     vrm_file = args.vrm.resolve()
     viewer_dir = args.viewer_dir.resolve()
+    website_dir = root_dir / "website"
     viewer_dist = viewer_dir / "dist"
+    website_dist = website_dir / "dist"
     expressions_dir = args.expressions_dir.resolve()
     cohost_expressions_dir = args.cohost_expressions_dir.resolve()
     active_port = args.port
+    website_port = args.website_port
+    launch_website = args.website
+    launch_viewer = not launch_website or args.with_viewer
     base_url = f"http://127.0.0.1:{active_port}/"
+    website_base_url = f"http://127.0.0.1:{website_port}/"
 
-    if not viewer_dir.is_dir():
-        print(f"Viewer folder not found: {viewer_dir}", file=sys.stderr)
-        sys.exit(1)
-    if not vrm_file.is_file():
-        print(f"Default VRM not found: {vrm_file}", file=sys.stderr)
-        sys.exit(1)
-    if args.static and not viewer_dist.is_dir():
-        print(
-            f"No {viewer_dist} — run: cd viewer && npm run build   "
-            "Or drop --static to use Vite dev.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if not args.static and not (viewer_dir / "package.json").is_file():
-        print(f"No package.json in {viewer_dir}; use --static with a built dist.", file=sys.stderr)
-        sys.exit(1)
+    if launch_viewer:
+        if not viewer_dir.is_dir():
+            print(f"Viewer folder not found: {viewer_dir}", file=sys.stderr)
+            sys.exit(1)
+        if not vrm_file.is_file():
+            print(f"Default VRM not found: {vrm_file}", file=sys.stderr)
+            sys.exit(1)
+        if args.static and not viewer_dist.is_dir():
+            print(
+                f"No {viewer_dist} — run: cd viewer && npm run build   "
+                "Or drop --static to use Vite dev.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not args.static and not (viewer_dir / "package.json").is_file():
+            print(
+                f"No package.json in {viewer_dir}; use --static with a built dist.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if launch_website:
+        if not website_dir.is_dir():
+            print(f"Website folder not found: {website_dir}", file=sys.stderr)
+            sys.exit(1)
+        if not (website_dir / "package.json").is_file():
+            print(
+                f"No package.json in {website_dir}; run: cd website && npm install",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-    print(f"Viewer dir: {viewer_dir}")
-    print(f"Default VRM: {vrm_file}")
+    if launch_viewer:
+        print(f"Viewer dir: {viewer_dir}")
+        print(f"Default VRM: {vrm_file}")
+    if launch_website:
+        print(f"Website dir: {website_dir}")
     luna_thinking_motion_file: Path | None = None
     if expressions_dir.is_dir():
         luna_thinking_motion_file = expressions_dir / "thinking.vrma"
@@ -325,15 +464,28 @@ def main() -> None:
 
     viewer_server: http.server.ThreadingHTTPServer | None = None
     viewer_proc: subprocess.Popen[str] | None = None
+    website_proc: subprocess.Popen[str] | None = None
     bot_proc: subprocess.Popen[str] | None = None
 
-    viewer_already_running = _url_alive(base_url)
-    if not viewer_already_running and _port_open("127.0.0.1", active_port):
+    viewer_already_running = launch_viewer and _url_alive(base_url)
+    if launch_viewer and not viewer_already_running and _port_open("127.0.0.1", active_port):
         active_port = _find_free_port("127.0.0.1", active_port + 1)
         base_url = f"http://127.0.0.1:{active_port}/"
         print(
             f"Port {args.port} is occupied by another process. "
             f"Using fallback port {active_port}."
+        )
+    website_already_running = launch_website and _url_alive(website_base_url)
+    if (
+        launch_website
+        and not website_already_running
+        and _port_open("127.0.0.1", website_port)
+    ):
+        website_port = _find_free_port("127.0.0.1", website_port + 1)
+        website_base_url = f"http://127.0.0.1:{website_port}/"
+        print(
+            f"Website port {args.website_port} is occupied. "
+            f"Using fallback port {website_port}."
         )
     chat_ws_port = int(os.environ.get("LUNA_CHAT_WS_PORT", "8765").strip() or "8765")
     chat_ws_url = (
@@ -404,28 +556,33 @@ def main() -> None:
     except ValueError:
         idle_skip_sec = 2.0
 
-    page_url = _viewer_page_url(
-        active_port,
-        vrm_file,
-        idle_motion_files,
-        cohost_idle_motion_files=cohost_idle_motion_files,
-        chat_ws=chat_ws_url,
-        cohost_vrm_file=cohost_vrm,
-        cohost_display_name=cohost_name,
-        cohost_idle_skip_sec=idle_skip_sec,
-        cohost_thinking_motion_file=cohost_thinking_motion_file,
-        himari_vrm_file=himari_vrm,
-        himari_display_name=himari_name,
-        himari_idle_motion_files=himari_idle_motion_files,
-        himari_thinking_motion_file=himari_thinking_motion_file,
-        himari_idle_skip_sec=idle_skip_sec,
-        luna_idle_skip_sec=idle_skip_sec,
-        luna_thinking_motion_file=luna_thinking_motion_file,
-    )
+    page_url = ""
+    if launch_viewer:
+        page_url = _viewer_page_url(
+            active_port,
+            vrm_file,
+            idle_motion_files,
+            cohost_idle_motion_files=cohost_idle_motion_files,
+            chat_ws=chat_ws_url,
+            cohost_vrm_file=cohost_vrm,
+            cohost_display_name=cohost_name,
+            cohost_idle_skip_sec=idle_skip_sec,
+            cohost_thinking_motion_file=cohost_thinking_motion_file,
+            himari_vrm_file=himari_vrm,
+            himari_display_name=himari_name,
+            himari_idle_motion_files=himari_idle_motion_files,
+            himari_thinking_motion_file=himari_thinking_motion_file,
+            himari_idle_skip_sec=idle_skip_sec,
+            luna_idle_skip_sec=idle_skip_sec,
+            luna_thinking_motion_file=luna_thinking_motion_file,
+        )
+    website_page_url = _website_page_url(website_port, chat_ws_url)
     if viewer_already_running:
         print(f"Viewer already running at {base_url}")
+    if website_already_running:
+        print(f"Website already running at {website_base_url}")
     try:
-        if not viewer_already_running:
+        if launch_viewer and not viewer_already_running:
             if args.static:
                 viewer_server = _start_viewer_static(viewer_dist, active_port)
             else:
@@ -442,15 +599,36 @@ def main() -> None:
                 time.sleep(0.35)
             print(f"Viewer ready at {base_url}")
 
+        if launch_website and not website_already_running:
+            website_proc = _start_vite_app(website_dir, website_port, label="website")
+            time.sleep(0.6)
+            if website_proc.poll() is not None:
+                raise RuntimeError(
+                    "Website Vite exited immediately. Install deps: cd website && npm install"
+                )
+            start = time.time()
+            while not _port_open("127.0.0.1", website_port):
+                if time.time() - start > 45:
+                    raise TimeoutError("Website startup timed out.")
+                time.sleep(0.35)
+            print(f"Website ready at {website_base_url}")
+
         if not args.no_open:
-            webbrowser.open(page_url)
-            print(f"Opened: {page_url}")
+            open_url = website_page_url if launch_website and not launch_viewer else page_url
+            if launch_website and launch_viewer and args.with_viewer:
+                _open_viewer_in_browser(page_url)
+                _open_viewer_in_browser(website_page_url)
+            elif open_url:
+                _open_viewer_in_browser(open_url)
 
         should_start_bot = not args.viewer_only and not args.no_bot
         if should_start_bot:
             bot_proc = _start_twitch_bot(root_dir)
 
-        if viewer_already_running and bot_proc is None:
+        ui_already_up = (viewer_already_running and launch_viewer) or (
+            website_already_running and launch_website
+        )
+        if ui_already_up and bot_proc is None:
             return
 
         print("Luna orchestrator running. Press Ctrl+C to stop managed modules.")
@@ -467,6 +645,8 @@ def main() -> None:
     finally:
         if bot_proc is not None:
             _terminate_process(bot_proc, "Twitch bot")
+        if website_proc is not None:
+            _terminate_process(website_proc, "Website dev server")
         if viewer_proc is not None:
             _terminate_process(viewer_proc, "Vite dev server")
         if viewer_server is not None:

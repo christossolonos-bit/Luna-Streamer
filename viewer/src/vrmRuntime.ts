@@ -1442,7 +1442,8 @@ export class VrmRuntime {
   }
 
   async setHimariThinking(active: boolean): Promise<void> {
-    if (!this.himariVrm || !this.himariInScene) return;
+    if (!this.himariVrm) return;
+    if (!this.himariInScene && this._creatorPanelFocus !== "himari") return;
     if (!active) {
       this.himariThinkingActive = false;
       const fadeFrom = this.himariThinkingAction;
@@ -2155,6 +2156,17 @@ export class VrmRuntime {
     }
     if (!this.himariVrm) return;
 
+    if (this._creatorPanelFocus === "himari") {
+      if (this.vrm) this.vrm.scene.visible = false;
+      if (this.cohostVrm) this.cohostVrm.scene.visible = false;
+      this.himariVrm.scene.visible = true;
+      this._applyDefaultStageFraming(this.himariPivot!, this.himariVrm);
+      this._orientAvatarTowardCamera(this.himariVrm);
+      this.setActiveSpeaker("himari");
+      await this._ensureHimariIdleForAppearance();
+      return;
+    }
+
     if (this.himariInScene) {
       if (this.vrm?.scene.visible) {
         this._applyCastLayoutPositions();
@@ -2196,6 +2208,10 @@ export class VrmRuntime {
       return;
     }
     if (this.himariInScene && this.activeAvatar === "himari") {
+      if (this._creatorPanelFocus === "himari") {
+        void this.focusCreatorChatTarget("himari");
+        return;
+      }
       this.setActiveSpeaker("luna");
     }
   }
@@ -2207,6 +2223,17 @@ export class VrmRuntime {
       await this.loadCohostVrmFromUrl(url, "cohost.vrm", { enableLayout: false });
     }
     if (!this.cohostVrm) return;
+
+    if (this._creatorPanelFocus === "cohost") {
+      if (this.vrm) this.vrm.scene.visible = false;
+      if (this.himariVrm) this.himariVrm.scene.visible = false;
+      this.cohostVrm.scene.visible = true;
+      this._applyDefaultStageFraming(this.cohostPivot!, this.cohostVrm);
+      this._orientAvatarTowardCamera(this.cohostVrm);
+      this.setActiveSpeaker("cohost");
+      await this._ensureCohostIdleForAppearance();
+      return;
+    }
 
     if (getCohostSoloMode()) {
       this._chatReplyTakeover = true;
@@ -2256,6 +2283,10 @@ export class VrmRuntime {
       return;
     }
     if (this.cohostInScene && this.activeAvatar === "cohost") {
+      if (this._creatorPanelFocus === "cohost") {
+        void this.focusCreatorChatTarget("cohost");
+        return;
+      }
       this.setActiveSpeaker("luna");
     }
   }

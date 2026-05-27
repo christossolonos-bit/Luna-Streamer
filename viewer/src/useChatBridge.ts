@@ -381,9 +381,10 @@ export function useChatBridge(enabled: boolean) {
             ? "luna"
             : msg.active_speaker;
         if (
-          activeSpeaker === "luna" ||
-          activeSpeaker === "cohost" ||
-          activeSpeaker === "himari"
+          !chatReply &&
+          (activeSpeaker === "luna" ||
+            activeSpeaker === "cohost" ||
+            activeSpeaker === "himari")
         ) {
           dispatchFocusAvatar(activeSpeaker);
         }

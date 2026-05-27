@@ -24,6 +24,8 @@ env/
 
 # ── Node / Vite (viewer) ─────────────────────────────────────────────────────
 viewer/node_modules/
+website/node_modules/
+website/dist/
 viewer/dist/
 viewer/.vite/
 *.tsbuildinfo
