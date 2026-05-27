@@ -1,9 +1,8 @@
 import type { CSSProperties } from "react";
 import { CAST } from "./characters";
-import { CharacterChat } from "./components/CharacterChat";
+import { DiscordSection } from "./components/DiscordSection";
 import { YouTubeSection } from "./components/YouTubeSection";
-import { YOUTUBE_CHANNEL_URL } from "./youtube";
-import { useWebsiteChat } from "./useWebsiteChat";
+import { DISCORD_INVITE_URL } from "./youtube";
 
 const FEATURES = [
   {
@@ -25,8 +24,6 @@ const FEATURES = [
 ];
 
 export default function App() {
-  const { messages, thinking, sendPrompt, clearCast } = useWebsiteChat();
-
   const luna = CAST[0];
 
   return (
@@ -47,25 +44,27 @@ export default function App() {
         </div>
         <div className="hero__actions">
           <a className="hero__btn hero__btn--primary" href="#watch">
-            Watch on YouTube
+            Watch videos
           </a>
           <a
-            className="hero__btn hero__btn--ghost"
-            href={YOUTUBE_CHANNEL_URL}
+            className="hero__btn hero__btn--discord"
+            href={DISCORD_INVITE_URL}
             target="_blank"
             rel="noopener noreferrer"
           >
-            @lunawolfsolo
+            Join Discord
           </a>
-          <a className="hero__btn hero__btn--ghost" href="#chat">
-            Try the cast chat
+          <a className="hero__btn hero__btn--ghost" href="#cast">
+            Meet the cast
           </a>
         </div>
       </header>
 
       <YouTubeSection />
 
-      <section className="cast-row" aria-labelledby="cast-heading">
+      <DiscordSection />
+
+      <section className="cast-row" id="cast" aria-labelledby="cast-heading">
         <h2 id="cast-heading" className="section-title">
           Meet the cast
         </h2>
@@ -98,32 +97,10 @@ export default function App() {
         </ul>
       </section>
 
-      <section className="chat-section" id="chat" aria-labelledby="chat-heading">
-        <h2 id="chat-heading" className="section-title">
-          Talk to us
-        </h2>
-        <p className="chat-section__note">
-          Three separate chats — each character has their own lane with in-character
-          replies. No stream PC or cloud needed.
-        </p>
-        <div className="chat-grid">
-          {CAST.map((c) => (
-            <CharacterChat
-              key={c.id}
-              cast={c}
-              lines={messages[c.id]}
-              thinking={thinking[c.id]}
-              onSend={(text) => sendPrompt(c.id, text)}
-              onClear={() => clearCast(c.id)}
-            />
-          ))}
-        </div>
-      </section>
-
       <footer className="footer">
         <p>
-          <a href={YOUTUBE_CHANNEL_URL} target="_blank" rel="noopener noreferrer">
-            YouTube @lunawolfsolo
+          <a href={DISCORD_INVITE_URL} target="_blank" rel="noopener noreferrer">
+            Discord
           </a>
           {" · "}
           Luna Streamer

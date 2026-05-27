@@ -1,13 +1,24 @@
-/** YouTube channel + optional featured video IDs (comma-separated in .env). */
+import channelData from "./data/channelVideos.json";
+
+export type ChannelVideo = {
+  id: string;
+  title: string;
+};
 
 export const YOUTUBE_CHANNEL_URL =
-  (import.meta.env.VITE_YOUTUBE_CHANNEL_URL || "https://www.youtube.com/@lunawolfsolo").trim();
+  (import.meta.env.VITE_YOUTUBE_CHANNEL_URL || channelData.channel_url).trim();
 
 export const YOUTUBE_CHANNEL_HANDLE =
   (import.meta.env.VITE_YOUTUBE_CHANNEL_HANDLE || "@lunawolfsolo").trim();
 
 export const YOUTUBE_CHANNEL_TITLE =
-  (import.meta.env.VITE_YOUTUBE_CHANNEL_TITLE || "Luna wolf").trim();
+  (import.meta.env.VITE_YOUTUBE_CHANNEL_TITLE || channelData.channel_title).trim();
+
+export const DISCORD_INVITE_URL =
+  (import.meta.env.VITE_DISCORD_INVITE_URL || "https://discord.gg/t3DpY3EP").trim();
+
+export const DISCORD_SERVER_NAME =
+  (import.meta.env.VITE_DISCORD_SERVER_NAME || "Luna's Wolf Den").trim();
 
 function parseVideoIds(raw: string | undefined): string[] {
   if (!raw?.trim()) return [];
@@ -23,16 +34,23 @@ function parseVideoIds(raw: string | undefined): string[] {
   return out;
 }
 
-export const YOUTUBE_FEATURED_VIDEO_IDS = parseVideoIds(
-  import.meta.env.VITE_YOUTUBE_VIDEO_IDS,
-);
+function videosFromEnv(): ChannelVideo[] {
+  const ids = parseVideoIds(import.meta.env.VITE_YOUTUBE_VIDEO_IDS);
+  return ids.map((id, i) => ({ id, title: `Video ${i + 1}` }));
+}
+
+/** Channel uploads baked into the site (refresh via scripts/fetch_youtube_videos.py). */
+export const CHANNEL_VIDEOS: ChannelVideo[] =
+  videosFromEnv().length > 0
+    ? videosFromEnv()
+    : (channelData.videos as ChannelVideo[]).filter((v) => v?.id);
 
 export function youtubeWatchUrl(videoId: string): string {
   return `https://www.youtube.com/watch?v=${videoId}`;
 }
 
 export function youtubeEmbedUrl(videoId: string): string {
-  return `https://www.youtube-nocookie.com/embed/${videoId}?rel=0&modestbranding=1`;
+  return `https://www.youtube-nocookie.com/embed/${videoId}?rel=0&modestbranding=1&playsinline=1`;
 }
 
 export function youtubeThumbnailUrl(videoId: string): string {

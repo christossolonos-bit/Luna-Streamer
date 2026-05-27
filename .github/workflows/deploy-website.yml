@@ -36,6 +36,8 @@ jobs:
           VITE_YOUTUBE_CHANNEL_URL: https://www.youtube.com/@lunawolfsolo
           VITE_YOUTUBE_CHANNEL_HANDLE: "@lunawolfsolo"
           VITE_YOUTUBE_CHANNEL_TITLE: Luna wolf
+          VITE_DISCORD_INVITE_URL: https://discord.gg/t3DpY3EP
+          VITE_DISCORD_SERVER_NAME: Luna's Wolf Den
         run: |
           npm ci
           npm run build

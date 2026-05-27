@@ -1,7 +1,6 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_CHAT_WS_URL?: string;
   readonly VITE_LUNA_NAME?: string;
   readonly VITE_HIMARI_NAME?: string;
   readonly VITE_VIKTOR_NAME?: string;
