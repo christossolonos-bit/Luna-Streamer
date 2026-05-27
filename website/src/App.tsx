@@ -1,7 +1,6 @@
 import type { CSSProperties } from "react";
 import { CAST } from "./characters";
 import { CharacterChat } from "./components/CharacterChat";
-import { ChatAvailability } from "./components/ChatAvailability";
 import { YouTubeSection } from "./components/YouTubeSection";
 import { YOUTUBE_CHANNEL_URL } from "./youtube";
 import { useWebsiteChat } from "./useWebsiteChat";
@@ -26,8 +25,7 @@ const FEATURES = [
 ];
 
 export default function App() {
-  const { conn, chatMode, messages, thinking, sendPrompt, clearCast } =
-    useWebsiteChat();
+  const { messages, thinking, sendPrompt, clearCast } = useWebsiteChat();
 
   const luna = CAST[0];
 
@@ -104,10 +102,9 @@ export default function App() {
         <h2 id="chat-heading" className="section-title">
           Talk to us
         </h2>
-        <ChatAvailability conn={conn} chatMode={chatMode} />
         <p className="chat-section__note">
-          Three separate chats — pick Luna, Himari, or Viktor. On GitHub Pages you
-          get in-character demo replies; full AI when the stream bridge is connected.
+          Three separate chats — each character has their own lane with in-character
+          replies. No stream PC or cloud needed.
         </p>
         <div className="chat-grid">
           {CAST.map((c) => (
@@ -116,8 +113,6 @@ export default function App() {
               cast={c}
               lines={messages[c.id]}
               thinking={thinking[c.id]}
-              conn={conn}
-              chatMode={chatMode}
               onSend={(text) => sendPrompt(c.id, text)}
               onClear={() => clearCast(c.id)}
             />

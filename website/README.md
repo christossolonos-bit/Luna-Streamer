@@ -6,11 +6,10 @@ Showcase page with Luna’s intro, **YouTube** ([@lunawolfsolo](https://www.yout
 
 | Feature | Luna running on your PC? |
 |---------|-------------------------|
-| YouTube links & embeds | **No** — always works on GitHub Pages |
-| Demo cast chat (pre-written) | **No** — works everywhere, no cloud |
-| Full AI cast chat | **Yes** — auto when WebSocket bridge connects |
+| YouTube links & embeds | **No** — always works |
+| Cast chat (pre-written) | **No** — works everywhere, no cloud |
 
-GitHub Pages builds set `VITE_CHAT_CANNED_ONLY=1` so visitors always get in-character demo replies. Locally, if `main.py` is running, the site upgrades to **live** AI chat automatically.
+Full AI chat stays in the VRM viewer / stream stack, not on this public site.
 
 ## Open quickly (Windows)
 

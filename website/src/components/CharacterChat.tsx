@@ -6,14 +6,12 @@ import {
   type FormEvent,
 } from "react";
 import type { CastProfile } from "../characters";
-import type { ChatLine, ChatMode, ConnState } from "../useWebsiteChat";
+import type { ChatLine } from "../useWebsiteChat";
 
 type Props = {
   cast: CastProfile;
   lines: ChatLine[];
   thinking: boolean;
-  conn: ConnState;
-  chatMode: ChatMode;
   onSend: (text: string) => Promise<boolean>;
   onClear: () => void;
 };
@@ -22,8 +20,6 @@ export function CharacterChat({
   cast,
   lines,
   thinking,
-  conn,
-  chatMode,
   onSend,
   onClear,
 }: Props) {
@@ -44,15 +40,6 @@ export function CharacterChat({
     setSending(false);
   };
 
-  const connLabel =
-    chatMode === "live" && conn === "open"
-      ? "Live"
-      : chatMode === "canned"
-        ? "Demo"
-        : conn === "connecting"
-          ? "…"
-          : "Demo";
-
   return (
     <article
       className="chat-card"
@@ -71,11 +58,6 @@ export function CharacterChat({
           <h3>{cast.name}</h3>
           <p>{cast.title}</p>
         </div>
-        <span
-          className={`chat-card__pill ${chatMode === "live" && conn === "open" ? "chat-card__pill--live" : chatMode === "canned" ? "chat-card__pill--demo" : ""}`}
-        >
-          {connLabel}
-        </span>
       </header>
 
       <div className="chat-card__log" role="log" aria-live="polite">

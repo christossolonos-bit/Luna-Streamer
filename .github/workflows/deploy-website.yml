@@ -33,7 +33,6 @@ jobs:
         working-directory: website
         env:
           VITE_BASE_PATH: /Luna-Streamer/
-          VITE_CHAT_CANNED_ONLY: "1"
           VITE_YOUTUBE_CHANNEL_URL: https://www.youtube.com/@lunawolfsolo
           VITE_YOUTUBE_CHANNEL_HANDLE: "@lunawolfsolo"
           VITE_YOUTUBE_CHANNEL_TITLE: Luna wolf

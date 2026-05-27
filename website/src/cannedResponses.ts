@@ -129,8 +129,8 @@ export const REPLIES: Record<CastId, Record<CannedBucket, string[]>> = {
     ],
     help: [
       "Pick a character box, type, send. YouTube works without anything running. Live AI chat needs Luna's stack on the stream PC.",
-      "Stuck? Watch section for videos. Three chats for three cast members. Green dot means the real bridge is connected.",
-      "This is a demo site plus optional live hookup. If the dot's red, you're getting pre-written us — still in character.",
+      "Stuck? Watch section for videos. Three chats for three cast members — Luna, Himari, Viktor.",
+      "This site uses pre-written replies so you can meet the cast anytime. Full AI Luna is on stream and in the VRM viewer.",
     ],
     joke: [
       "Why did the wolf cross the stream? Better bitrate on the other side.",
@@ -198,7 +198,7 @@ export const REPLIES: Record<CastId, Record<CannedBucket, string[]>> = {
       "Thank you… I'll remember this when I'm doubting everything later.",
     ],
     help: [
-      "Type in my box and press Send… if the status says demo mode, these are preset lines. Green dot means live Himari on stream PC.",
+      "Type in my box and press Send — these are preset lines that still sound like me. Full Himari is on stream when we're live.",
       "Ask about games or anime if you want me to open up… or just say hi. I'll try.",
       "Watch YouTube above for videos anytime. Chat here is always available — scripted me, not cloud.",
     ],
@@ -267,7 +267,7 @@ export const REPLIES: Record<CastId, Record<CannedBucket, string[]>> = {
       "You're perceptive. Rare.",
     ],
     help: [
-      "Type. Send. Demo mode uses fixed lines. Green indicator means the live bridge — actual AI on the creator's machine.",
+      "Type. Send. These lines are fixed in advance — eloquent, but not the full AI on the stream PC.",
       "Three panels, three cast members. I am the handsome one. YouTube requires no setup.",
       "If confused: watch videos above, or insult Luna in her box for sport.",
     ],
