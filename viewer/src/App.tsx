@@ -126,10 +126,15 @@ function AppInner() {
 
   const onSocialShareVideoClick = useCallback(() => {
     const raw = window.prompt(
-      "Paste a YouTube video URL to share on X and Facebook (works for older uploads too). Server needs LUNA_SOCIAL_PLAYWRIGHT and storage JSON paths.",
+      "Paste a YouTube video URL to share on X and Facebook (works for older uploads too). First time: Settings → Social login.",
     );
     const u = raw?.trim();
-    if (u) void sendSocialShareVideo(u);
+    if (!u) return;
+    void sendSocialShareVideo(u).then((ok) => {
+      if (!ok) {
+        setLastError("Social share failed: chat bridge not connected (wait for ● live).");
+      }
+    });
   }, [sendSocialShareVideo]);
 
   const onYoutubeCommentClick = useCallback(() => {
@@ -570,6 +575,7 @@ function AppInner() {
       const ce = ev as CustomEvent<{
         dualLayout?: boolean;
         trioLayout?: boolean;
+        cohostDuoLayout?: boolean;
         vrmUrl?: string;
         himariVrmUrl?: string;
         activeSpeaker?: "luna" | "cohost" | "himari";
@@ -589,7 +595,42 @@ function AppInner() {
         void rt.prepareCohostChatReply(url);
         return;
       }
+      if (ce.detail?.cohostDuoLayout) {
+        if (rt.getCreatorPanelFocus() && !ce.detail?.chatReply) {
+          return;
+        }
+        if (rt.isCohostSoloMode() && !ce.detail?.chatReply) {
+          return;
+        }
+        const vUrl = ce.detail.vrmUrl?.trim() || cohostVrmUrlRef.current;
+        const hUrl = ce.detail.himariVrmUrl?.trim() || himariVrmUrlRef.current;
+        if (!vUrl || !hUrl) return;
+        cohostVrmUrlRef.current = vUrl;
+        himariVrmUrlRef.current = hUrl;
+        const vLabel = vUrl.split("/").pop() || "cohost.vrm";
+        const hLabel = hUrl.split("/").pop() || "himari.vrm";
+        void rt.summonViktorHimariDuo(vUrl, hUrl, vLabel, hLabel).then(async () => {
+          setCohostInScene(rt.isCohostInScene());
+          setHimariInScene(rt.isHimariInScene());
+          if (cohostThinkingUrlRef.current) {
+            await rt.setCohostThinkingMotionUrl(cohostThinkingUrlRef.current);
+          }
+          if (cohostIdleUrlsRef.current.length > 0) {
+            await rt.setCohostIdleMotionUrls(cohostIdleUrlsRef.current);
+          }
+          if (himariThinkingUrlRef.current) {
+            await rt.setHimariThinkingMotionUrl(himariThinkingUrlRef.current);
+          }
+          if (himariIdleUrlsRef.current.length > 0) {
+            await rt.setHimariIdleMotionUrls(himariIdleUrlsRef.current);
+          }
+        });
+        return;
+      }
       if (ce.detail?.dualLayout || ce.detail?.trioLayout) {
+        if (rt.getCreatorPanelFocus() && !ce.detail?.chatReply) {
+          return;
+        }
         if (rt.isCohostSoloMode() && !ce.detail?.chatReply) {
           return;
         }
@@ -620,7 +661,11 @@ function AppInner() {
         });
       }
       if (ce.detail?.activeSpeaker) {
-        if (rt.isCohostSoloMode() && ce.detail.activeSpeaker === "cohost") {
+        if (
+          rt.isCohostSoloMode() &&
+          ce.detail.activeSpeaker === "cohost" &&
+          !rt.isCohostInScene()
+        ) {
           return;
         }
         rt.setActiveSpeaker(ce.detail.activeSpeaker);
@@ -778,6 +823,7 @@ function AppInner() {
     void sendViewerCohostScene({
       viktor: rt.isCohostInScene(),
       himari: rt.isHimariInScene(),
+      luna: rt.isLunaOnStage(),
     });
   }, [sendViewerCohostScene]);
 

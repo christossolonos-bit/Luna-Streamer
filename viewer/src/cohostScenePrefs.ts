@@ -3,6 +3,8 @@
 const COHOST_SOLO_STORAGE_KEY = "luna.cohostSoloMode.v1";
 
 let soloMode = readCohostSoloModeStored();
+let viktorOnStage = false;
+let himariOnStage = false;
 
 export function readCohostSoloModeStored(): boolean {
   try {
@@ -23,4 +25,21 @@ export function setCohostSoloMode(solo: boolean): void {
   } catch {
     /* ignore */
   }
+}
+
+/** Viewer dock: who is currently summoned (clears solo mode when any co-host is on stage). */
+export function setCastStageFlags(viktor: boolean, himari: boolean): void {
+  viktorOnStage = viktor;
+  himariOnStage = himari;
+  if (viktor || himari) {
+    setCohostSoloMode(false);
+  }
+}
+
+export function isViktorOnStage(): boolean {
+  return viktorOnStage;
+}
+
+export function isHimariOnStage(): boolean {
+  return himariOnStage;
 }

@@ -785,9 +785,66 @@ export class VrmRuntime {
     );
   }
 
+  /** Creator chat tab — only one avatar visible; do not let dock/banter layout override. */
+  private _applyCreatorPanelVisibility(target: "luna" | "cohost" | "himari"): void {
+    if (!this.vrm) return;
+    if (target === "luna") {
+      if (this.cohostVrm) this.cohostVrm.scene.visible = false;
+      if (this.himariVrm) this.himariVrm.scene.visible = false;
+      this.vrm.scene.visible = true;
+      if (this.lunaPivot) {
+        this._applyDefaultStageFraming(this.lunaPivot, this.vrm);
+        this._orientAvatarTowardCamera(this.vrm);
+      }
+      return;
+    }
+    if (target === "cohost") {
+      if (this.vrm) this.vrm.scene.visible = false;
+      if (this.himariVrm) this.himariVrm.scene.visible = false;
+      if (this.cohostVrm && this.cohostPivot) {
+        this.cohostVrm.scene.visible = true;
+        this._applyDefaultStageFraming(this.cohostPivot, this.cohostVrm);
+        this._orientAvatarTowardCamera(this.cohostVrm);
+      }
+      return;
+    }
+    if (this.vrm) this.vrm.scene.visible = false;
+    if (this.cohostVrm) this.cohostVrm.scene.visible = false;
+    if (this.himariVrm && this.himariPivot) {
+      this.himariVrm.scene.visible = true;
+      this._applyDefaultStageFraming(this.himariPivot, this.himariVrm);
+      this._orientAvatarTowardCamera(this.himariVrm);
+    }
+  }
+
+  private async _refreshVisibleCastIdle(): Promise<void> {
+    if (this.cohostVrm?.scene.visible) {
+      await this._ensureCohostIdleForAppearance();
+      this._kickIdleMixer(this.cohostVrm, this.cohostMixer);
+    }
+    if (this.himariVrm?.scene.visible) {
+      await this._ensureHimariIdleForAppearance();
+      this._kickIdleMixer(this.himariVrm, this.himariMixer);
+    }
+    if (this.vrm?.scene.visible && this.idleClips.length > 0 && !this.lunaThinkingActive) {
+      this._ensureMixerForCurrentVrm();
+      if (!this._idleActionActive(this.action)) {
+        this.idleModeEnabled = true;
+        this._playIdleAt(this.idleClipIndex, null, "fresh");
+      }
+      this._kickIdleMixer(this.vrm, this.mixer);
+    }
+  }
+
   /** Dock cast layout: Luna+Viktor, Luna+Himari, Viktor+Himari (both toggles), or Luna solo. */
   private _syncCastStageLayout(): void {
     if (!this.vrm) return;
+    const focus = this._creatorPanelFocus;
+    if (focus) {
+      this._applyCreatorPanelVisibility(focus);
+      void this._refreshVisibleCastIdle();
+      return;
+    }
     const viktor = this.cohostInScene && !!this.cohostVrm;
     const himari = this.himariInScene && !!this.himariVrm;
 
@@ -870,6 +927,7 @@ export class VrmRuntime {
       this._centerCastGroupOnScreen();
       this.cb.onSceneStatus("Cast on stage: Luna + Himari");
     }
+    void this._refreshVisibleCastIdle();
   }
 
   /** Shift every visible cast pivot so the group bbox center sits on the orbit target. */
@@ -1821,6 +1879,17 @@ export class VrmRuntime {
     return this.isCohostInScene() && this.isHimariInScene();
   }
 
+  isLunaOnStage(): boolean {
+    if (this.isViktorHimariDuoInScene() && !this.castTrioWithLuna) {
+      return false;
+    }
+    return true;
+  }
+
+  isCastTrioWithLuna(): boolean {
+    return this.castTrioWithLuna;
+  }
+
   async summonViktorHimariDuo(
     viktorUrl: string,
     himariUrl: string,
@@ -1847,7 +1916,7 @@ export class VrmRuntime {
     this.himariInScene = true;
     this.castTrioWithLuna = false;
     this._syncCastStageLayout();
-    this._ensureCohostIdlePlaying();
+    await this._ensureCohostIdleForAppearance();
     await this._ensureHimariIdleForAppearance();
   }
 
@@ -1862,6 +1931,7 @@ export class VrmRuntime {
 
   async summonHimari(url: string, label = "himari.vrm"): Promise<void> {
     this._creatorPanelFocus = null;
+    setCohostSoloMode(false);
     const trimmed = url.trim();
     if (!trimmed) {
       throw new Error("Himari VRM URL is missing (check LUNA_HIMARI_VRM in .env).");
@@ -2027,7 +2097,7 @@ export class VrmRuntime {
       this.castTrioWithLuna = true;
     }
     this._syncCastStageLayout();
-    this._ensureCohostIdlePlaying();
+    await this._ensureCohostIdleForAppearance();
     this.activeAvatar = "luna";
     this._captureJawRestPose();
   }
@@ -2053,18 +2123,6 @@ export class VrmRuntime {
     this._creatorPanelFocus = target;
     this.setActiveSpeaker(target === "cohost" ? "cohost" : target);
 
-    if (target === "luna") {
-      if (this.cohostVrm) this.cohostVrm.scene.visible = false;
-      if (this.himariVrm) this.himariVrm.scene.visible = false;
-      if (this.vrm && this.lunaPivot) {
-        this.vrm.scene.visible = true;
-        this._applyDefaultStageFraming(this.lunaPivot, this.vrm);
-        this._orientAvatarTowardCamera(this.vrm);
-      }
-      this.cb.onSceneStatus("Talking to Luna");
-      return;
-    }
-
     if (target === "cohost") {
       const url = (urls?.cohostVrm || "").trim();
       if (!this.cohostVrm && url) {
@@ -2074,35 +2132,27 @@ export class VrmRuntime {
         this.cb.onSceneStatus("Viktor VRM not loaded — check LUNA_COHOST_VRM in .env");
         return;
       }
-      if (this.vrm) this.vrm.scene.visible = false;
-      if (this.himariVrm) this.himariVrm.scene.visible = false;
-      this.cohostVrm.scene.visible = true;
-      this._applyDefaultStageFraming(this.cohostPivot, this.cohostVrm);
-      this._orientAvatarTowardCamera(this.cohostVrm);
-      if (this.cohostIdleSourceUrls.length > 0) {
-        await this.setCohostIdleMotionUrls(this.cohostIdleSourceUrls);
-      } else {
-        this._ensureCohostIdlePlaying();
+    } else if (target === "himari") {
+      const himariUrl = (urls?.himariVrm || "").trim();
+      if (!this.himariVrm && himariUrl) {
+        await this.loadHimariVrmFromUrl(himariUrl, "himari.vrm");
       }
-      this.cb.onSceneStatus("Talking to Viktor");
-      return;
+      if (!this.himariVrm || !this.himariPivot) {
+        this.cb.onSceneStatus("Himari VRM not loaded — check LUNA_HIMARI_VRM in .env");
+        return;
+      }
     }
 
-    const himariUrl = (urls?.himariVrm || "").trim();
-    if (!this.himariVrm && himariUrl) {
-      await this.loadHimariVrmFromUrl(himariUrl, "himari.vrm");
+    this._applyCreatorPanelVisibility(target);
+    await this._refreshVisibleCastIdle();
+
+    if (target === "luna") {
+      this.cb.onSceneStatus("Talking to Luna");
+    } else if (target === "cohost") {
+      this.cb.onSceneStatus("Talking to Viktor");
+    } else {
+      this.cb.onSceneStatus("Talking to Himari");
     }
-    if (!this.himariVrm || !this.himariPivot) {
-      this.cb.onSceneStatus("Himari VRM not loaded — check LUNA_HIMARI_VRM in .env");
-      return;
-    }
-    if (this.vrm) this.vrm.scene.visible = false;
-    if (this.cohostVrm) this.cohostVrm.scene.visible = false;
-    this.himariVrm.scene.visible = true;
-    this._applyDefaultStageFraming(this.himariPivot, this.himariVrm);
-    this._orientAvatarTowardCamera(this.himariVrm);
-    await this._ensureHimariIdleForAppearance();
-    this.cb.onSceneStatus("Talking to Himari");
   }
 
   getCreatorPanelFocus(): "luna" | "cohost" | "himari" | null {
@@ -2134,7 +2184,7 @@ export class VrmRuntime {
   private _ensureHimariIdlePlaying(): void {
     if (!this.himariVrm || this.himariThinkingActive) return;
     if (this.himariIdleClips.length === 0) return;
-    if (this.himariIdleAction?.isRunning()) return;
+    if (this._idleActionActive(this.himariIdleAction)) return;
     this.himariIdleModeEnabled = true;
     this._ensureMixerForHimari();
     this._playHimariIdleAt(this.himariIdleClipIndex);

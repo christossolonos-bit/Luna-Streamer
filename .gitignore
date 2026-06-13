@@ -40,6 +40,7 @@ build/
 checkpoints/
 logs/
 *.log
+viktor 's wisdom for men/
 
 # ── Per-user voice samples (speaker enrollment + Chatterbox refs) ────────────
 # Generated locally; do not publish your own voice to a public repo.

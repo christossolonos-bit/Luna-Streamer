@@ -5,7 +5,7 @@ import {
   type ViewerAvatarId,
   parseBridgeMessage,
 } from "./chatTypes";
-import { getCohostSoloMode, readCohostSoloModeStored } from "./cohostScenePrefs";
+import { getCohostSoloMode, isViktorOnStage, readCohostSoloModeStored, setCastStageFlags } from "./cohostScenePrefs";
 import { playViewerTts, stopViewerTts } from "./viewerTtsPlayer";
 
 const DEFAULT_WS = "ws://127.0.0.1:8765/ws";
@@ -377,7 +377,7 @@ export function useChatBridge(enabled: boolean) {
         const chatReply = msg.chat_reply === true;
         const solo = getCohostSoloMode();
         const activeSpeaker =
-          !chatReply && solo && msg.active_speaker === "cohost"
+          !chatReply && solo && msg.active_speaker === "cohost" && !isViktorOnStage()
             ? "luna"
             : msg.active_speaker;
         if (
@@ -393,6 +393,7 @@ export function useChatBridge(enabled: boolean) {
             detail: {
               dualLayout: chatReply ? msg.dual_layout === true : !solo && msg.dual_layout === true,
               trioLayout: msg.trio_layout === true,
+              cohostDuoLayout: msg.cohost_duo_layout === true,
               vrmUrl: msg.vrm_url?.trim() || "",
               himariVrmUrl: msg.himari_vrm_url?.trim() || "",
               activeSpeaker,
@@ -417,7 +418,7 @@ export function useChatBridge(enabled: boolean) {
         const chatReply = msg.chat_reply === true;
         const solo = getCohostSoloMode();
         const speaker: ViewerAvatarId = normalizeViewerAvatar(msg.avatar) ?? "luna";
-        if (solo && speaker === "cohost" && !chatReply) {
+        if (solo && speaker === "cohost" && !chatReply && !isViktorOnStage()) {
           const ws = wsRef.current;
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "viewer_tts_ended" }));
@@ -869,6 +870,18 @@ export function useChatBridge(enabled: boolean) {
     return true;
   }, [addStatusLine]);
 
+  const sendSocialRecoverLogin = useCallback(async (site: string) => {
+    const s = site.trim().toLowerCase() || "all";
+    let ws: WebSocket | null = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      ws = await waitForOpenWebSocket(wsRef, 4000);
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    addStatusLine(`Social login: exporting saved ${s} session from Chrome profile…`);
+    ws.send(JSON.stringify({ type: "viewer_social_recover_login", site: s }));
+    return true;
+  }, [addStatusLine]);
+
   const sendSocialShareVideo = useCallback(async (url: string) => {
     const u = url.trim();
     if (!u) return false;
@@ -959,7 +972,8 @@ export function useChatBridge(enabled: boolean) {
   }, []);
 
   const sendViewerCohostScene = useCallback(
-    async (cast: { viktor: boolean; himari: boolean }) => {
+    async (cast: { viktor: boolean; himari: boolean; luna?: boolean }) => {
+      setCastStageFlags(cast.viktor, cast.himari);
       let ws: WebSocket | null = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         ws = await waitForOpenWebSocket(wsRef, 4000);
@@ -969,7 +983,11 @@ export function useChatBridge(enabled: boolean) {
         JSON.stringify({
           type: "viewer_cohost_scene",
           in_scene: cast.viktor || cast.himari,
-          cast: { viktor: cast.viktor, himari: cast.himari },
+          cast: {
+            viktor: cast.viktor,
+            himari: cast.himari,
+            luna: cast.luna !== false,
+          },
         }),
       );
       return true;
@@ -1033,6 +1051,7 @@ export function useChatBridge(enabled: boolean) {
     sendYoutubeLiveCheck,
     sendSocialShareVideo,
     sendSocialInteractiveLogin,
+    sendSocialRecoverLogin,
     sendYouTubeLiveUrl,
     dismissYouTubeLivePrompt,
     youtubeLivePrompt,

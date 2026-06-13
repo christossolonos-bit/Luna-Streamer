@@ -116,6 +116,129 @@ def social_playwright_configured() -> bool:
     return False
 
 
+def social_playwright_session_paths() -> tuple[Path | None, Path | None]:
+    """Resolved X / Facebook session JSON paths (None when unset or file missing)."""
+    return (
+        _resolve_storage_path("LUNA_SOCIAL_X_STORAGE_STATE", warn=False),
+        _resolve_storage_path("LUNA_SOCIAL_FACEBOOK_STORAGE_STATE", warn=False),
+    )
+
+
+def social_playwright_ready() -> bool:
+    """True when Playwright is on and at least one saved login session file exists."""
+    if not _env_truthy("LUNA_SOCIAL_PLAYWRIGHT"):
+        return False
+    x_path, fb_path = social_playwright_session_paths()
+    return x_path is not None or fb_path is not None
+
+
+def social_share_setup_hint() -> str:
+    """Viewer-friendly hint when share is configured but sessions are missing."""
+    missing: list[str] = []
+    for key, label in (
+        ("LUNA_SOCIAL_X_STORAGE_STATE", "X"),
+        ("LUNA_SOCIAL_FACEBOOK_STORAGE_STATE", "Facebook"),
+    ):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        if not p.is_file():
+            missing.append(label)
+    if missing:
+        sites = " and ".join(missing)
+        return (
+            f"Social share: no saved {sites} login JSON yet. If you already signed in in Chrome, "
+            f"click **Export {sites} login** in Settings → Social login. Otherwise use **{sites} login**, "
+            f"sign in, then close only the login tab (not the whole Chrome window)."
+        )
+    if not social_playwright_configured():
+        return (
+            "Social share: set LUNA_SOCIAL_PLAYWRIGHT=1 and LUNA_SOCIAL_X_STORAGE_STATE / "
+            "LUNA_SOCIAL_FACEBOOK_STORAGE_STATE in .env, restart Luna, then use Settings → Social login."
+        )
+    return "Social share: login session missing. Use Settings → Social login (X / Facebook)."
+
+
+async def export_chrome_profile_to_storage_state(*, out_json: Path, site: str) -> bool:
+    """Write Playwright storage_state JSON from an on-disk Chrome profile (recovery after login)."""
+    out = out_json.expanduser().resolve()
+    profile_dir = interactive_login_chrome_user_data_dir(out, site)
+    if not profile_dir.is_dir() or not (profile_dir / "Default").is_dir():
+        return False
+
+    async with _share_lock:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            print(
+                "(social playwright) Install: pip install playwright && python -m playwright install chrome",
+                flush=True,
+            )
+            return False
+
+        profile_dir, merged = interactive_login_persistent_launch_kwargs(
+            out_json=out,
+            site=site,
+            existing_storage=out if out.is_file() else None,
+        )
+        merged = dict(merged)
+        merged["headless"] = True
+
+        try:
+            async with async_playwright() as p:
+                ctx = await p.chromium.launch_persistent_context(str(profile_dir), **merged)
+                try:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    await ctx.storage_state(path=str(out))
+                finally:
+                    await ctx.close()
+        except Exception as exc:
+            print(f"(social playwright) profile export failed ({site}): {exc}", flush=True)
+            return False
+
+    ok = out.is_file() and out.stat().st_size > 20
+    if ok:
+        print(f"(social playwright) exported session JSON from Chrome profile -> {out}", flush=True)
+    return ok
+
+
+async def recover_social_storage_states(
+    *,
+    sites: tuple[str, ...] = ("x", "facebook"),
+    broadcast: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, bool]:
+    """If login JSON is missing but the Chrome profile folder exists, export cookies to JSON."""
+    env_by_site = {
+        "x": "LUNA_SOCIAL_X_STORAGE_STATE",
+        "facebook": "LUNA_SOCIAL_FACEBOOK_STORAGE_STATE",
+        "youtube": "LUNA_SOCIAL_YOUTUBE_STORAGE_STATE",
+    }
+    out: dict[str, bool] = {}
+    for site in sites:
+        key = env_by_site.get(site)
+        if not key:
+            continue
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if path.is_file():
+            out[site] = True
+            continue
+        ok = await export_chrome_profile_to_storage_state(out_json=path, site=site)
+        out[site] = ok
+        if broadcast:
+            if ok:
+                await broadcast(f"Social login: recovered {site} session -> {path}")
+            else:
+                await broadcast(
+                    f"Social login: could not export {site} profile (sign in again with **{site} login**, "
+                    f"then close only the login tab — not the Chrome window X)."
+                )
+    return out
+
+
 _share_lock = asyncio.Lock()
 
 
@@ -1577,13 +1700,21 @@ async def share_live_stream(
             print(f"(social playwright) live share failed: {exc}", flush=True)
 
 
-async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
-    """Post ``title`` + ``video_url`` to X and/or Facebook using configured storage states."""
+async def share_new_youtube_upload(*, title: str, video_url: str) -> bool:
+    """Post ``title`` + ``video_url`` to X and/or Facebook using configured storage states.
+
+    Returns True if at least one platform was posted to.
+    """
     x_path = _resolve_storage_path("LUNA_SOCIAL_X_STORAGE_STATE", warn=True)
     fb_path = _resolve_storage_path("LUNA_SOCIAL_FACEBOOK_STORAGE_STATE", warn=True)
     if x_path is None and fb_path is None:
-        return
+        print(
+            "(social playwright) share skipped — no saved X/Facebook session JSON (Settings → Social login).",
+            flush=True,
+        )
+        return False
 
+    posted = False
     async with _share_lock:
         try:
             from playwright.async_api import async_playwright
@@ -1592,7 +1723,7 @@ async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
                 "(social playwright) Install: pip install playwright && python -m playwright install chrome",
                 flush=True,
             )
-            return
+            return False
 
         headless = social_playwright_share_headless()
         slow_mo = int((os.environ.get("LUNA_SOCIAL_PLAYWRIGHT_SLOW_MO") or "0").strip() or "0")
@@ -1609,6 +1740,7 @@ async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
                         await ctx.add_init_script(STEALTH_INIT_SCRIPT)
                         try:
                             await _post_x(ctx, title, video_url, image_path=None)
+                            posted = True
                         finally:
                             await ctx.close()
                     if fb_path is not None:
@@ -1618,12 +1750,15 @@ async def share_new_youtube_upload(*, title: str, video_url: str) -> None:
                         await ctx.add_init_script(STEALTH_INIT_SCRIPT)
                         try:
                             await _post_facebook(ctx, title, video_url, image_path=None)
+                            posted = True
                         finally:
                             await ctx.close()
                 finally:
                     await browser.close()
         except Exception as exc:
             print(f"(social playwright) browser run failed: {exc}", flush=True)
+            return False
+    return posted
 
 
 async def run_interactive_social_login(
@@ -1715,34 +1850,60 @@ async def run_interactive_social_login(
                 page = await ctx.new_page()
                 await page.goto(start_url, wait_until="domcontentloaded", timeout=120_000)
                 keeper = None
+                saved = False
+
+                async def _persist_session(reason: str) -> None:
+                    nonlocal saved
+                    if saved:
+                        return
+                    try:
+                        await ctx.storage_state(path=str(out))
+                        saved = True
+                        await broadcast(
+                            f"Social login: saved ({reason}) to {out}. "
+                            f"You can use the dock share icon now."
+                        )
+                    except Exception as exc:
+                        await broadcast(f"Social login: could not save storage ({reason}): {exc}")
+
+                def _schedule_save(reason: str) -> None:
+                    asyncio.create_task(_persist_session(reason))
+
+                page.on("close", lambda _p: _schedule_save("login tab closed"))
+
                 try:
                     keeper = await ctx.new_page()
-                    await keeper.goto("about:blank", wait_until="domcontentloaded", timeout=15_000)
+                    await keeper.set_content(
+                        "<!doctype html><html><body style='font:16px system-ui;padding:24px;"
+                        "max-width:520px;line-height:1.5'>"
+                        "<h2>Keep this tab open</h2>"
+                        "<p><strong>When you finish signing in</strong>, close the <em>other</em> tab "
+                        "(the login tab only).</p>"
+                        "<p>Do <strong>not</strong> click the Chrome window X — that skips saving.</p>"
+                        "<p>Luna will say <strong>saved</strong> in chat when cookies are written.</p>"
+                        "</body></html>",
+                        wait_until="domcontentloaded",
+                        timeout=15_000,
+                    )
                 except Exception:
                     keeper = None
                     print(
                         "(social playwright) interactive login: could not open keeper tab; "
-                        "if cookies are not saved, close only the login tab (not Exit) or try again.",
+                        "close only the login tab (not the whole Chrome window) when done.",
                         flush=True,
                     )
                 await broadcast(
-                    "Social login: use the **first tab** to sign in. When done, **close that tab** "
-                    "(a blank second tab keeps Chrome alive so Luna can save cookies). "
-                    "Wait for “saved” in chat before using File→Exit."
+                    "Social login: sign in on the **first tab**. When done, **close that tab only** "
+                    "(leave the “Keep this tab open” tab — do not exit Chrome with the window X)."
                 )
                 try:
-                    await page.wait_for_event("close", timeout=3_600_000)
-                except PWTimeout:
-                    await broadcast("Social login: timed out after 1 hour — closing without saving.")
-                    return
-                try:
-                    await ctx.storage_state(path=str(out))
-                    await broadcast(
-                        f"Social login: saved to {out}. "
-                        f"Ensure LUNA_SOCIAL_{'FACEBOOK' if s == 'facebook' else 'YOUTUBE' if s == 'youtube' else 'X'}_STORAGE_STATE matches this path; restart Luna if you changed it."
-                    )
-                except Exception as exc:
-                    await broadcast(f"Social login: could not save storage ({exc}).")
+                    try:
+                        await page.wait_for_event("close", timeout=3_600_000)
+                    except PWTimeout:
+                        await broadcast("Social login: timed out after 1 hour — closing without saving.")
+                        return
+                    if not saved:
+                        await _persist_session("after login tab closed")
                 finally:
                     if keeper is not None:
                         try:

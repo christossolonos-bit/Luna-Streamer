@@ -33,6 +33,7 @@ def _state_path() -> Path:
 class CastScene:
     viktor_in_scene: bool = False
     himari_in_scene: bool = False
+    luna_in_scene: bool = True
     last_idle_partner: str = ""
 
     def any_in_scene(self) -> bool:
@@ -49,10 +50,21 @@ class CastScene:
             out.append("himari")
         return out
 
+    def cohost_duo_on_stage(self) -> bool:
+        """Viktor + Himari on stage with Luna off screen (viewer duo layout)."""
+        return (
+            not self.luna_in_scene
+            and self.viktor_in_scene
+            and self.himari_in_scene
+        )
+
     def trio_on_stage(self) -> bool:
-        """Luna + Viktor + Himari all available for a three-way idle banter."""
-        ids = self.idle_partner_ids()
-        return "viktor" in ids and "himari" in ids
+        """Luna + Viktor + Himari all on stage for three-way idle banter."""
+        return (
+            self.luna_in_scene
+            and self.viktor_in_scene
+            and self.himari_in_scene
+        )
 
 
 def load_cast_scene(*, default_viktor: bool = False) -> CastScene:
@@ -67,6 +79,8 @@ def load_cast_scene(*, default_viktor: bool = False) -> CastScene:
                 elif "in_scene" in data:
                     scene.viktor_in_scene = bool(data.get("in_scene"))
                 scene.himari_in_scene = bool(data.get("himari_in_scene"))
+                if "luna_in_scene" in data:
+                    scene.luna_in_scene = bool(data.get("luna_in_scene"))
                 scene.last_idle_partner = str(data.get("last_idle_partner") or "").strip().lower()
         except (OSError, json.JSONDecodeError, TypeError):
             pass
@@ -88,6 +102,7 @@ def save_cast_scene(scene: CastScene) -> None:
             {
                 "viktor_in_scene": bool(scene.viktor_in_scene),
                 "himari_in_scene": bool(scene.himari_in_scene),
+                "luna_in_scene": bool(scene.luna_in_scene),
                 "last_idle_partner": scene.last_idle_partner,
                 "in_scene": scene.any_in_scene(),
             },

@@ -1825,6 +1825,31 @@ class LunaDiscordBot:
                             + ", ".join(str(i) for i in sorted(engagement_guild_ids())),
                             flush=True,
                         )
+
+                from luna_discord_private_duty_dm import (
+                    private_duty_dm_enabled,
+                    private_duty_dm_loop,
+                    private_duty_dm_owner_ids,
+                )
+
+                if private_duty_dm_enabled():
+                    if private_duty_dm_owner_ids():
+                        asyncio.create_task(
+                            private_duty_dm_loop(bot),
+                            name="discord-private-duty-dm",
+                        )
+                    else:
+                        print(
+                            "(discord private) duty DM enabled but no recipient — set "
+                            "LUNA_OWNER_DISCORD_ID (or LUNA_DISCORD_PRIVATE_DUTY_DM_USER_ID) in .env",
+                            flush=True,
+                        )
+                else:
+                    print(
+                        "(discord private) Viktor hourly duty DMs OFF — set "
+                        "LUNA_DISCORD_PRIVATE_DUTY_DM=1 and LUNA_OWNER_DISCORD_ID in .env, then restart",
+                        flush=True,
+                    )
             guild_id = _int_env("DISCORD_VOICE_GUILD_ID")
             channel_id = _int_env("DISCORD_VOICE_CHANNEL_ID")
             if guild_id and channel_id:

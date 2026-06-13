@@ -19,6 +19,9 @@ Environment (or use CLI flags where noted):
   TWITCH_SEND_REPLIES  If "1", post model replies to chat (needs chat:write on token)
   TWITCH_AUTO_REPLY    If "1", generate replies from regular chat messages
   TWITCH_AUTO_TRIGGER  "all" (default: Luna replies even without @; Viktor only when named) or "mention"
+  TWITCH_EXTRA_IRC_CHANNELS  Comma list of guest channel logins Luna also joins (e.g. rayen or rayen:mention).
+  TWITCH_EXTRA_IRC_REPLY_TRIGGER  Default trigger for extras without :suffix (default mention).
+  TWITCH_EXTRA_IRC_REPLY_COOLDOWN_SEC  Optional longer cooldown for guest channels only (0 = same as primary).
   TWITCH_AUTO_COOLDOWN / LUNA_PUBLIC_CHAT_COOLDOWN_SEC  Seconds between public-chat replies (default 4).
   LUNA_YOUTUBE_LIVE_COOLDOWN_SEC  YouTube Live override (defaults to public chat cooldown).
   LUNA_TIKTOK_LIVE_COOLDOWN_SEC   TikTok Live override (defaults to public chat cooldown).
@@ -240,12 +243,16 @@ from vampire_cohost import (
 )
 from social_playwright_share import (
     default_youtube_storage_path,
+    export_chrome_profile_to_storage_state,
     generate_and_post_youtube_video_comment,
     post_youtube_video_comment,
+    recover_social_storage_states,
     run_interactive_social_login,
     share_live_stream,
     share_new_youtube_upload,
     social_playwright_configured,
+    social_playwright_ready,
+    social_share_setup_hint,
     youtube_comment_posting_enabled,
     youtube_comment_posting_requested,
     youtube_comment_setup_hint,
@@ -267,6 +274,11 @@ from luna_twitch_user import (
     live_chatter_system_note,
     profile_from_chatter,
     profile_from_login,
+)
+from luna_twitch_irc import (
+    extra_irc_reply_cooldown_sec,
+    parse_extra_irc_channels,
+    twitch_initial_channel_logins,
 )
 from luna_chat_safety import (
     chat_injection_guard_enabled,
@@ -521,15 +533,19 @@ class LunaTwitchBot(commands.Bot):
         auto_reply: bool,
         auto_trigger: str,
         auto_cooldown_sec: float,
+        extra_irc_channels: dict[str, str] | None = None,
+        extra_irc_cooldown_sec: float = 0.0,
         ollama_client: Client,
         chat_hub: ChatHub | None,
         discord_bot: LunaDiscordBot | None = None,
         vision_ollama_client: Client | None = None,
     ) -> None:
+        extra = dict(extra_irc_channels or {})
+        initial = twitch_initial_channel_logins(channel, extra)
         super().__init__(
             token=token,
             prefix="!",
-            initial_channels=[channel],
+            initial_channels=initial or [channel],
         )
         self._discord = discord_bot
         self._ollama = ollama_client
@@ -538,6 +554,8 @@ class LunaTwitchBot(commands.Bot):
         self._chat_model = resolve_chat_model()
         self._system = system_prompt.strip()
         self._twitch_channel_login = (channel or "").strip().lstrip("#").lower()
+        self._extra_irc_triggers = extra
+        self._extra_irc_cooldown_sec = max(0.0, extra_irc_cooldown_sec)
         self._youtube_live_active_cb: Callable[[], bool] | None = None
         self._tiktok_live_active_cb: Callable[[], bool] | None = None
         self._send_replies = send_replies
@@ -668,23 +686,41 @@ class LunaTwitchBot(commands.Bot):
         elapsed = time.monotonic() - self._last_avatar_speaking_end_ts
         return max(0.0, self._viewer_voice_block_after_tts_sec - elapsed)
 
-    def _public_chat_cooldown_sec_for(self, source: str) -> float:
+    def _twitch_trigger_all_for(self, channel_name: str) -> bool:
+        ch = (channel_name or "").strip().lstrip("#").lower()
+        if ch == self._twitch_channel_login:
+            return self._auto_trigger == "all"
+        mode = self._extra_irc_triggers.get(ch)
+        if mode is not None:
+            return mode == "all"
+        return False
+
+    def _is_extra_irc_channel(self, channel_name: str) -> bool:
+        ch = (channel_name or "").strip().lstrip("#").lower()
+        return ch in self._extra_irc_triggers and ch != self._twitch_channel_login
+
+    def _public_chat_cooldown_sec_for(self, source: str, *, twitch_channel: str | None = None) -> float:
         s = (source or "").strip().lower()
         if s == "youtube live":
             return self._youtube_cooldown_sec
         if s == "tiktok live":
             return self._tiktok_cooldown_sec
+        if twitch_channel and self._is_extra_irc_channel(twitch_channel):
+            if self._extra_irc_cooldown_sec > 0:
+                return self._extra_irc_cooldown_sec
         return self._auto_cooldown_sec
 
-    def _public_chat_on_cooldown(self, source: str) -> bool:
-        sec = self._public_chat_cooldown_sec_for(source)
+    def _public_chat_on_cooldown(self, source: str, *, twitch_channel: str | None = None) -> bool:
+        sec = self._public_chat_cooldown_sec_for(source, twitch_channel=twitch_channel)
         if sec <= 0:
             return False
         return (time.time() - self._last_auto_reply_ts) < sec
 
-    async def _wait_public_chat_cooldown(self, source: str = "Twitch chat") -> None:
+    async def _wait_public_chat_cooldown(
+        self, source: str = "Twitch chat", *, twitch_channel: str | None = None
+    ) -> None:
         """Space out public-chat replies so back-to-back viewer lines do not stack."""
-        sec = self._public_chat_cooldown_sec_for(source)
+        sec = self._public_chat_cooldown_sec_for(source, twitch_channel=twitch_channel)
         if sec <= 0:
             return
         remaining = sec - (time.time() - self._last_auto_reply_ts)
@@ -970,6 +1006,7 @@ class LunaTwitchBot(commands.Bot):
         partner_ids: list[str],
         *,
         trio: bool = False,
+        cohost_duo: bool = False,
     ) -> None:
         """Ensure summoned co-hosts are visible in the viewer before banter TTS."""
         from luna_cast import partner_vrm_viewer_url
@@ -993,6 +1030,16 @@ class LunaTwitchBot(commands.Bot):
             if himari_url:
                 payload["himari_vrm_url"] = himari_url
             await self._chat_hub.broadcast(payload)
+        elif cohost_duo and viktor_url and himari_url:
+            await self._chat_hub.broadcast(
+                {
+                    "type": "control",
+                    "name": "cohost_avatar",
+                    "cohost_duo_layout": True,
+                    "vrm_url": viktor_url,
+                    "himari_vrm_url": himari_url,
+                }
+            )
         elif "viktor" in partner_ids and viktor_url:
             await self._chat_hub.broadcast(
                 {
@@ -1028,6 +1075,8 @@ class LunaTwitchBot(commands.Bot):
         if not line or self._chat_hub is None:
             return
         is_luna = spk == "luna"
+        if is_luna and not self._cast_scene.luna_in_scene:
+            return
         pid = (
             (partner_id or spk or self._active_banter_partner or "viktor")
             .strip()
@@ -1119,6 +1168,83 @@ class LunaTwitchBot(commands.Bot):
             }
         )
 
+    async def _maybe_append_banter_chat_cta(
+        self,
+        *,
+        played: list[tuple[str, str]],
+    ) -> None:
+        """After banter, ask chat a humorous engagement question if the room has been quiet."""
+        from luna_cast import partner_display_name
+        from luna_cohost_banter import (
+            banter_chat_cta_enabled,
+            banter_chat_cta_post_twitch,
+            banter_chat_cta_quiet_sec,
+            choose_banter_cta_speaker,
+            generate_banter_chat_cta_sync,
+            line_looks_like_chat_cta,
+        )
+
+        if not played or not banter_chat_cta_enabled():
+            return
+        if self.public_chat_reply_priority_busy():
+            return
+        quiet_sec = time.monotonic() - self._last_activity_ts
+        if quiet_sec < banter_chat_cta_quiet_sec():
+            return
+        if line_looks_like_chat_cta(played[-1][1]):
+            return
+
+        speaker = choose_banter_cta_speaker(self._cast_scene, played)
+        viktor_name = partner_display_name("viktor")
+        himari_name = partner_display_name("himari")
+        try:
+            async with self._ollama_lock:
+                line = await asyncio.to_thread(
+                    generate_banter_chat_cta_sync,
+                    model=self._chat_model,
+                    luna_name=self.nick or "Luna",
+                    speaker_id=speaker,
+                    quiet_sec=quiet_sec,
+                    recent_banter=played,
+                    viktor_name=viktor_name,
+                    himari_name=himari_name,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"(banter) chat CTA skipped: {exc}", flush=True)
+            return
+        if not line:
+            return
+
+        pname = (
+            (self.nick or "Luna")
+            if speaker == "luna"
+            else partner_display_name(speaker)
+        )
+        print(
+            f"(banter) chat CTA ({int(quiet_sec)}s quiet) → {pname}: {line[:80]}…"
+            if len(line) > 80
+            else f"(banter) chat CTA ({int(quiet_sec)}s quiet) → {pname}: {line}",
+            flush=True,
+        )
+        await self._dispatch_banter_line(
+            speaker,
+            line,
+            cohost_display=pname,
+            partner_id=speaker if speaker != "luna" else None,
+        )
+        played.append((speaker, line))
+
+        if banter_chat_cta_post_twitch() and self._send_replies:
+            twitch_out = line
+            if speaker != "luna" and speaker in ("viktor", "himari"):
+                twitch_out = f"[{pname}] {line}"
+            room = self.get_channel(self._twitch_channel_login)
+            if room is not None:
+                try:
+                    await room.send(twitch_out[:450])
+                except Exception:
+                    pass
+
     async def run_cohost_banter_exchange(self, *, full_conversation: bool = False) -> None:
         from luna_cast import (
             choose_idle_banter_partner_sync,
@@ -1137,9 +1263,10 @@ class LunaTwitchBot(commands.Bot):
         partner_ids = self._cast_scene.idle_partner_ids()
         if not partner_ids:
             return
+        cohost_duo = self._cast_scene.cohost_duo_on_stage()
         trio = self._cast_scene.trio_on_stage()
         partner = partner_ids[0]
-        if not trio:
+        if not trio and not cohost_duo:
             if len(partner_ids) == 1:
                 partner = partner_ids[0]
             else:
@@ -1154,10 +1281,10 @@ class LunaTwitchBot(commands.Bot):
             if not partner:
                 return
             save_last_idle_partner(partner)
-        self._active_banter_partner = partner if not trio else "viktor"
+        self._active_banter_partner = partner if not trio and not cohost_duo else "viktor"
         viktor_name = partner_display_name("viktor")
         himari_name = partner_display_name("himari")
-        duo_name = partner_display_name(partner) if not trio else ""
+        duo_name = partner_display_name(partner) if not trio and not cohost_duo else ""
         self._cohost_banter_active = True
         self.touch_activity()
         played: list[tuple[str, str]] = []
@@ -1166,7 +1293,7 @@ class LunaTwitchBot(commands.Bot):
                 line_budget = cohost_full_banter_line_cap()
             else:
                 line_budget = cohost_exchange_lines()
-            if trio:
+            if trio or cohost_duo:
                 line_budget = max(line_budget, cohost_exchange_lines() * 2)
             min_lines = 3 if trio else 2
             script: list[tuple[str, str]] = []
@@ -1175,12 +1302,23 @@ class LunaTwitchBot(commands.Bot):
                 async with self._ollama_lock:
                     presence = self._dual_presence_context_block()
                     dynamics = self._cohost_dynamics.block_for_banter()
+                    cast_label = f"{viktor_name} and {himari_name}"
                     if trio:
                         consciousness = self._cast_consciousness.block_for_trio_banter(
                             viktor_name=viktor_name,
                             himari_name=himari_name,
                         )
-                        cast_label = f"{viktor_name} and {himari_name}"
+                        yt_banter = self._youtube_live_session.block_for_banter(
+                            cohost_name=cast_label
+                        )
+                        tt_banter = self._tiktok_live_session.block_for_banter(
+                            cohost_name=cast_label
+                        )
+                    elif cohost_duo:
+                        consciousness = self._cast_consciousness.block_for_trio_banter(
+                            viktor_name=viktor_name,
+                            himari_name=himari_name,
+                        )
                         yt_banter = self._youtube_live_session.block_for_banter(
                             cohost_name=cast_label
                         )
@@ -1206,6 +1344,7 @@ class LunaTwitchBot(commands.Bot):
                         model=self._chat_model,
                         luna_name=self.nick or "Luna",
                         trio=trio,
+                        cohost_duo=cohost_duo,
                         ledger=self._banter_novelty,
                         strict_novelty=strict_novelty,
                         max_lines=line_budget,
@@ -1240,6 +1379,13 @@ class LunaTwitchBot(commands.Bot):
                     flush=True,
                 )
                 status_label = f"Luna + {viktor_name} + {himari_name}"
+            elif cohost_duo:
+                print(
+                    f"(cohost) co-host duo ({len(script)} lines, {mode}) "
+                    f"{viktor_name} ↔ {himari_name}",
+                    flush=True,
+                )
+                status_label = f"{viktor_name} ↔ {himari_name}"
             else:
                 print(
                     f"(cohost) exchange ({len(script)} lines, {mode}) Luna ↔ {duo_name}",
@@ -1260,14 +1406,18 @@ class LunaTwitchBot(commands.Bot):
             await self._broadcast_cast_on_viewer_for_banter(
                 list(on_stage),
                 trio=trio,
+                cohost_duo=cohost_duo,
             )
+            allowed_speakers = set(on_stage)
+            if self._cast_scene.luna_in_scene:
+                allowed_speakers.add("luna")
             for spk, line in script:
                 if on_stage != set(self._cast_scene.idle_partner_ids()):
                     break
                 if self.public_chat_reply_priority_busy():
                     print("(cohost) banter yielding — chat reply in progress", flush=True)
                     break
-                if spk not in ("luna", *on_stage):
+                if spk not in allowed_speakers:
                     continue
                 pname = (
                     partner_display_name(spk)
@@ -1284,9 +1434,11 @@ class LunaTwitchBot(commands.Bot):
                     print("(cohost) banter yielding — chat took priority", flush=True)
                     break
                 played.append((spk, line))
+            if played and not self.public_chat_reply_priority_busy():
+                await self._maybe_append_banter_chat_cta(played=played)
             if played:
                 self._banter_novelty.record_script(played)
-                if trio:
+                if trio or cohost_duo:
                     self._cast_consciousness.observe_trio_banter_script(played)
                     viktor_lines = [
                         ("luna" if s == "luna" else "cohost", t)
@@ -1305,7 +1457,7 @@ class LunaTwitchBot(commands.Bot):
                     name="cohost-dynamics-refresh",
                 )
             if consciousness_enabled():
-                if trio:
+                if trio or cohost_duo:
                     for pid in ("viktor", "himari"):
                         asyncio.create_task(
                             self._maybe_refresh_cast_consciousness(pid),
@@ -1791,9 +1943,8 @@ class LunaTwitchBot(commands.Bot):
         )
         author = profile.login
         channel = message.channel.name if message.channel else ""
-        addressees = twitch_message_addressees(
-            text, trigger_all=self._auto_trigger == "all"
-        )
+        trigger_all = self._twitch_trigger_all_for(channel)
+        addressees = twitch_message_addressees(text, trigger_all=trigger_all)
         if not addressees:
             return
         source = "Twitch chat"
@@ -1810,10 +1961,10 @@ class LunaTwitchBot(commands.Bot):
         async with self._public_chat_serial_lock:
             await self.begin_public_chat_reply_priority()
             try:
-                await self._wait_public_chat_cooldown(source)
+                await self._wait_public_chat_cooldown(source, twitch_channel=channel)
                 for i, speaker in enumerate(addressees):
                     if i > 0:
-                        await self._wait_public_chat_cooldown(source)
+                        await self._wait_public_chat_cooldown(source, twitch_channel=channel)
                     await self._generate_and_dispatch_reply(
                         channel_name=channel,
                         author=author,
@@ -1838,11 +1989,11 @@ class LunaTwitchBot(commands.Bot):
             return False
         if text.startswith("!"):
             return False
-        if self._public_chat_on_cooldown("Twitch chat"):
+        if self._public_chat_on_cooldown("Twitch chat", twitch_channel=message.channel.name if message.channel else None):
             return False
-        addressees = twitch_message_addressees(
-            text, trigger_all=self._auto_trigger == "all"
-        )
+        ch = message.channel.name if message.channel else ""
+        trigger_all = self._twitch_trigger_all_for(ch)
+        addressees = twitch_message_addressees(text, trigger_all=trigger_all)
         return bool(addressees)
 
     def _mention_triggers_chat_reply(self, text: str) -> bool:
@@ -3328,6 +3479,8 @@ async def _run_async(
         auto_reply=auto_reply,
         auto_trigger=auto_trigger,
         auto_cooldown_sec=auto_cooldown_sec,
+        extra_irc_channels=parse_extra_irc_channels(),
+        extra_irc_cooldown_sec=extra_irc_reply_cooldown_sec(),
         ollama_client=client,
         chat_hub=hub,
         discord_bot=discord_bot_obj,
@@ -3599,6 +3752,8 @@ async def _run_async(
                         scene.viktor_in_scene = bool(cast.get("viktor"))
                     if "himari" in cast:
                         scene.himari_in_scene = bool(cast.get("himari"))
+                    if "luna" in cast:
+                        scene.luna_in_scene = bool(cast.get("luna"))
                 elif partner == "himari":
                     scene.himari_in_scene = in_scene
                 elif partner == "viktor":
@@ -3825,6 +3980,59 @@ async def _run_async(
                         }
                     )
                     return
+                if not social_playwright_ready():
+                    async def _try_recover_then_share() -> None:
+                        async def _bcast(text: str) -> None:
+                            await hub.broadcast({"type": "status", "text": text})
+
+                        await _bcast("Social share: checking Chrome profiles for saved login…")
+                        await recover_social_storage_states(broadcast=_bcast)
+                        if not social_playwright_ready():
+                            await hub.broadcast(
+                                {"type": "status", "text": social_share_setup_hint()}
+                            )
+                            return
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "Social share: login recovered — resolving video…",
+                            }
+                        )
+                        try:
+                            ok, meta = await asyncio.to_thread(yt_resolve_track, url)
+                            if not ok or not isinstance(meta, dict):
+                                err = meta if isinstance(meta, str) else "Could not resolve that URL."
+                                await hub.broadcast({"type": "status", "text": f"Social share: {err}"})
+                                return
+                            title = (meta.get("title") or "YouTube").strip()
+                            web_url = (meta.get("web_url") or url).strip()
+                            posted = await share_new_youtube_upload(title=title, video_url=web_url)
+                        except Exception as exc:
+                            await hub.broadcast({"type": "status", "text": f"Social share: {exc}"})
+                            return
+                        if posted:
+                            await hub.broadcast(
+                                {
+                                    "type": "status",
+                                    "text": "Social share: posted (check X/Facebook). Playwright finished.",
+                                }
+                            )
+                        else:
+                            await hub.broadcast(
+                                {
+                                    "type": "status",
+                                    "text": (
+                                        "Social share: Playwright finished but nothing was posted "
+                                        "(login expired or Facebook/X UI changed — try Settings → Social login again)."
+                                    ),
+                                }
+                            )
+
+                    await hub.broadcast(
+                        {"type": "status", "text": "Social share: resolving title, then Playwright (X/Facebook)..."}
+                    )
+                    asyncio.create_task(_try_recover_then_share())
+                    return
 
                 async def _manual_social_share() -> None:
                     try:
@@ -3835,16 +4043,27 @@ async def _run_async(
                             return
                         title = (meta.get("title") or "YouTube").strip()
                         web_url = (meta.get("web_url") or url).strip()
-                        await share_new_youtube_upload(title=title, video_url=web_url)
+                        posted = await share_new_youtube_upload(title=title, video_url=web_url)
                     except Exception as exc:
                         await hub.broadcast({"type": "status", "text": f"Social share: {exc}"})
                         return
-                    await hub.broadcast(
-                        {
-                            "type": "status",
-                            "text": "Social share: Playwright run finished (check X/Facebook or terminal if nothing posted).",
-                        }
-                    )
+                    if posted:
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "Social share: posted (check X/Facebook). Playwright finished.",
+                            }
+                        )
+                    else:
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": (
+                                    "Social share: Playwright finished but nothing was posted "
+                                    "(login expired or Facebook/X UI changed — try Settings → Social login again)."
+                                ),
+                            }
+                        )
 
                 await hub.broadcast(
                     {"type": "status", "text": "Social share: resolving title, then Playwright (X/Facebook)..."}
@@ -3893,6 +4112,48 @@ async def _run_async(
                     run_interactive_social_login(site=site, out_path=out_path, broadcast=_login_bcast)
                 )
                 tsk.add_done_callback(_login_done)
+                return
+
+            if msg_type == "viewer_social_recover_login":
+                site_raw = str(payload.get("site") or "").strip().lower()
+                if site_raw in ("facebook", "fb"):
+                    site = "facebook"
+                    env_key = "LUNA_SOCIAL_FACEBOOK_STORAGE_STATE"
+                elif site_raw in ("youtube", "yt"):
+                    site = "youtube"
+                    env_key = "LUNA_SOCIAL_YOUTUBE_STORAGE_STATE"
+                elif site_raw in ("all", "both", ""):
+                    site = "all"
+                    env_key = ""
+                else:
+                    site = "x"
+                    env_key = "LUNA_SOCIAL_X_STORAGE_STATE"
+
+                async def _recover_bcast(text: str) -> None:
+                    await hub.broadcast({"type": "status", "text": text})
+
+                async def _recover_task() -> None:
+                    if site == "all":
+                        await recover_social_storage_states(broadcast=_recover_bcast)
+                    else:
+                        raw = str(payload.get("out_path") or os.environ.get(env_key) or "").strip()
+                        if not raw:
+                            await _recover_bcast(
+                                f"Social login: set {env_key} in .env first."
+                            )
+                            return
+                        ok = await export_chrome_profile_to_storage_state(
+                            out_json=Path(raw).expanduser(),
+                            site=site,
+                        )
+                        if ok:
+                            await _recover_bcast(f"Social login: recovered {site} session -> {raw}")
+                        else:
+                            await _recover_bcast(
+                                f"Social login: no {site} Chrome profile to export — use **{site} login** and sign in again."
+                            )
+
+                asyncio.create_task(_recover_task())
                 return
 
             if msg_type == "viewer_tts_ended":
@@ -4132,7 +4393,8 @@ async def _run_async(
         async def _twitch_announce(text: str) -> None:
             if not bot._send_replies:
                 return
-            for room in list(bot.connected_channels or []):
+            room = bot.get_channel(bot._twitch_channel_login)
+            if room is not None:
                 try:
                     await room.send(text[:450])
                 except Exception:
@@ -4422,10 +4684,15 @@ def main() -> None:
             f"ollama {os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')} "
             f"chat={chat_model} vision={vision_model}"
         )
+    extra_irc = parse_extra_irc_channels()
+    extra_note = ""
+    if extra_irc:
+        parts = [f"#{k} ({v})" for k, v in sorted(extra_irc.items())]
+        extra_note = f" | guest IRC: {', '.join(parts)}"
     print(
         f"Starting Twitch bot | channel #{channel} | "
         f"{llm_line} | "
-        f"send_replies={send_replies} | auto_reply={auto_reply} ({auto_trigger}) | "
+        f"send_replies={send_replies} | auto_reply={auto_reply} ({auto_trigger}){extra_note} | "
         f"public_chat_cooldown twitch={auto_cooldown_sec}s "
         f"youtube={youtube_live_cooldown_sec()}s tiktok={tiktok_live_cooldown_sec()}s | "
         f"LUNA_TTS={tts_enabled()} | LUNA_TTS_PLAY={tts_playback_enabled()} | "

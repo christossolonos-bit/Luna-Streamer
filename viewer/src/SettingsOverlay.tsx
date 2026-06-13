@@ -77,6 +77,7 @@ export function SettingsOverlay({
     sendPlayRequest,
     sendYouTubeSummary,
     sendSocialInteractiveLogin,
+    sendSocialRecoverLogin,
     addStatusLine,
   } = useBridge();
 
@@ -426,11 +427,8 @@ export function SettingsOverlay({
           <h3 className="settings-section-title">Social login</h3>
           <p className="settings-hint">
             One-time setup for Playwright sharing and YouTube comments. Opens Chrome on the PC
-            running Luna — sign in, then close the tab when chat says the session was saved. Set{" "}
-            <code className="chat-code">LUNA_SOCIAL_X_STORAGE_STATE</code>,{" "}
-            <code className="chat-code">LUNA_SOCIAL_FACEBOOK_STORAGE_STATE</code>, and/or{" "}
-            <code className="chat-code">LUNA_SOCIAL_YOUTUBE_STORAGE_STATE</code> in{" "}
-            <code className="chat-code">.env</code>.
+            running Luna — sign in, then <strong>close only the login tab</strong> (not the Chrome
+            window X). If you already signed in but share still fails, use <strong>Export login</strong>.
           </p>
           <div className="settings-row">
             <button
@@ -462,6 +460,17 @@ export function SettingsOverlay({
             >
               <SocialYoutubeLoginIcon />
               YouTube login
+            </button>
+          </div>
+          <div className="settings-row">
+            <button
+              type="button"
+              className="settings-btn"
+              disabled={conn !== "open"}
+              onClick={() => void sendSocialRecoverLogin("all")}
+              title="Export cookies from Chrome profiles to JSON (if you logged in but saving failed)"
+            >
+              Export X + Facebook login
             </button>
           </div>
         </section>

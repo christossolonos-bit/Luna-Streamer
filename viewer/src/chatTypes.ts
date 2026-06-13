@@ -123,6 +123,8 @@ export type BridgeControlCohostAvatarMessage = {
   dual_layout?: boolean;
   /** Luna + Viktor + Himari on stage for cast banter. */
   trio_layout?: boolean;
+  /** Viktor + Himari on stage; Luna off screen. */
+  cohost_duo_layout?: boolean;
   vrm_url?: string;
   himari_vrm_url?: string;
   active_speaker?: ViewerAvatarId;
@@ -353,6 +355,7 @@ export function parseBridgeMessage(raw: unknown): BridgeMessage | null {
       name: "cohost_avatar",
       dual_layout: o.dual_layout === true || o.visible === true,
       trio_layout: o.trio_layout === true,
+      cohost_duo_layout: o.cohost_duo_layout === true,
       vrm_url: typeof o.vrm_url === "string" ? o.vrm_url : undefined,
       himari_vrm_url:
         typeof o.himari_vrm_url === "string" ? o.himari_vrm_url : undefined,
