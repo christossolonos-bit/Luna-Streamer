@@ -11,6 +11,7 @@ Setup (one-time per site):
   python scripts/social_playwright_login.py https://x.com D:/path/x_storage.json
   python scripts/social_playwright_login.py https://www.facebook.com D:/path/fb_storage.json
   python scripts/social_playwright_login.py https://www.youtube.com D:/path/luna_youtube.json
+  python scripts/social_playwright_login.py https://www.tiktok.com/login D:/path/luna_tiktok.json
   # Or from the viewer: Settings → Social login sends viewer_social_interactive_login (headed Chrome on the PC running Luna).
   # Optional: LUNA_SOCIAL_X_LOGIN_START_URL / LUNA_SOCIAL_FACEBOOK_LOGIN_START_URL open your profile pages instead of default login URLs.
 
@@ -21,6 +22,8 @@ Env:
   LUNA_SOCIAL_YOUTUBE_STORAGE_STATE=path   Saved Chrome session for Luna's YouTube account (comment on videos).
   LUNA_SOCIAL_YOUTUBE_COMMENT=1            Post to YouTube's comment box when storage is set (set 0 to disable).
   LUNA_SOCIAL_YOUTUBE_LOGIN_START_URL=...  Key-icon login first page (default https://www.youtube.com).
+  LUNA_SOCIAL_TIKTOK_STORAGE_STATE=path    Saved Chrome session for TikTok (Settings → TikTok login).
+  LUNA_SOCIAL_TIKTOK_LOGIN_START_URL=...   Key-icon login first page (default https://www.tiktok.com/login).
   LUNA_SOCIAL_YOUTUBE_COMMENT_PROMPT=...   Optional LLM user prompt; {title} {url} {transcript}.
   LUNA_SOCIAL_YOUTUBE_COMMENT_NUM_PREDICT=80
   LUNA_SOCIAL_YOUTUBE_COMMENT_MAX_CHARS=900
@@ -46,10 +49,13 @@ Env:
   LUNA_SOCIAL_FACEBOOK_POST_LEGACY_SHARER=1  Use sharer.php popup only (skip profile composer).
   LUNA_SOCIAL_FB_POST_UI_STEP_MS / LUNA_SOCIAL_FB_POST_UI_SETTLE_MS  Optional timeouts for Facebook UI flow.
   LUNA_SOCIAL_INTERACTIVE_EPHEMERAL=1        Key-icon login: use old temp profile (not recommended for Google OAuth on X).
-  LUNA_SOCIAL_INTERACTIVE_PROFILE_ROOT=path Optional; persistent Chrome profiles live under ``{root}/x`` and ``{root}/facebook``.
+  LUNA_SOCIAL_INTERACTIVE_PROFILE_ROOT=path Optional; persistent Chrome profiles live under ``{root}/x``, ``{root}/facebook``, ``{root}/tiktok``, etc.
   LUNA_SOCIAL_INTERACTIVE_NO_VIEWPORT=1    Default 1; real window size (omit fixed viewport) during key-icon login.
   LUNA_SOCIAL_INTERACTIVE_USE_SYNTHETIC_UA=1 Force the module default Chrome UA during interactive login (omit unless needed).
-  LUNA_SOCIAL_INTERACTIVE_CDP_URL=http://127.0.0.1:9222  Optional; attach to **your** Chrome (remote debugging) instead of Playwright launching one — best chance for “Sign in with Google” on X. Close other Chrome windows or use a dedicated ``--user-data-dir``.
+  LUNA_SOCIAL_INTERACTIVE_CDP_URL=http://127.0.0.1:9222  Optional; attach to **your** Chrome instead of Playwright launching one.
+  LUNA_SOCIAL_INTERACTIVE_CDP_PORT=9222      Port when Luna auto-launches Chrome (TikTok/X default).
+  LUNA_SOCIAL_INTERACTIVE_PLAYWRIGHT_LAUNCH=1  Force Playwright-launched Chrome (Google OAuth on TikTok/X will fail).
+  LUNA_SOCIAL_INTERACTIVE_AUTO_CDP=1         Auto-launch real chrome.exe + CDP for every interactive login site.
 
 UI selectors change; if posting stops working, update this module or use HEADLESS=0 to inspect.
 """
@@ -59,7 +65,10 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import subprocess
+import sys
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -69,9 +78,14 @@ STEALTH_INIT_SCRIPT = """
   try {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+    Object.defineProperty(navigator, "maxTouchPoints", { get: () => 0 });
   } catch (e) {}
   try {
-    window.chrome = { runtime: {} };
+    window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+  } catch (e) {}
+  try {
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
   } catch (e) {}
 })();
 """
@@ -203,26 +217,197 @@ async def export_chrome_profile_to_storage_state(*, out_json: Path, site: str) -
     return ok
 
 
+_SOCIAL_STORAGE_ENV_BY_SITE: dict[str, str] = {
+    "x": "LUNA_SOCIAL_X_STORAGE_STATE",
+    "facebook": "LUNA_SOCIAL_FACEBOOK_STORAGE_STATE",
+    "youtube": "LUNA_SOCIAL_YOUTUBE_STORAGE_STATE",
+    "tiktok": "LUNA_SOCIAL_TIKTOK_STORAGE_STATE",
+}
+
+
+def default_youtube_storage_path() -> Path:
+    """Default session JSON next to other Luna data (Settings → YouTube login)."""
+    return (Path(__file__).resolve().parent / "data" / "luna_youtube.json").resolve()
+
+
+def default_tiktok_storage_path() -> Path:
+    """Default session JSON next to other Luna data (Settings → TikTok login)."""
+    return (Path(__file__).resolve().parent / "data" / "luna_tiktok.json").resolve()
+
+
+def social_storage_json_path(site: str) -> Path | None:
+    """Resolved session JSON path for a site (env override, else TikTok/YouTube defaults)."""
+    s = site.strip().lower()
+    if s in ("twitter", "t"):
+        s = "x"
+    elif s in ("facebook", "fb"):
+        s = "facebook"
+    elif s in ("youtube", "yt"):
+        s = "youtube"
+    key = _SOCIAL_STORAGE_ENV_BY_SITE.get(s)
+    if key:
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return Path(raw).expanduser()
+    if s == "youtube":
+        return default_youtube_storage_path()
+    if s == "tiktok":
+        return default_tiktok_storage_path()
+    return None
+
+
+def interactive_login_oauth_hint(site: str) -> str:
+    """Extra chat hint when OAuth providers often block Playwright-launched Chrome."""
+    s = site.strip().lower()
+    if s == "tiktok":
+        return (
+            " TikTok opens **your real Chrome** (not Playwright) so **Sign in with Google** works."
+        )
+    if s == "x":
+        return (
+            " X opens **your real Chrome** when using Google/Apple OAuth "
+            "(Playwright-launched Chrome is blocked by Google)."
+        )
+    return ""
+
+
+def interactive_cdp_port() -> int:
+    raw = (os.environ.get("LUNA_SOCIAL_INTERACTIVE_CDP_PORT") or "9222").strip() or "9222"
+    try:
+        return max(1024, min(int(raw), 65535))
+    except ValueError:
+        return 9222
+
+
+def resolve_chrome_executable() -> Path | None:
+    raw = (os.environ.get("LUNA_SOCIAL_CHROME_EXECUTABLE") or "").strip()
+    if raw:
+        p = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if p.is_file():
+            return p
+    if sys.platform == "win32":
+        candidates = [
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+            / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+            / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        ]
+    elif sys.platform == "darwin":
+        candidates = [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    else:
+        candidates = [
+            Path("/usr/bin/google-chrome"),
+            Path("/usr/bin/google-chrome-stable"),
+            Path("/usr/bin/chromium"),
+        ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def interactive_login_prefers_user_chrome(site: str) -> bool:
+    """Use real chrome.exe + CDP (Google OAuth works). Playwright launch fails on TikTok/X."""
+    if _env_truthy("LUNA_SOCIAL_INTERACTIVE_PLAYWRIGHT_LAUNCH"):
+        return False
+    if (os.environ.get("LUNA_SOCIAL_INTERACTIVE_CDP_URL") or "").strip():
+        return True
+    if _env_truthy("LUNA_SOCIAL_INTERACTIVE_AUTO_CDP"):
+        return True
+    return site.strip().lower() in ("tiktok", "x")
+
+
+async def cdp_endpoint_ready(base_url: str) -> bool:
+    url = base_url.rstrip("/") + "/json/version"
+
+    def _probe() -> bool:
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    return await asyncio.to_thread(_probe)
+
+
+async def wait_for_cdp_endpoint(base_url: str, *, timeout_sec: float = 45.0) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_sec
+    while loop.time() < deadline:
+        if await cdp_endpoint_ready(base_url):
+            return True
+        await asyncio.sleep(0.35)
+    return False
+
+
+async def ensure_interactive_cdp_browser(
+    *,
+    profile_dir: Path,
+    broadcast: Callable[[str], Awaitable[None]],
+) -> tuple[str, subprocess.Popen[Any] | None]:
+    """Return CDP base URL; auto-launch real Chrome when not already listening."""
+    manual = (os.environ.get("LUNA_SOCIAL_INTERACTIVE_CDP_URL") or "").strip().rstrip("/")
+    if manual:
+        if not await cdp_endpoint_ready(manual):
+            raise RuntimeError(
+                f"CDP not reachable at {manual}. Start Chrome with --remote-debugging-port first."
+            )
+        return manual, None
+
+    port = interactive_cdp_port()
+    base = f"http://127.0.0.1:{port}"
+    if await cdp_endpoint_ready(base):
+        await broadcast(f"Social login: reusing Chrome on port {port}.")
+        return base, None
+
+    exe = resolve_chrome_executable()
+    if exe is None:
+        raise RuntimeError(
+            "Google sign-in needs your real Chrome (not Playwright). "
+            "Install Chrome or set LUNA_SOCIAL_CHROME_EXECUTABLE in .env."
+        )
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    await broadcast(
+        f"Social login: launching **your Chrome** on port {port} "
+        "(Sign in with Google works here — Playwright Chrome is blocked)."
+    )
+    args = [
+        str(exe),
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
+    ]
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    if not await wait_for_cdp_endpoint(base):
+        proc.terminate()
+        raise RuntimeError(
+            f"Chrome did not open CDP on port {port}. Close other Chrome windows or pick another port "
+            f"(LUNA_SOCIAL_INTERACTIVE_CDP_PORT)."
+        )
+    return base, proc
+
+
 async def recover_social_storage_states(
     *,
-    sites: tuple[str, ...] = ("x", "facebook"),
+    sites: tuple[str, ...] = ("x", "facebook", "tiktok"),
     broadcast: Callable[[str], Awaitable[None]] | None = None,
 ) -> dict[str, bool]:
     """If login JSON is missing but the Chrome profile folder exists, export cookies to JSON."""
-    env_by_site = {
-        "x": "LUNA_SOCIAL_X_STORAGE_STATE",
-        "facebook": "LUNA_SOCIAL_FACEBOOK_STORAGE_STATE",
-        "youtube": "LUNA_SOCIAL_YOUTUBE_STORAGE_STATE",
-    }
     out: dict[str, bool] = {}
     for site in sites:
-        key = env_by_site.get(site)
-        if not key:
+        path = social_storage_json_path(site)
+        if path is None:
             continue
-        raw = (os.environ.get(key) or "").strip()
-        if not raw:
-            continue
-        path = Path(raw).expanduser()
         if path.is_file():
             out[site] = True
             continue
@@ -272,6 +457,8 @@ def stealth_browser_launch_kwargs(*, headless: bool, slow_mo: int) -> dict:
         "args": [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--exclude-switches=enable-automation",
         ],
     }
     exe = (os.environ.get("LUNA_SOCIAL_CHROME_EXECUTABLE") or "").strip()
@@ -355,12 +542,10 @@ def interactive_login_start_url(site: str) -> str:
     if s in ("youtube", "yt"):
         raw = (os.environ.get("LUNA_SOCIAL_YOUTUBE_LOGIN_START_URL") or "").strip()
         return raw or "https://www.youtube.com"
+    if s == "tiktok":
+        raw = (os.environ.get("LUNA_SOCIAL_TIKTOK_LOGIN_START_URL") or "").strip()
+        return raw or "https://www.tiktok.com"
     return "https://x.com/i/flow/login"
-
-
-def default_youtube_storage_path() -> Path:
-    """Default session JSON next to other Luna data (Settings → YouTube login)."""
-    return (Path(__file__).resolve().parent / "data" / "luna_youtube.json").resolve()
 
 
 def youtube_comment_storage_path(*, warn: bool = False) -> Path | None:
@@ -1781,8 +1966,10 @@ async def run_interactive_social_login(
         s = "facebook"
     elif s in ("youtube", "yt"):
         s = "youtube"
+    elif s == "tiktok":
+        s = "tiktok"
     else:
-        await broadcast("Social login: use site x, facebook, or youtube.")
+        await broadcast("Social login: use site x, facebook, youtube, or tiktok.")
         return
 
     start_url = interactive_login_start_url(s)
@@ -1794,6 +1981,7 @@ async def run_interactive_social_login(
     async with _share_lock:
         ctx = None
         browser = None
+        cdp_attach = False
         try:
             try:
                 from playwright.async_api import async_playwright
@@ -1801,52 +1989,73 @@ async def run_interactive_social_login(
                 await broadcast("Social login: pip install playwright && python -m playwright install chrome")
                 return
 
-            cdp_url = (os.environ.get("LUNA_SOCIAL_INTERACTIVE_CDP_URL") or "").strip()
+            use_user_chrome = interactive_login_prefers_user_chrome(s)
             slow_mo = int((os.environ.get("LUNA_SOCIAL_PLAYWRIGHT_SLOW_MO") or "0").strip() or "0")
             use_ephemeral = _env_truthy("LUNA_SOCIAL_INTERACTIVE_EPHEMERAL", default=False)
 
-            profile_dir: Path | None = None
+            profile_dir = interactive_login_chrome_user_data_dir(out, s)
             merged_persistent_kw: dict[str, Any] | None = None
-            if not cdp_url and not use_ephemeral:
+            cdp_proc: subprocess.Popen[Any] | None = None
+            cdp_attach = False
+            cdp_default_context = False
+            cdp_url = ""
+
+            if use_user_chrome:
+                cdp_url, cdp_proc = await ensure_interactive_cdp_browser(
+                    profile_dir=profile_dir,
+                    broadcast=broadcast,
+                )
+                cdp_attach = True
+                await broadcast(
+                    f"Social login ({s}): attached to **your Chrome** — use Sign in with Google if you want. "
+                    f"Saving session to: {out}"
+                )
+            elif not use_ephemeral:
                 profile_dir, merged_persistent_kw = interactive_login_persistent_launch_kwargs(
                     out_json=out,
                     site=s,
                     existing_storage=existing,
                 )
-
-            if cdp_url:
-                await broadcast(
-                    f"Social login ({s}): CDP attach → {cdp_url} (Chrome must already be running with that port). "
-                    f"Saving session to: {out}"
-                )
-            else:
-                extra = f" On-disk Chrome profile: {profile_dir}" if profile_dir is not None else ""
-                x_google = ""
-                if s == "x":
-                    x_google = (
-                        " **On X:** “Sign in with Google” is usually blocked in Playwright-launched Chrome — "
-                        "use **password / phone / Apple**, or set **LUNA_SOCIAL_INTERACTIVE_CDP_URL** and log in via your own Chrome."
-                    )
+                extra = f" On-disk Chrome profile: {profile_dir}"
+                oauth_hint = interactive_login_oauth_hint(s)
                 await broadcast(
                     f"Social login ({s}): opening Chrome — sign in, then **close the login tab** when done "
-                    f"(Luna opens a blank second tab so cookies save reliably). Saving to: {out}.{extra}{x_google}"
+                    f"(Luna opens a blank second tab so cookies save reliably). Saving to: {out}.{extra}{oauth_hint}"
                 )
+            else:
+                await broadcast(
+                    f"Social login ({s}): opening temporary Chrome (ephemeral). Saving to: {out}"
+                )
+
+            custom_ua = (os.environ.get("LUNA_SOCIAL_PLAYWRIGHT_USER_AGENT") or "").strip()
+            omit_ua = not custom_ua and not _env_truthy(
+                "LUNA_SOCIAL_INTERACTIVE_USE_SYNTHETIC_UA", default=False
+            )
             async with async_playwright() as p:
-                if cdp_url:
+                if cdp_attach:
                     browser = await p.chromium.connect_over_cdp(cdp_url)
-                    ctx = await browser.new_context()
+                    if browser.contexts:
+                        ctx = browser.contexts[0]
+                        cdp_default_context = True
+                    else:
+                        ctx = await browser.new_context(
+                            **stealth_browser_context_kwargs(
+                                storage_state=existing, omit_user_agent=omit_ua
+                            )
+                        )
                 elif use_ephemeral:
                     launch_kw = stealth_browser_launch_kwargs(headless=False, slow_mo=slow_mo)
                     browser = await p.chromium.launch(**launch_kw)
                     ctx = await browser.new_context(
-                        **stealth_browser_context_kwargs(storage_state=existing, omit_user_agent=False)
+                        **stealth_browser_context_kwargs(storage_state=existing, omit_user_agent=omit_ua)
                     )
                 else:
-                    assert profile_dir is not None and merged_persistent_kw is not None
+                    assert merged_persistent_kw is not None
                     ctx = await p.chromium.launch_persistent_context(
                         str(profile_dir), **merged_persistent_kw
                     )
-                await ctx.add_init_script(STEALTH_INIT_SCRIPT)
+                if not cdp_default_context:
+                    await ctx.add_init_script(STEALTH_INIT_SCRIPT)
                 page = await ctx.new_page()
                 await page.goto(start_url, wait_until="domcontentloaded", timeout=120_000)
                 keeper = None
@@ -1859,9 +2068,15 @@ async def run_interactive_social_login(
                     try:
                         await ctx.storage_state(path=str(out))
                         saved = True
+                        label = {
+                            "x": "X/Facebook sharing",
+                            "facebook": "X/Facebook sharing",
+                            "tiktok": "TikTok",
+                            "youtube": "YouTube comments",
+                        }.get(s, s)
                         await broadcast(
                             f"Social login: saved ({reason}) to {out}. "
-                            f"You can use the dock share icon now."
+                            f"Session ready for {label}."
                         )
                     except Exception as exc:
                         await broadcast(f"Social login: could not save storage ({reason}): {exc}")
@@ -1914,13 +2129,14 @@ async def run_interactive_social_login(
         except Exception as exc:
             await broadcast(f"Social login: {exc}")
         finally:
-            if ctx is not None:
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
-            if browser is not None:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+            if not cdp_attach:
+                if ctx is not None:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+                if browser is not None:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass

@@ -3,6 +3,7 @@ import { useBridge } from "./chatBridgeContext";
 import {
   CloseIcon,
   SocialFacebookLoginIcon,
+  SocialTiktokLoginIcon,
   SocialXLoginIcon,
   SocialYoutubeLoginIcon,
   VoiceIcon,
@@ -426,9 +427,10 @@ export function SettingsOverlay({
         <section className="settings-section">
           <h3 className="settings-section-title">Social login</h3>
           <p className="settings-hint">
-            One-time setup for Playwright sharing and YouTube comments. Opens Chrome on the PC
-            running Luna — sign in, then <strong>close only the login tab</strong> (not the Chrome
-            window X). If you already signed in but share still fails, use <strong>Export login</strong>.
+            One-time setup for Playwright sharing, YouTube comments, and TikTok login.{" "}
+            <strong>TikTok and X</strong> open <strong>your real Chrome</strong> (not Playwright) so Google sign-in
+            works. Sign in, then <strong>close only the login tab</strong> (not the Chrome window X). If saving
+            failed, use <strong>Export login</strong>.
           </p>
           <div className="settings-row">
             <button
@@ -461,6 +463,16 @@ export function SettingsOverlay({
               <SocialYoutubeLoginIcon />
               YouTube login
             </button>
+            <button
+              type="button"
+              className="settings-btn settings-btn--social-tiktok"
+              disabled={conn !== "open"}
+              onClick={() => void sendSocialInteractiveLogin("tiktok")}
+              title="Set up TikTok login (same stealth Chrome profile as X/Facebook)"
+            >
+              <SocialTiktokLoginIcon />
+              TikTok login
+            </button>
           </div>
           <div className="settings-row">
             <button
@@ -470,7 +482,7 @@ export function SettingsOverlay({
               onClick={() => void sendSocialRecoverLogin("all")}
               title="Export cookies from Chrome profiles to JSON (if you logged in but saving failed)"
             >
-              Export X + Facebook login
+              Export X + Facebook + TikTok login
             </button>
           </div>
         </section>

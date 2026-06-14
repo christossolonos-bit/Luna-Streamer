@@ -192,6 +192,8 @@ from youtube_audio import (
     extract_video_id as yt_extract_video_id,
     fetch_video_context as yt_fetch_video_context,
     resolve_track as yt_resolve_track,
+    resolve_social_share_video,
+    is_social_share_video_url,
     short_status_line as yt_short_status_line,
 )
 from youtube_feed import (
@@ -242,7 +244,7 @@ from vampire_cohost import (
     twitch_message_addressees,
 )
 from social_playwright_share import (
-    default_youtube_storage_path,
+    social_storage_json_path,
     export_chrome_profile_to_storage_state,
     generate_and_post_youtube_video_comment,
     post_youtube_video_comment,
@@ -3951,11 +3953,14 @@ async def _run_async(
                 if not url:
                     await hub.broadcast({"type": "status", "text": "Social share: missing URL."})
                     return
-                if not yt_extract_video_id(url):
+                if not is_social_share_video_url(url):
                     await hub.broadcast(
                         {
                             "type": "status",
-                            "text": "Social share: use a YouTube video link (watch, Shorts, or youtu.be).",
+                            "text": (
+                                "Social share: use a YouTube video link (watch, Shorts, youtu.be) "
+                                "or a TikTok video link."
+                            ),
                         }
                     )
                     return
@@ -3980,69 +3985,23 @@ async def _run_async(
                         }
                     )
                     return
-                if not social_playwright_ready():
-                    async def _try_recover_then_share() -> None:
-                        async def _bcast(text: str) -> None:
-                            await hub.broadcast({"type": "status", "text": text})
 
-                        await _bcast("Social share: checking Chrome profiles for saved login…")
-                        await recover_social_storage_states(broadcast=_bcast)
-                        if not social_playwright_ready():
-                            await hub.broadcast(
-                                {"type": "status", "text": social_share_setup_hint()}
-                            )
-                            return
-                        await hub.broadcast(
-                            {
-                                "type": "status",
-                                "text": "Social share: login recovered — resolving video…",
-                            }
-                        )
-                        try:
-                            ok, meta = await asyncio.to_thread(yt_resolve_track, url)
-                            if not ok or not isinstance(meta, dict):
-                                err = meta if isinstance(meta, str) else "Could not resolve that URL."
-                                await hub.broadcast({"type": "status", "text": f"Social share: {err}"})
-                                return
-                            title = (meta.get("title") or "YouTube").strip()
-                            web_url = (meta.get("web_url") or url).strip()
-                            posted = await share_new_youtube_upload(title=title, video_url=web_url)
-                        except Exception as exc:
-                            await hub.broadcast({"type": "status", "text": f"Social share: {exc}"})
-                            return
-                        if posted:
-                            await hub.broadcast(
-                                {
-                                    "type": "status",
-                                    "text": "Social share: posted (check X/Facebook). Playwright finished.",
-                                }
-                            )
-                        else:
-                            await hub.broadcast(
-                                {
-                                    "type": "status",
-                                    "text": (
-                                        "Social share: Playwright finished but nothing was posted "
-                                        "(login expired or Facebook/X UI changed — try Settings → Social login again)."
-                                    ),
-                                }
-                            )
-
-                    await hub.broadcast(
-                        {"type": "status", "text": "Social share: resolving title, then Playwright (X/Facebook)..."}
-                    )
-                    asyncio.create_task(_try_recover_then_share())
-                    return
-
-                async def _manual_social_share() -> None:
+                async def _run_social_share() -> None:
                     try:
-                        ok, meta = await asyncio.to_thread(yt_resolve_track, url)
+                        ok, meta = await asyncio.to_thread(resolve_social_share_video, url)
                         if not ok or not isinstance(meta, dict):
                             err = meta if isinstance(meta, str) else "Could not resolve that URL."
                             await hub.broadcast({"type": "status", "text": f"Social share: {err}"})
                             return
-                        title = (meta.get("title") or "YouTube").strip()
+                        title = (meta.get("title") or "Video").strip()
                         web_url = (meta.get("web_url") or url).strip()
+                        platform = (meta.get("platform") or "video").strip()
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": f"Social share: posting {platform} link to X/Facebook…",
+                            }
+                        )
                         posted = await share_new_youtube_upload(title=title, video_url=web_url)
                     except Exception as exc:
                         await hub.broadcast({"type": "status", "text": f"Social share: {exc}"})
@@ -4065,10 +4024,36 @@ async def _run_async(
                             }
                         )
 
+                if not social_playwright_ready():
+                    async def _try_recover_then_share() -> None:
+                        async def _bcast(text: str) -> None:
+                            await hub.broadcast({"type": "status", "text": text})
+
+                        await _bcast("Social share: checking Chrome profiles for saved login…")
+                        await recover_social_storage_states(broadcast=_bcast)
+                        if not social_playwright_ready():
+                            await hub.broadcast(
+                                {"type": "status", "text": social_share_setup_hint()}
+                            )
+                            return
+                        await hub.broadcast(
+                            {
+                                "type": "status",
+                                "text": "Social share: login recovered — resolving video…",
+                            }
+                        )
+                        await _run_social_share()
+
+                    await hub.broadcast(
+                        {"type": "status", "text": "Social share: resolving title, then Playwright (X/Facebook)..."}
+                    )
+                    asyncio.create_task(_try_recover_then_share())
+                    return
+
                 await hub.broadcast(
                     {"type": "status", "text": "Social share: resolving title, then Playwright (X/Facebook)..."}
                 )
-                asyncio.create_task(_manual_social_share())
+                asyncio.create_task(_run_social_share())
                 return
 
             if msg_type == "viewer_social_interactive_login":
@@ -4079,12 +4064,16 @@ async def _run_async(
                 elif site_raw in ("youtube", "yt"):
                     site = "youtube"
                     env_key = "LUNA_SOCIAL_YOUTUBE_STORAGE_STATE"
+                elif site_raw == "tiktok":
+                    site = "tiktok"
+                    env_key = "LUNA_SOCIAL_TIKTOK_STORAGE_STATE"
                 else:
                     site = "x"
                     env_key = "LUNA_SOCIAL_X_STORAGE_STATE"
-                out_raw = str(payload.get("out_path") or os.environ.get(env_key) or "").strip()
-                if not out_raw and site == "youtube":
-                    out_raw = str(default_youtube_storage_path())
+                out_raw = str(payload.get("out_path") or "").strip()
+                if not out_raw:
+                    default_path = social_storage_json_path(site)
+                    out_raw = str(default_path) if default_path else ""
                 if not out_raw:
                     await hub.broadcast(
                         {
@@ -4094,7 +4083,7 @@ async def _run_async(
                     )
                     return
                 out_path = Path(out_raw).expanduser()
-                if site == "youtube":
+                if site in ("youtube", "tiktok"):
                     out_path.parent.mkdir(parents=True, exist_ok=True)
 
                 async def _login_bcast(text: str) -> None:
@@ -4122,6 +4111,9 @@ async def _run_async(
                 elif site_raw in ("youtube", "yt"):
                     site = "youtube"
                     env_key = "LUNA_SOCIAL_YOUTUBE_STORAGE_STATE"
+                elif site_raw == "tiktok":
+                    site = "tiktok"
+                    env_key = "LUNA_SOCIAL_TIKTOK_STORAGE_STATE"
                 elif site_raw in ("all", "both", ""):
                     site = "all"
                     env_key = ""
@@ -4136,7 +4128,10 @@ async def _run_async(
                     if site == "all":
                         await recover_social_storage_states(broadcast=_recover_bcast)
                     else:
-                        raw = str(payload.get("out_path") or os.environ.get(env_key) or "").strip()
+                        raw = str(payload.get("out_path") or "").strip()
+                        if not raw:
+                            default_path = social_storage_json_path(site)
+                            raw = str(default_path) if default_path else ""
                         if not raw:
                             await _recover_bcast(
                                 f"Social login: set {env_key} in .env first."

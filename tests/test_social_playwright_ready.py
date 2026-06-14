@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from social_playwright_share import (
+    interactive_login_prefers_user_chrome,
     social_playwright_configured,
     social_playwright_ready,
     social_share_setup_hint,
@@ -60,6 +61,19 @@ class SocialPlaywrightReadyTests(unittest.TestCase):
             ):
                 os.environ.pop("LUNA_SOCIAL_FACEBOOK_STORAGE_STATE", None)
                 self.assertIn("Export", social_share_setup_hint())
+
+    def test_tiktok_prefers_user_chrome_by_default(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for key in (
+                "LUNA_SOCIAL_INTERACTIVE_CDP_URL",
+                "LUNA_SOCIAL_INTERACTIVE_AUTO_CDP",
+                "LUNA_SOCIAL_INTERACTIVE_PLAYWRIGHT_LAUNCH",
+            ):
+                os.environ.pop(key, None)
+            self.assertTrue(interactive_login_prefers_user_chrome("tiktok"))
+            self.assertTrue(interactive_login_prefers_user_chrome("x"))
+            self.assertFalse(interactive_login_prefers_user_chrome("facebook"))
+            self.assertFalse(interactive_login_prefers_user_chrome("youtube"))
 
 
 if __name__ == "__main__":

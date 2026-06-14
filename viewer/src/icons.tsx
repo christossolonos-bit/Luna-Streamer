@@ -100,6 +100,16 @@ export function SocialYoutubeLoginIcon(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+/** TikTok — open Chrome to save session for TikTok login. */
+export function SocialTiktokLoginIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg {...base} {...props}>
+      <path d="M14 4v6.2a3.8 3.8 0 1 1-2.4-3.5V4h2.4Z" />
+      <path d="M10 4v6.8a3.2 3.2 0 1 1-2-2.9" />
+    </svg>
+  );
+}
+
 /** Facebook — open Chrome to save session for Facebook posting. */
 export function SocialFacebookLoginIcon(props: SVGProps<SVGSVGElement>) {
   return (

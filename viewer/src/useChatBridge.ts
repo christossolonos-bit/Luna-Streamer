@@ -890,7 +890,7 @@ export function useChatBridge(enabled: boolean) {
       ws = await waitForOpenWebSocket(wsRef, 4000);
     }
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    addStatusLine("Social share: sending to server...");
+    addStatusLine("Social share: sending to server (YouTube or TikTok)...");
     ws.send(JSON.stringify({ type: "viewer_social_share_video", url: u }));
     return true;
   }, [addStatusLine]);

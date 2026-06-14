@@ -152,10 +152,78 @@ YT_ID_RE = re.compile(
     r"(?:v=|/shorts/|youtu\.be/|/embed/|/v/)([A-Za-z0-9_-]{11})"
 )
 
+TIKTOK_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/",
+    re.IGNORECASE,
+)
+
 
 def extract_video_id(url: str) -> str:
     m = YT_ID_RE.search(url or "")
     return m.group(1) if m else ""
+
+
+def looks_like_tiktok_url(url: str) -> bool:
+    return bool(TIKTOK_URL_RE.search((url or "").strip()))
+
+
+def is_social_share_video_url(url: str) -> bool:
+    """True for YouTube watch/Shorts links or TikTok video URLs."""
+    u = (url or "").strip()
+    return bool(extract_video_id(u)) or looks_like_tiktok_url(u)
+
+
+def resolve_social_share_video(url: str) -> tuple[bool, dict[str, Any] | str]:
+    """Resolve a YouTube or TikTok URL for manual X/Facebook sharing."""
+    u = (url or "").strip()
+    if not u:
+        return False, "Paste a YouTube or TikTok video link."
+    if not is_social_share_video_url(u):
+        return False, "Use a YouTube (watch, Shorts, youtu.be) or TikTok video link."
+    try:
+        import yt_dlp
+    except ImportError:
+        return False, "yt-dlp is not installed. Run: pip install yt-dlp"
+
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    if not looks_like_tiktok_url(u):
+        opts["format"] = _format_pref()
+        opts["default_search"] = "ytsearch1"
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(u, download=False)
+    except Exception as exc:  # noqa: BLE001
+        platform = "TikTok" if looks_like_tiktok_url(u) else "YouTube"
+        return False, f"Could not resolve {platform} video: {exc}"
+
+    if isinstance(info, dict) and info.get("entries"):
+        entries = [e for e in info["entries"] if e]
+        if not entries:
+            return False, "No matching video result."
+        info = entries[0]
+    if not isinstance(info, dict):
+        return False, "Unexpected response from yt-dlp."
+
+    web_url = (info.get("webpage_url") or info.get("original_url") or u).strip()
+    title = (info.get("title") or "").strip()
+    if not title:
+        title = "TikTok video" if looks_like_tiktok_url(u) else "YouTube video"
+    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or ""
+    duration = info.get("duration")
+    return True, {
+        "title": title,
+        "uploader": uploader,
+        "duration_sec": int(duration) if isinstance(duration, (int, float)) else None,
+        "web_url": web_url,
+        "platform": "tiktok" if looks_like_tiktok_url(web_url or u) else "youtube",
+    }
 
 
 _VTT_TS_RE = re.compile(r"^\d{2}:\d{2}")

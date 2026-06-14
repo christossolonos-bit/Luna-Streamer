@@ -126,7 +126,7 @@ function AppInner() {
 
   const onSocialShareVideoClick = useCallback(() => {
     const raw = window.prompt(
-      "Paste a YouTube video URL to share on X and Facebook (works for older uploads too). First time: Settings → Social login.",
+      "Paste a YouTube or TikTok video URL to share on X and Facebook. First time: Settings → Social login.",
     );
     const u = raw?.trim();
     if (!u) return;

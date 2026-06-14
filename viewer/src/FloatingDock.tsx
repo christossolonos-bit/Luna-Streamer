@@ -32,7 +32,7 @@ type Props = {
   /** Manual poll: today's uploads on YouTube observe channels (server). */
   ytObserveCheckDisabled?: boolean;
   onYoutubeObserveCheck?: () => void;
-  /** Share any YouTube URL to X/Facebook via Playwright (server; separate from today's check). */
+  /** Share a YouTube or TikTok URL to X/Facebook via Playwright (server; separate from today's check). */
   socialShareDisabled?: boolean;
   onSocialShareVideo?: () => void;
   /** Luna reacts to a YouTube video (transcript + TTS). */
@@ -158,7 +158,7 @@ export function FloatingDock({
       ) : null}
       {onSocialShareVideo ? (
         <DockBtn
-          label="Share a YouTube video to X and Facebook (paste URL)"
+          label="Share a YouTube or TikTok video to X and Facebook (paste URL)"
           disabled={socialShareDisabled}
           onClick={onSocialShareVideo}
         >

@@ -583,7 +583,9 @@
 }
 
 .settings-btn--social-x,
-.settings-btn--social-fb {
+.settings-btn--social-fb,
+.settings-btn--social-yt,
+.settings-btn--social-tiktok {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
@@ -597,6 +599,11 @@
 .settings-btn--social-fb:hover:not(:disabled) {
   color: #8ab4f8;
   border-color: rgba(138, 180, 248, 0.35);
+}
+
+.settings-btn--social-tiktok:hover:not(:disabled) {
+  color: #69c9d0;
+  border-color: rgba(105, 201, 208, 0.35);
 }
 
 .settings-input,
