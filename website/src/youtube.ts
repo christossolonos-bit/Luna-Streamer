@@ -15,7 +15,7 @@ export const YOUTUBE_CHANNEL_TITLE =
   (import.meta.env.VITE_YOUTUBE_CHANNEL_TITLE || channelData.channel_title).trim();
 
 export const DISCORD_INVITE_URL =
-  (import.meta.env.VITE_DISCORD_INVITE_URL || "https://discord.gg/t3DpY3EP").trim();
+  (import.meta.env.VITE_DISCORD_INVITE_URL || "https://discord.gg/yJmKc6yNRU").trim();
 
 export const DISCORD_SERVER_NAME =
   (import.meta.env.VITE_DISCORD_SERVER_NAME || "Luna's Wolf Den").trim();

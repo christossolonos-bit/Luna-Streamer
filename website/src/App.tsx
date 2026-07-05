@@ -1,6 +1,6 @@
-import type { CSSProperties } from "react";
 import { CAST } from "./characters";
 import { DiscordSection } from "./components/DiscordSection";
+import { TestimonialsSection } from "./components/TestimonialsSection";
 import { YouTubeSection } from "./components/YouTubeSection";
 import { DISCORD_INVITE_URL } from "./youtube";
 
@@ -54,8 +54,8 @@ export default function App() {
           >
             Join Discord
           </a>
-          <a className="hero__btn hero__btn--ghost" href="#cast">
-            Meet the cast
+          <a className="hero__btn hero__btn--ghost" href="#opinions">
+            Community voices
           </a>
         </div>
       </header>
@@ -64,24 +64,7 @@ export default function App() {
 
       <DiscordSection />
 
-      <section className="cast-row" id="cast" aria-labelledby="cast-heading">
-        <h2 id="cast-heading" className="section-title">
-          Meet the cast
-        </h2>
-        <div className="cast-row__grid">
-          {CAST.map((c) => (
-            <div
-              key={c.id}
-              className="cast-tile"
-              style={{ "--cast-accent": c.accent } as CSSProperties}
-            >
-              <h3>{c.name}</h3>
-              <p className="cast-tile__tag">{c.tagline}</p>
-              <p className="cast-tile__intro">{c.intro}</p>
-            </div>
-          ))}
-        </div>
-      </section>
+      <TestimonialsSection />
 
       <section className="features" aria-labelledby="features-heading">
         <h2 id="features-heading" className="section-title">

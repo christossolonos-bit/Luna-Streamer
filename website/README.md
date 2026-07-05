@@ -1,6 +1,6 @@
 # Luna marketing site
 
-Showcase page: Luna’s intro, **embedded YouTube player** ([@lunawolfsolo](https://www.youtube.com/@lunawolfsolo)), **Discord** ([Luna's Wolf Den](https://discord.gg/t3DpY3EP)), and cast bios (Luna, Himari, Viktor).
+Showcase page: Luna’s intro, **embedded YouTube player** ([@lunawolfsolo](https://www.youtube.com/@lunawolfsolo)), **Discord** ([Luna's Wolf Den](https://discord.gg/yJmKc6yNRU)), and community testimonials.
 
 ## Open quickly (Windows)
 
@@ -33,7 +33,7 @@ Optional override in `website/.env`:
 
 ```env
 VITE_YOUTUBE_VIDEO_IDS=VIDEO_ID_1,VIDEO_ID_2
-VITE_DISCORD_INVITE_URL=https://discord.gg/t3DpY3EP
+VITE_DISCORD_INVITE_URL=https://discord.gg/yJmKc6yNRU
 ```
 
 ## GitHub Pages
