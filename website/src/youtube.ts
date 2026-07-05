@@ -39,20 +39,38 @@ function videosFromEnv(): ChannelVideo[] {
   return ids.map((id, i) => ({ id, title: `Video ${i + 1}` }));
 }
 
+function shortsFromEnv(): ChannelVideo[] {
+  const ids = parseVideoIds(import.meta.env.VITE_YOUTUBE_SHORT_IDS);
+  return ids.map((id, i) => ({ id, title: `Short ${i + 1}` }));
+}
+
 /** Channel uploads baked into the site (refresh via scripts/fetch_youtube_videos.py). */
 export const CHANNEL_VIDEOS: ChannelVideo[] =
   videosFromEnv().length > 0
     ? videosFromEnv()
     : (channelData.videos as ChannelVideo[]).filter((v) => v?.id);
 
+/** Channel shorts baked into the site (refresh via scripts/fetch_youtube_videos.py). */
+export const CHANNEL_SHORTS: ChannelVideo[] =
+  shortsFromEnv().length > 0
+    ? shortsFromEnv()
+    : ((channelData as { shorts?: ChannelVideo[] }).shorts ?? []).filter((v) => v?.id);
+
 export function youtubeWatchUrl(videoId: string): string {
   return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+export function youtubeShortsUrl(videoId: string): string {
+  return `https://www.youtube.com/shorts/${videoId}`;
 }
 
 export function youtubeEmbedUrl(videoId: string): string {
   return `https://www.youtube-nocookie.com/embed/${videoId}?rel=0&modestbranding=1&playsinline=1`;
 }
 
-export function youtubeThumbnailUrl(videoId: string): string {
+export function youtubeThumbnailUrl(videoId: string, vertical = false): string {
+  if (vertical) {
+    return `https://i.ytimg.com/vi/${videoId}/oardefault.jpg`;
+  }
   return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 }

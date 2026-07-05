@@ -168,6 +168,36 @@ body {
   font-size: 0.95rem;
 }
 
+.youtube__tabs {
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.youtube__tab {
+  padding: 0.45rem 1rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.88rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.youtube__tab:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.youtube__tab--active {
+  color: var(--text);
+  border-color: rgba(201, 166, 255, 0.45);
+  background: rgba(201, 166, 255, 0.12);
+}
+
 .youtube__player-layout {
   display: grid;
   gap: 1.25rem;
@@ -193,6 +223,20 @@ body {
   width: 100%;
   aspect-ratio: 16 / 9;
   border: 0;
+}
+
+.youtube__player-layout--shorts {
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 300px);
+}
+
+.youtube__player-wrap--shorts {
+  max-width: 360px;
+  margin-inline: auto;
+}
+
+.youtube__player-wrap--shorts iframe {
+  aspect-ratio: 9 / 16;
+  max-height: min(640px, 70vh);
 }
 
 .youtube__now-playing {
@@ -286,6 +330,11 @@ body {
   border-radius: 6px;
   flex-shrink: 0;
   background: #111;
+}
+
+.youtube__thumb--vertical {
+  width: 45px;
+  height: 72px;
 }
 
 .youtube__playlist-meta {

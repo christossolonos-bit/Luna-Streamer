@@ -8,6 +8,7 @@ interface ImportMetaEnv {
   readonly VITE_YOUTUBE_CHANNEL_HANDLE?: string;
   readonly VITE_YOUTUBE_CHANNEL_TITLE?: string;
   readonly VITE_YOUTUBE_VIDEO_IDS?: string;
+  readonly VITE_YOUTUBE_SHORT_IDS?: string;
   readonly VITE_BASE_PATH?: string;
 }
 

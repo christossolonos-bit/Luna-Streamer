@@ -27,7 +27,7 @@ From the repo root:
 python scripts/fetch_youtube_videos.py
 ```
 
-This updates `website/src/data/channelVideos.json` (IDs and titles). Rebuild or restart dev after refreshing.
+This updates `website/src/data/channelVideos.json` (video and short IDs and titles). Rebuild or restart dev after refreshing.
 
 Optional override in `website/.env`:
 
